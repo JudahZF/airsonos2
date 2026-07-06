@@ -8,8 +8,9 @@ use airsonos2_airplay::{
     AirPlayEndpointRunner, AirPlayEvent, FilePairingStore, PcmFormat, ZoneVolumeState,
 };
 use airsonos2_core::{
-    Config, EncoderState, SessionId, SonosZone, StreamCodec, StreamSession, VirtualAirPlayEndpoint,
-    ZoneId, configured_delays, filter_zones, sonos_volume_to_airplay_db, virtual_endpoint_for_zone,
+    Config, EncoderState, ServerConfig, SessionId, SonosZone, StreamCodec, StreamSession,
+    VirtualAirPlayEndpoint, ZoneId, configured_delays, filter_zones, sonos_volume_to_airplay_db,
+    virtual_endpoint_for_zone,
 };
 use airsonos2_diagnostics::{CheckStatus, run_doctor, serve_diagnostics};
 use airsonos2_sonos::{SonosClient, discover_sonos_zones_from_sources};
@@ -1413,11 +1414,14 @@ async fn stream_url_for_zone(
     codec: StreamCodec,
     generation: u64,
 ) -> anyhow::Result<Url> {
-    let host = if config.server.bind.is_unspecified() {
-        local_ip_for_remote(zone_ip).await.unwrap_or(zone_ip)
+    let needs_inference =
+        config.server.advertise_addr.is_none() && config.server.bind.is_unspecified();
+    let inferred_local_ip = if needs_inference {
+        local_ip_for_remote(zone_ip).await
     } else {
-        config.server.bind
+        None
     };
+    let host = resolve_stream_host(&config.server, inferred_local_ip)?;
     let extension = match codec {
         StreamCodec::Mp3 => "mp3",
         StreamCodec::Aac => "aac",
@@ -1460,6 +1464,28 @@ fn stream_codec(codec: &str) -> anyhow::Result<StreamCodec> {
         "wav" | "pcm" => Ok(StreamCodec::Wav),
         other => anyhow::bail!("unsupported stream codec {other:?}; expected mp3 or wav"),
     }
+}
+
+fn resolve_stream_host(
+    server: &ServerConfig,
+    inferred_local_ip: Option<IpAddr>,
+) -> anyhow::Result<IpAddr> {
+    if let Some(advertise_addr) = server.advertise_addr {
+        anyhow::ensure!(
+            !advertise_addr.is_unspecified(),
+            "server.advertise_addr must be a specific address reachable by Sonos, got {advertise_addr}"
+        );
+        return Ok(advertise_addr);
+    }
+    if !server.bind.is_unspecified() {
+        return Ok(server.bind);
+    }
+    inferred_local_ip.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot determine stream URL host: server.bind is unspecified and inferring a local \
+             address for the Sonos zone failed; set server.advertise_addr to this host's LAN IP"
+        )
+    })
 }
 
 async fn local_ip_for_remote(remote: IpAddr) -> Option<IpAddr> {
@@ -1849,6 +1875,63 @@ mod tests {
 
         assert!(!runtime.sessions[&session_id].desired_playback);
         assert!(runtime.sessions[&session_id].reset_needed);
+    }
+
+    fn ip(value: &str) -> IpAddr {
+        value.parse().expect("valid ip")
+    }
+
+    #[test]
+    fn resolve_stream_host_prefers_explicit_advertise_addr() {
+        let server = ServerConfig {
+            advertise_addr: Some(ip("192.0.2.5")),
+            bind: ip("192.0.2.99"),
+            ..ServerConfig::default()
+        };
+
+        let host = resolve_stream_host(&server, Some(ip("192.0.2.1"))).expect("host");
+
+        assert_eq!(host, ip("192.0.2.5"));
+    }
+
+    #[test]
+    fn resolve_stream_host_rejects_unspecified_advertise_addr() {
+        let server = ServerConfig {
+            advertise_addr: Some(ip("0.0.0.0")),
+            ..ServerConfig::default()
+        };
+
+        assert!(resolve_stream_host(&server, None).is_err());
+    }
+
+    #[test]
+    fn resolve_stream_host_uses_explicit_bind() {
+        let server = ServerConfig {
+            bind: ip("192.0.2.7"),
+            ..ServerConfig::default()
+        };
+
+        let host = resolve_stream_host(&server, None).expect("host");
+
+        assert_eq!(host, ip("192.0.2.7"));
+    }
+
+    #[test]
+    fn resolve_stream_host_uses_inferred_local_ip_when_bind_is_unspecified() {
+        let server = ServerConfig::default();
+
+        let host = resolve_stream_host(&server, Some(ip("192.0.2.1"))).expect("host");
+
+        assert_eq!(host, ip("192.0.2.1"));
+    }
+
+    #[test]
+    fn resolve_stream_host_fails_when_bind_is_unspecified_and_inference_fails() {
+        let server = ServerConfig::default();
+
+        let error = resolve_stream_host(&server, None).expect_err("must fail");
+
+        assert!(error.to_string().contains("server.advertise_addr"));
     }
 
     #[test]

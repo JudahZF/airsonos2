@@ -1,5 +1,9 @@
 [server]
 bind = "0.0.0.0"
+# Host advertised to Sonos in stream URLs. Optional when bind is a specific
+# address or the local IP can be inferred; required if the bridge cannot infer
+# a LAN IP reachable by Sonos (e.g. multi-homed hosts or unusual routing).
+# advertise_addr = "192.168.1.10"
 http_port = 7000
 state_dir = "/var/lib/airsonos2"
 log_level = "info"
