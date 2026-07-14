@@ -49,7 +49,7 @@ nix develop -c docker build -f packaging/docker/Dockerfile .
 
 ## Configuration
 
-Start from [docs/config.example.toml](docs/config.example.toml).
+Start from [docs/config.example.toml](docs/config.example.toml). When `[server].bind` is unspecified, AirSonos2 normally infers the local address used to reach each Sonos zone. Set `[server].advertise_addr` to a specific IPv4 or IPv6 LAN address when inference is unavailable or the host has multiple interfaces and Sonos must use a particular one.
 
 ```bash
 install -d ~/.local/state/airsonos2

@@ -20,7 +20,7 @@ ghcr.io/judahfuller/airsonos2
 
 ## Runtime
 
-On startup the app renders Home Assistant options to `/data/config.toml`, optionally runs `airsonos2 doctor --config /data/config.toml`, then starts `airsonos2 serve --config /data/config.toml`.
+On startup the app renders Home Assistant options to `/data/config.toml`, optionally runs `airsonos2 doctor --config /data/config.toml`, then starts `airsonos2 serve --config /data/config.toml`. If Sonos cannot reach automatically inferred stream URLs, set `advertise_addr` to the Home Assistant host's IPv4 or IPv6 LAN address.
 
 The health endpoint is available at:
 

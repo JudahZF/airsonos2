@@ -17,6 +17,7 @@ watchdog: http://[HOST]:7000/healthz
 options:
   log_level: info
   run_doctor_on_start: false
+  advertise_addr: null
   name_template: "{room} AirSonos2"
   advertised_model: AudioAccessory5,1
   pin: "3939"
@@ -47,6 +48,7 @@ options:
 schema:
   log_level: list(trace|debug|info|warn|error)
   run_doctor_on_start: bool
+  advertise_addr: str?
   name_template: str(1,)
   advertised_model: str(1,)
   pin: str(0,)

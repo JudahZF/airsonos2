@@ -17,6 +17,7 @@ const HA_METRICS_ADDR: &str = "0.0.0.0:9100";
 pub(crate) struct HomeAssistantOptions {
     pub(crate) log_level: String,
     pub(crate) run_doctor_on_start: bool,
+    pub(crate) advertise_addr: Option<String>,
     pub(crate) name_template: String,
     pub(crate) advertised_model: String,
     pub(crate) pin: String,
@@ -58,6 +59,7 @@ impl Default for HomeAssistantOptions {
         Self {
             log_level: config.server.log_level,
             run_doctor_on_start: false,
+            advertise_addr: config.server.advertise_addr.map(|ip| ip.to_string()),
             name_template: config.airplay.name_template,
             advertised_model: config.airplay.advertised_model,
             pin: config.airplay.pin,
@@ -108,6 +110,7 @@ impl HomeAssistantOptions {
         let mut config = Config::default();
 
         config.server.bind = HA_BIND.parse()?;
+        config.server.advertise_addr = parse_optional_ip(self.advertise_addr.as_deref())?;
         config.server.http_port = HA_HTTP_PORT;
         config.server.state_dir = PathBuf::from(HA_STATE_DIR);
         config.server.log_level = self.log_level.clone();
@@ -179,6 +182,17 @@ fn non_empty_password(password: &str) -> Option<String> {
     }
 }
 
+fn parse_optional_ip(value: Option<&str>) -> anyhow::Result<Option<IpAddr>> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .map_err(|error| anyhow::anyhow!("invalid advertise_addr {value:?}: {error}"))
+        })
+        .transpose()
+}
+
 fn parse_static_ips(values: &[String]) -> anyhow::Result<Vec<IpAddr>> {
     values
         .iter()
@@ -222,6 +236,7 @@ mod tests {
         assert_eq!(config.server.bind, defaults.server.bind);
         assert_eq!(config.server.http_port, defaults.server.http_port);
         assert_eq!(config.server.log_level, defaults.server.log_level);
+        assert_eq!(config.server.advertise_addr, defaults.server.advertise_addr);
         assert_eq!(config.server.state_dir, PathBuf::from(HA_STATE_DIR));
         assert_eq!(config.airplay, defaults.airplay);
         assert_eq!(config.sonos, defaults.sonos);
@@ -252,6 +267,31 @@ mod tests {
         let config = options.to_config().expect("config");
 
         assert_eq!(config.airplay.rtsp_password, None);
+    }
+
+    #[test]
+    fn advertise_addr_is_preserved_in_generated_toml() {
+        let options = HomeAssistantOptions::from_json_str(r#"{"advertise_addr":"2001:db8::20"}"#)
+            .expect("options");
+
+        let toml = render_config_toml(&options).expect("render");
+        let config = Config::from_toml_str(&toml).expect("generated config");
+
+        assert!(toml.contains("advertise_addr = \"2001:db8::20\""));
+        assert_eq!(
+            config.server.advertise_addr,
+            Some("2001:db8::20".parse::<IpAddr>().expect("ipv6"))
+        );
+    }
+
+    #[test]
+    fn advertise_addr_rejects_invalid_values() {
+        let options = HomeAssistantOptions {
+            advertise_addr: Some("not an ip".to_owned()),
+            ..HomeAssistantOptions::default()
+        };
+
+        assert!(options.to_config().is_err());
     }
 
     #[test]

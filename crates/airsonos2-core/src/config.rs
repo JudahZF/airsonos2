@@ -46,6 +46,9 @@ impl Config {
 #[serde(default)]
 pub struct ServerConfig {
     pub bind: IpAddr,
+    /// Explicit IP address advertised to Sonos in stream URLs. Required when
+    /// `bind` is unspecified (0.0.0.0/[::]) and the local address cannot be inferred.
+    pub advertise_addr: Option<IpAddr>,
     pub http_port: u16,
     pub state_dir: PathBuf,
     pub log_level: String,
@@ -55,6 +58,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0".parse().expect("valid default bind address"),
+            advertise_addr: None,
             http_port: 7000,
             state_dir: PathBuf::from("/var/lib/airsonos2"),
             log_level: "info".to_owned(),
@@ -221,6 +225,7 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.server.http_port, 7000);
+        assert_eq!(config.server.advertise_addr, None);
         assert_eq!(config.airplay.pin, "3939");
         assert_eq!(config.airplay.advertised_model, "AudioAccessory5,1");
         assert_eq!(config.airplay.rtsp_password, None);
@@ -259,6 +264,22 @@ mod tests {
                 "192.0.2.10".parse::<IpAddr>().expect("ipv4"),
                 "2001:db8::10".parse::<IpAddr>().expect("ipv6"),
             ]
+        );
+    }
+
+    #[test]
+    fn server_advertise_addr_can_be_configured() {
+        let config = Config::from_toml_str(
+            r#"
+            [server]
+            advertise_addr = "192.0.2.20"
+            "#,
+        )
+        .expect("valid config");
+
+        assert_eq!(
+            config.server.advertise_addr,
+            Some("192.0.2.20".parse::<IpAddr>().expect("ipv4"))
         );
     }
 
