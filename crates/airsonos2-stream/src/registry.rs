@@ -119,6 +119,7 @@ pub struct LiveStream {
     bytes_skipped: Arc<AtomicU64>,
     chunks_dropped: Arc<AtomicU64>,
     subscriber_connected: Arc<AtomicBool>,
+    delivery_open: Arc<AtomicBool>,
     ready: watch::Sender<bool>,
     subscriber: watch::Sender<bool>,
     playback_anchor: Arc<std::sync::Mutex<PlaybackAnchorState>>,
@@ -142,6 +143,7 @@ impl LiveStream {
             bytes_skipped: Arc::new(AtomicU64::new(0)),
             chunks_dropped: Arc::new(AtomicU64::new(0)),
             subscriber_connected: Arc::new(AtomicBool::new(false)),
+            delivery_open: Arc::new(AtomicBool::new(true)),
             ready,
             subscriber,
             playback_anchor: Arc::new(std::sync::Mutex::new(PlaybackAnchorState::Unset)),
@@ -154,6 +156,10 @@ impl LiveStream {
     /// Publish encoded stream bytes. Before an HTTP subscriber connects, chunks are
     /// dropped so Sonos starts at the live edge instead of replaying startup audio.
     pub fn publish(&self, bytes: Bytes) {
+        self.publish_inner(bytes, false);
+    }
+
+    fn publish_inner(&self, bytes: Bytes, bypass_delivery_hold: bool) {
         if bytes.is_empty() {
             return;
         }
@@ -163,7 +169,9 @@ impl LiveStream {
         self.note_first_encoded(len);
         let _ = self.ready.send(true);
 
-        if !self.subscriber_connected.load(Ordering::Acquire) {
+        if !self.subscriber_connected.load(Ordering::Acquire)
+            || (!bypass_delivery_hold && !self.delivery_open.load(Ordering::Acquire))
+        {
             self.bytes_dropped.fetch_add(len, Ordering::Relaxed);
             self.chunks_dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -190,7 +198,9 @@ impl LiveStream {
         self.note_first_encoded(len);
         let _ = self.ready.send(true);
 
-        if !self.subscriber_connected.load(Ordering::Acquire) {
+        if !self.subscriber_connected.load(Ordering::Acquire)
+            || !self.delivery_open.load(Ordering::Acquire)
+        {
             self.bytes_dropped.fetch_add(len, Ordering::Relaxed);
             self.chunks_dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -307,7 +317,7 @@ impl LiveStream {
             *prelude = Some(bytes.clone());
         }
 
-        self.publish(bytes);
+        self.publish_inner(bytes, true);
     }
 
     /// Called when Sonos (or another client) connects to the HTTP stream.
@@ -351,6 +361,15 @@ impl LiveStream {
             None
         };
         (prelude, subscriber)
+    }
+
+    /// Drop live audio until coordinated downstream playback is ready.
+    pub fn hold_delivery(&self) {
+        self.delivery_open.store(false, Ordering::Release);
+    }
+
+    pub fn open_delivery(&self) {
+        self.delivery_open.store(true, Ordering::Release);
     }
 
     pub fn set_playback_anchor(&self, anchor: Instant) {
@@ -537,6 +556,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staggered_subscribers_wait_for_the_same_delivery_gate() {
+        let stream = LiveStream::new(session());
+        stream.hold_delivery();
+        stream.on_subscriber_connected();
+        let mut first = stream.subscribe();
+        stream.publish(Bytes::from_static(b"before"));
+        let mut second = stream.subscribe();
+        stream.publish(Bytes::from_static(b"still-before"));
+
+        assert!(first.try_recv().is_err());
+        assert!(second.try_recv().is_err());
+        stream.open_delivery();
+        stream.publish(Bytes::from_static(b"together"));
+
+        assert_eq!(&first.try_recv().expect("first")[..], b"together");
+        assert_eq!(&second.try_recv().expect("second")[..], b"together");
+    }
+
+    #[tokio::test]
     async fn prelude_is_retained_when_published_before_subscriber_connects() {
         let stream = LiveStream::new(session());
 
@@ -568,6 +606,21 @@ mod tests {
 
         let chunk = rx.try_recv().expect("late prelude chunk");
         assert_eq!(&chunk[..], b"header");
+    }
+
+    #[tokio::test]
+    async fn held_delivery_still_sends_late_prelude_to_attached_subscriber() {
+        let stream = LiveStream::new(session());
+        stream.hold_delivery();
+        let (prelude, mut rx) = stream.attach_subscriber();
+
+        assert!(prelude.is_none());
+        stream.publish_prelude(Bytes::from_static(b"header"));
+        stream.publish(Bytes::from_static(b"held"));
+
+        let chunk = rx.try_recv().expect("late prelude chunk");
+        assert_eq!(&chunk[..], b"header");
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

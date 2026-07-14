@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use airsonos2_airplay::{
@@ -21,6 +22,7 @@ use clap::{Parser, Subcommand};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
@@ -469,6 +471,7 @@ struct BridgeRuntime {
     sessions: HashMap<SessionId, ZoneId>,
     session_formats: HashMap<SessionId, PcmFormat>,
     downstream_generations: HashMap<SessionId, u64>,
+    downstream_lifecycles: HashMap<SessionId, DownstreamLifecycle>,
     downstream_reset_needed: HashSet<SessionId>,
     desired_playback: HashMap<SessionId, bool>,
     /// Last known Sonos playback state per session (`true` = playing).
@@ -486,7 +489,8 @@ struct BridgeRuntime {
     prepared_rx: mpsc::UnboundedReceiver<PreparedDownstream>,
     cohort_wake_tx: mpsc::UnboundedSender<()>,
     cohort_wake_rx: mpsc::UnboundedReceiver<()>,
-    sync_cohort: Option<SyncCohort>,
+    sync_cohorts: VecDeque<SyncCohort>,
+    next_cohort_id: u64,
     startup_estimator: StartupDelayEstimator,
 }
 
@@ -494,6 +498,8 @@ struct SonosStreamPrepare {
     session_id: SessionId,
     zone_id: ZoneId,
     generation: u64,
+    cohort_id: u64,
+    lifecycle: DownstreamLifecycle,
     zone: SonosZone,
     client: SonosClient,
     live_stream: LiveStream,
@@ -507,7 +513,10 @@ struct SonosStreamPrepare {
 enum DownstreamStartOutcome {
     Started,
     Failed,
+    Cancelled,
 }
+
+type DownstreamLifecycle = Arc<CancellationToken>;
 
 #[derive(Clone, Debug)]
 struct DownstreamStartResult {
@@ -520,6 +529,7 @@ struct DownstreamStartResult {
 
 #[derive(Debug)]
 struct SyncCohort {
+    id: u64,
     opened_at: Instant,
     window_deadline: Instant,
     start_deadline: Instant,
@@ -532,6 +542,8 @@ struct PreparedDownstream {
     session_id: SessionId,
     zone_id: ZoneId,
     generation: u64,
+    cohort_id: u64,
+    lifecycle: DownstreamLifecycle,
     zone_room_name: String,
     client: SonosClient,
     live_stream: LiveStream,
@@ -570,6 +582,7 @@ impl BridgeRuntime {
             sessions: HashMap::new(),
             session_formats: HashMap::new(),
             downstream_generations: HashMap::new(),
+            downstream_lifecycles: HashMap::new(),
             downstream_reset_needed: HashSet::new(),
             desired_playback: HashMap::new(),
             playback_state: HashMap::new(),
@@ -586,7 +599,8 @@ impl BridgeRuntime {
             prepared_rx,
             cohort_wake_tx,
             cohort_wake_rx,
-            sync_cohort: None,
+            sync_cohorts: VecDeque::new(),
+            next_cohort_id: 0,
             startup_estimator,
         }
     }
@@ -635,7 +649,7 @@ impl BridgeRuntime {
                 }
                 wake = self.cohort_wake_rx.recv() => {
                     if wake.is_some() {
-                        self.maybe_start_sync_cohort(false).await;
+                        self.maybe_start_sync_cohorts();
                     }
                 }
             }
@@ -653,7 +667,10 @@ impl BridgeRuntime {
     fn clear_session_runtime_state(&mut self, session_id: SessionId) {
         self.playback_state.remove(&session_id);
         self.session_formats.remove(&session_id);
-        self.downstream_generations.remove(&session_id);
+        // Keep the generation tombstone: a late result must not match a later
+        // reuse of this AirPlay session id.
+        self.invalidate_prepared_downstream(session_id);
+        self.downstream_lifecycles.remove(&session_id);
         self.downstream_reset_needed.remove(&session_id);
         self.desired_playback.remove(&session_id);
         self.downstream_retry_attempts.remove(&session_id);
@@ -745,6 +762,7 @@ impl BridgeRuntime {
                     );
                 }
             }
+            DownstreamStartOutcome::Cancelled => {}
         }
     }
 
@@ -852,6 +870,10 @@ impl BridgeRuntime {
                 Ok(())
             }
             AirPlayEvent::ClientDisconnected { zone_id, addr } => {
+                // This callback identifies only the receiver zone, not the audio
+                // session. A stale control connection can disconnect after a new
+                // session has already started on the same zone, so exact session
+                // teardown is handled by SessionStopped instead.
                 info!(%zone_id, %addr, "AirPlay client disconnected");
                 Ok(())
             }
@@ -883,9 +905,6 @@ impl BridgeRuntime {
             encoder_state: EncoderState::Starting,
         };
         let live_stream = self.registry.create(stream_session).await;
-        if stream_codec == StreamCodec::Wav {
-            live_stream.arm_playback_anchor_on_next_timed_pcm();
-        }
         let encoder = FfmpegEncoder::spawn(
             FfmpegEncoderConfig {
                 ffmpeg_path: self.config.stream.ffmpeg_path.clone(),
@@ -900,10 +919,15 @@ impl BridgeRuntime {
         Ok((live_stream, encoder, local_url))
     }
 
-    fn next_downstream_generation(&mut self, session_id: SessionId) -> u64 {
+    fn next_downstream_generation(&mut self, session_id: SessionId) -> (u64, DownstreamLifecycle) {
+        self.cancel_downstream_lifecycle(session_id);
+        self.remove_session_from_sync_cohort(session_id);
         let generation = self.downstream_generations.entry(session_id).or_insert(0);
         *generation = generation.saturating_add(1);
-        *generation
+        let lifecycle = Arc::new(CancellationToken::new());
+        self.downstream_lifecycles
+            .insert(session_id, lifecycle.clone());
+        (*generation, lifecycle)
     }
 
     fn schedule_cohort_wake(&self, delay: Duration) {
@@ -914,17 +938,58 @@ impl BridgeRuntime {
         });
     }
 
-    fn add_session_to_sync_cohort(&mut self, session_id: SessionId) {
+    fn remove_session_from_sync_cohort(&mut self, session_id: SessionId) {
+        let mut removed = false;
+        for cohort in &mut self.sync_cohorts {
+            let old_len = cohort.sessions.len();
+            cohort.sessions.retain(|id| *id != session_id);
+            removed |= cohort.sessions.len() != old_len;
+            cohort.prepared.remove(&session_id);
+        }
+        self.sync_cohorts
+            .retain(|cohort| !cohort.sessions.is_empty());
+        if removed {
+            let _ = self.cohort_wake_tx.send(());
+        }
+    }
+
+    fn cancel_downstream_lifecycle(&self, session_id: SessionId) {
+        if let Some(lifecycle) = self.downstream_lifecycles.get(&session_id) {
+            lifecycle.cancel();
+        }
+    }
+
+    fn invalidate_prepared_downstream(&mut self, session_id: SessionId) {
+        self.cancel_downstream_lifecycle(session_id);
+        self.remove_session_from_sync_cohort(session_id);
+        if let Some(generation) = self.downstream_generations.get_mut(&session_id) {
+            *generation = generation.saturating_add(1);
+        }
+    }
+
+    fn prepared_downstream_is_current(&self, prepared: &PreparedDownstream) -> bool {
+        self.downstream_generations.get(&prepared.session_id) == Some(&prepared.generation)
+            && self.desired_playback.get(&prepared.session_id) == Some(&true)
+            && self
+                .downstream_lifecycles
+                .get(&prepared.session_id)
+                .is_some_and(|lifecycle| Arc::ptr_eq(lifecycle, &prepared.lifecycle))
+            && !prepared.lifecycle.is_cancelled()
+    }
+
+    fn add_session_to_sync_cohort(&mut self, session_id: SessionId) -> u64 {
         let now = Instant::now();
         let multi_select_window = Duration::from_millis(self.config.sync.multi_select_window_ms);
         let start_deadline = Duration::from_millis(self.config.sync.start_deadline_ms);
         let should_open = self
-            .sync_cohort
-            .as_ref()
-            .is_none_or(|cohort| now >= cohort.window_deadline || now >= cohort.start_deadline);
+            .sync_cohorts
+            .back()
+            .is_none_or(|cohort| now >= cohort.window_deadline);
 
         if should_open {
-            self.sync_cohort = Some(SyncCohort {
+            self.next_cohort_id = self.next_cohort_id.saturating_add(1);
+            self.sync_cohorts.push_back(SyncCohort {
+                id: self.next_cohort_id,
                 opened_at: now,
                 window_deadline: now + multi_select_window,
                 start_deadline: now + start_deadline,
@@ -935,15 +1000,15 @@ impl BridgeRuntime {
             self.schedule_cohort_wake(start_deadline);
         }
 
-        if let Some(cohort) = self.sync_cohort.as_mut()
-            && !cohort.sessions.contains(&session_id)
-        {
+        let cohort = self.sync_cohorts.back_mut().expect("cohort was opened");
+        if !cohort.sessions.contains(&session_id) {
             cohort.sessions.push(session_id);
         }
+        cohort.id
     }
 
     async fn handle_prepared_downstream(&mut self, prepared: PreparedDownstream) {
-        if self.downstream_generations.get(&prepared.session_id) != Some(&prepared.generation) {
+        if !self.prepared_downstream_is_current(&prepared) {
             debug!(
                 session_id = %prepared.session_id,
                 zone_id = %prepared.zone_id,
@@ -955,50 +1020,63 @@ impl BridgeRuntime {
         self.startup_estimator
             .record(prepared.zone_id.clone(), &prepared.timing);
 
-        let joined_cohort = self
-            .sync_cohort
-            .as_ref()
-            .is_some_and(|cohort| cohort.sessions.contains(&prepared.session_id));
-        if joined_cohort {
-            if let Some(cohort) = self.sync_cohort.as_mut() {
-                cohort.prepared.insert(prepared.session_id, prepared);
-            }
-            self.maybe_start_sync_cohort(false).await;
-            return;
+        if let Some(cohort) = self.sync_cohorts.iter_mut().find(|cohort| {
+            cohort.id == prepared.cohort_id && cohort.sessions.contains(&prepared.session_id)
+        }) {
+            cohort.prepared.insert(prepared.session_id, prepared);
+            self.maybe_start_sync_cohorts();
+        } else {
+            debug!("ignoring prepared downstream from replaced cohort");
         }
-
-        self.play_prepared_downstreams(vec![prepared]).await;
     }
 
-    async fn maybe_start_sync_cohort(&mut self, force: bool) {
-        let Some(cohort) = self.sync_cohort.as_ref() else {
-            return;
-        };
-        let now = Instant::now();
-        let should_start = sync_cohort_should_start(cohort, now, force);
-        let all_prepared =
-            !cohort.sessions.is_empty() && cohort.sessions.len() == cohort.prepared.len();
-        let deadline_expired = now >= cohort.start_deadline;
-        if !should_start {
-            return;
+    fn retry_unprepared_downstream(&mut self, session_id: SessionId) {
+        self.cancel_downstream_lifecycle(session_id);
+        if let Some(task) = self.playback_tasks.remove(&session_id) {
+            task.abort();
         }
+        let generation = self.downstream_generations.entry(session_id).or_insert(0);
+        *generation = generation.saturating_add(1);
+        let generation = *generation;
+        self.downstream_reset_needed.insert(session_id);
+        if self.desired_playback.get(&session_id) == Some(&true)
+            && let Some(zone_id) = self.sessions.get(&session_id).cloned()
+        {
+            self.schedule_downstream_retry(session_id, zone_id, generation);
+        }
+    }
 
-        let cohort = self.sync_cohort.take().expect("cohort exists");
-        let mut prepared = Vec::new();
-        for session_id in cohort.sessions {
-            if let Some(stream) = cohort.prepared.get(&session_id) {
-                prepared.push(stream.clone());
+    fn maybe_start_sync_cohorts(&mut self) {
+        while let Some(cohort) = self.sync_cohorts.front() {
+            let now = Instant::now();
+            if !sync_cohort_should_start(cohort, now) {
+                return;
             }
+            let all_prepared = cohort.sessions.len() == cohort.prepared.len();
+            let deadline_expired = now >= cohort.start_deadline;
+            let cohort = self.sync_cohorts.pop_front().expect("cohort exists");
+            let mut prepared = Vec::new();
+            let mut unprepared = Vec::new();
+            for session_id in cohort.sessions {
+                if let Some(stream) = cohort.prepared.get(&session_id) {
+                    prepared.push(stream.clone());
+                } else {
+                    unprepared.push(session_id);
+                }
+            }
+            for session_id in unprepared {
+                self.retry_unprepared_downstream(session_id);
+            }
+            if prepared.is_empty() {
+                continue;
+            }
+            let age_ms = cohort.opened_at.elapsed().as_millis();
+            info!(
+                sessions = prepared.len(),
+                age_ms, all_prepared, deadline_expired, "starting AirPlay multi-select sync cohort"
+            );
+            self.play_prepared_downstreams(prepared);
         }
-        if prepared.is_empty() {
-            return;
-        }
-        let age_ms = cohort.opened_at.elapsed().as_millis();
-        info!(
-            sessions = prepared.len(),
-            age_ms, all_prepared, deadline_expired, "starting AirPlay multi-select sync cohort"
-        );
-        self.play_prepared_downstreams(prepared).await;
     }
 
     fn apply_sync_anchors(&self, prepared: &[PreparedDownstream]) {
@@ -1042,19 +1120,25 @@ impl BridgeRuntime {
         }
     }
 
-    async fn play_prepared_downstreams(&self, prepared: Vec<PreparedDownstream>) {
+    fn play_prepared_downstreams(&self, prepared: Vec<PreparedDownstream>) {
         self.apply_sync_anchors(&prepared);
 
         let play_started_at = Instant::now();
+        let result_tx = self.downstream_result_tx.clone();
         let mut tasks = Vec::with_capacity(prepared.len());
         for stream in prepared {
-            let result_tx = self.downstream_result_tx.clone();
             tasks.push(tokio::spawn(async move {
                 info!(session_id = %stream.session_id, zone_id = %stream.zone_id, "starting Sonos playback");
                 let play_start = Instant::now();
                 let mut startup_timing = stream.timing.clone();
-                let outcome = match stream.client.play().await {
-                    Ok(()) => {
+                let play_result = tokio::select! {
+                    biased;
+                    _ = stream.lifecycle.cancelled() => None,
+                    result = stream.client.play() => Some(result),
+                };
+                let outcome = match play_result {
+                    None => DownstreamStartOutcome::Cancelled,
+                    Some(Ok(())) => {
                         startup_timing.play_ms = Some(play_start.elapsed().as_millis() as u64);
                         let timing = stream.live_stream.timing();
                         debug!(
@@ -1066,7 +1150,7 @@ impl BridgeRuntime {
                         );
                         DownstreamStartOutcome::Started
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         if error.is_timeout() {
                             startup_timing.play_ms = Some(play_start.elapsed().as_millis() as u64);
                             warn!(
@@ -1081,33 +1165,38 @@ impl BridgeRuntime {
                         }
                     }
                 };
+                (stream, outcome, startup_timing)
+            }));
+        }
+        let warn_ms = self.config.sync.play_command_spread_warn_ms;
+        tokio::spawn(async move {
+            let mut completed = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                match task.await {
+                    Ok(result) => completed.push(result),
+                    Err(error) => warn!("Sonos play task failed to join: {error}"),
+                }
+            }
+            for (stream, outcome, timing) in completed {
+                if outcome == DownstreamStartOutcome::Started && !stream.lifecycle.is_cancelled() {
+                    stream.live_stream.open_delivery();
+                }
                 let _ = result_tx.send(DownstreamStartResult {
                     session_id: stream.session_id,
                     zone_id: stream.zone_id,
                     generation: stream.generation,
                     outcome,
-                    timing: Some(startup_timing),
+                    timing: Some(timing),
                 });
-            }));
-        }
-
-        let mut last_completion = play_started_at;
-        for task in tasks {
-            if let Err(error) = task.await {
-                warn!("Sonos play task failed to join: {error}");
             }
-            last_completion = Instant::now();
-        }
-        let spread_ms = last_completion
-            .saturating_duration_since(play_started_at)
-            .as_millis() as u64;
-        if spread_ms > self.config.sync.play_command_spread_warn_ms {
-            warn!(
-                spread_ms,
-                warn_ms = self.config.sync.play_command_spread_warn_ms,
-                "coordinated Sonos Play commands completed slowly"
-            );
-        }
+            let spread_ms = play_started_at.elapsed().as_millis() as u64;
+            if spread_ms > warn_ms {
+                warn!(
+                    spread_ms,
+                    warn_ms, "coordinated Sonos Play commands completed slowly"
+                );
+            }
+        });
     }
 
     fn start_sonos_prepare_task(&self, start: SonosStreamPrepare) -> JoinHandle<()> {
@@ -1117,6 +1206,8 @@ impl BridgeRuntime {
             session_id,
             zone_id,
             generation,
+            cohort_id,
+            lifecycle,
             zone,
             client,
             live_stream,
@@ -1129,15 +1220,22 @@ impl BridgeRuntime {
             if force_standalone_on_start {
                 info!(%session_id, %zone_id, "setting Sonos zone standalone");
                 let started_at = Instant::now();
-                if let Err(error) = client.become_coordinator_of_standalone_group().await {
+                let standalone_result = tokio::select! {
+                    biased;
+                    _ = lifecycle.cancelled() => return,
+                    result = client.become_coordinator_of_standalone_group() => result,
+                };
+                if let Err(error) = standalone_result {
                     warn!(%session_id, %zone_id, "Sonos standalone request failed: {error:#}");
-                    let _ = result_tx.send(DownstreamStartResult {
-                        session_id,
-                        zone_id: zone_id.clone(),
-                        generation,
-                        outcome: DownstreamStartOutcome::Failed,
-                        timing: None,
-                    });
+                    if !lifecycle.is_cancelled() {
+                        let _ = result_tx.send(DownstreamStartResult {
+                            session_id,
+                            zone_id: zone_id.clone(),
+                            generation,
+                            outcome: DownstreamStartOutcome::Failed,
+                            timing: None,
+                        });
+                    }
                     return;
                 }
                 debug!(
@@ -1157,18 +1255,23 @@ impl BridgeRuntime {
             info!(%session_id, %zone_id, %local_url, "setting Sonos stream URI");
             let prepare_started_at = Instant::now();
             let uri_started_at = Instant::now();
-            if let Err(error) = client
-                .set_av_transport_uri(local_url.as_str(), &format!("{} AirSonos2", zone.room_name))
-                .await
-            {
+            let title = format!("{} AirSonos2", zone.room_name);
+            let set_uri_result = tokio::select! {
+                biased;
+                _ = lifecycle.cancelled() => return,
+                result = client.set_av_transport_uri(local_url.as_str(), &title) => result,
+            };
+            if let Err(error) = set_uri_result {
                 warn!(%session_id, %zone_id, "Sonos stream URI request failed: {error:#}");
-                let _ = result_tx.send(DownstreamStartResult {
-                    session_id,
-                    zone_id: zone_id.clone(),
-                    generation,
-                    outcome: DownstreamStartOutcome::Failed,
-                    timing: None,
-                });
+                if !lifecycle.is_cancelled() {
+                    let _ = result_tx.send(DownstreamStartResult {
+                        session_id,
+                        zone_id: zone_id.clone(),
+                        generation,
+                        outcome: DownstreamStartOutcome::Failed,
+                        timing: None,
+                    });
+                }
                 return;
             }
             debug!(
@@ -1178,10 +1281,18 @@ impl BridgeRuntime {
                 "Sonos stream URI request completed"
             );
 
-            let subscriber_ready = live_stream.wait_for_subscriber(subscriber_wait).await;
+            let subscriber_ready = tokio::select! {
+                biased;
+                _ = lifecycle.cancelled() => return,
+                ready = live_stream.wait_for_subscriber(subscriber_wait) => ready,
+            };
             if live_stream.session.codec == StreamCodec::Wav {
                 let prebuffer = Duration::from_millis(prebuffer_ms);
-                let ready = live_stream.wait_until_ready(prebuffer).await;
+                let ready = tokio::select! {
+                    biased;
+                    _ = lifecycle.cancelled() => return,
+                    ready = live_stream.wait_until_ready(prebuffer) => ready,
+                };
                 if !ready {
                     warn!(
                         %session_id,
@@ -1229,11 +1340,16 @@ impl BridgeRuntime {
                     .map(|at| at.saturating_duration_since(prepare_started_at).as_millis() as u64),
                 play_ms: None,
             };
+            if lifecycle.is_cancelled() {
+                return;
+            }
             if prepared_tx
                 .send(PreparedDownstream {
                     session_id,
                     zone_id: zone_id.clone(),
                     generation,
+                    cohort_id,
+                    lifecycle: lifecycle.clone(),
                     zone_room_name: zone.room_name,
                     client,
                     live_stream,
@@ -1275,7 +1391,7 @@ impl BridgeRuntime {
             .ok_or_else(|| anyhow::anyhow!("no Sonos client for zone {zone_id}"))?
             .clone();
         self.clear_session_runtime_state(session_id);
-        let generation = self.next_downstream_generation(session_id);
+        let (generation, lifecycle) = self.next_downstream_generation(session_id);
         let (live_stream, encoder, local_url) = self
             .create_downstream_stream(session_id, zone_id.clone(), zone.ip, format, generation)
             .await?;
@@ -1288,11 +1404,14 @@ impl BridgeRuntime {
 
         let force_standalone_on_start =
             self.config.sonos.force_standalone_on_start && !zone.is_group_coordinator;
-        self.add_session_to_sync_cohort(session_id);
+        live_stream.hold_delivery();
+        let cohort_id = self.add_session_to_sync_cohort(session_id);
         let task = self.start_sonos_prepare_task(SonosStreamPrepare {
             session_id,
             zone_id: zone_id.clone(),
             generation,
+            cohort_id,
+            lifecycle,
             zone,
             client,
             live_stream,
@@ -1332,7 +1451,7 @@ impl BridgeRuntime {
         }
         self.registry.remove(&session_id).await;
 
-        let generation = self.next_downstream_generation(session_id);
+        let (generation, lifecycle) = self.next_downstream_generation(session_id);
         let (live_stream, encoder, local_url) = self
             .create_downstream_stream(session_id, zone_id.clone(), zone.ip, format, generation)
             .await?;
@@ -1346,11 +1465,14 @@ impl BridgeRuntime {
             "recreated downstream stream for AirPlay playback"
         );
 
-        self.add_session_to_sync_cohort(session_id);
+        live_stream.hold_delivery();
+        let cohort_id = self.add_session_to_sync_cohort(session_id);
         let task = self.start_sonos_prepare_task(SonosStreamPrepare {
             session_id,
             zone_id: zone_id.clone(),
             generation,
+            cohort_id,
+            lifecycle,
             zone,
             client,
             live_stream,
@@ -1389,6 +1511,7 @@ impl BridgeRuntime {
 
         self.downstream_reset_needed.insert(session_id);
         self.cancel_downstream_retry(session_id);
+        self.invalidate_prepared_downstream(session_id);
         if let Some(task) = self.playback_tasks.remove(&session_id) {
             task.abort();
         }
@@ -1472,12 +1595,15 @@ fn should_restart_downstream_for_play(previous_playing: Option<bool>, reset_need
     previous_playing == Some(false) || reset_needed
 }
 
-fn sync_cohort_should_start(cohort: &SyncCohort, now: Instant, force: bool) -> bool {
+fn sync_cohort_should_start(cohort: &SyncCohort, now: Instant) -> bool {
     let window_closed = now >= cohort.window_deadline;
     let deadline_expired = now >= cohort.start_deadline;
     let all_prepared =
         !cohort.sessions.is_empty() && cohort.sessions.len() == cohort.prepared.len();
-    force || all_prepared || (window_closed && deadline_expired)
+    // The admission window is what lets a later AirPlay selection join the same
+    // coordinated start. Delivery stays gated while we wait, so every subscriber
+    // still begins at the same live edge when the cohort starts.
+    window_closed && (all_prepared || deadline_expired)
 }
 
 fn downstream_retry_delay(attempt: u32) -> Duration {
@@ -1510,6 +1636,8 @@ async fn local_ip_for_remote(remote: IpAddr) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn runtime() -> BridgeRuntime {
         let (cleanup_tx, _cleanup_rx) = mpsc::unbounded_channel();
@@ -1554,6 +1682,8 @@ mod tests {
             session_id,
             zone_id: zone_id.clone(),
             generation: 1,
+            cohort_id: 0,
+            lifecycle: Arc::new(CancellationToken::new()),
             zone_room_name: "Kitchen".to_owned(),
             client: SonosClient::from_base_url(
                 Url::parse("http://127.0.0.1:1400").expect("sonos url"),
@@ -1567,12 +1697,221 @@ mod tests {
         }
     }
 
+    fn cohort_with_single_prepared_session(now: Instant) -> SyncCohort {
+        let session_id = SessionId::new();
+        let mut cohort = SyncCohort {
+            id: 1,
+            opened_at: now,
+            window_deadline: now + Duration::from_millis(750),
+            start_deadline: now + Duration::from_millis(2_500),
+            sessions: vec![session_id],
+            prepared: HashMap::new(),
+        };
+        cohort.prepared.insert(
+            session_id,
+            prepared_downstream(session_id, zone_id(), StreamCodec::Mp3),
+        );
+        cohort
+    }
+
+    #[test]
+    fn single_prepared_session_waits_for_multi_select_window() {
+        let now = Instant::now();
+        let cohort = cohort_with_single_prepared_session(now);
+
+        assert!(!sync_cohort_should_start(&cohort, now));
+        assert!(!sync_cohort_should_start(
+            &cohort,
+            now + Duration::from_millis(700)
+        ));
+    }
+
+    #[test]
+    fn single_prepared_session_starts_once_window_closes() {
+        let now = Instant::now();
+        let cohort = cohort_with_single_prepared_session(now);
+
+        assert!(sync_cohort_should_start(
+            &cohort,
+            now + Duration::from_millis(750)
+        ));
+    }
+
+    #[test]
+    fn expired_start_deadline_does_not_bypass_multi_select_window() {
+        let now = Instant::now();
+        let mut cohort = cohort_with_single_prepared_session(now);
+        cohort.start_deadline = now + Duration::from_millis(500);
+
+        assert!(!sync_cohort_should_start(
+            &cohort,
+            now + Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
+    fn mixed_preparation_waits_until_deadline() {
+        let now = Instant::now();
+        let first = SessionId::new();
+        let mut cohort = SyncCohort {
+            id: 1,
+            opened_at: now,
+            window_deadline: now + Duration::from_millis(750),
+            start_deadline: now + Duration::from_millis(2_500),
+            sessions: vec![first, SessionId::new()],
+            prepared: HashMap::new(),
+        };
+        cohort.prepared.insert(
+            first,
+            prepared_downstream(first, zone_id(), StreamCodec::Mp3),
+        );
+
+        assert!(!sync_cohort_should_start(
+            &cohort,
+            now + Duration::from_millis(800)
+        ));
+        assert!(sync_cohort_should_start(
+            &cohort,
+            now + Duration::from_millis(2_500)
+        ));
+    }
+
+    #[test]
+    fn unprepared_cohort_waits_for_start_deadline() {
+        let now = Instant::now();
+        let cohort = SyncCohort {
+            id: 1,
+            opened_at: now,
+            window_deadline: now + Duration::from_millis(750),
+            start_deadline: now + Duration::from_millis(2_500),
+            sessions: vec![SessionId::new()],
+            prepared: HashMap::new(),
+        };
+
+        assert!(!sync_cohort_should_start(
+            &cohort,
+            now + Duration::from_millis(800)
+        ));
+        assert!(sync_cohort_should_start(
+            &cohort,
+            now + Duration::from_millis(2_500)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replacement_cohort_does_not_drain_unprepared_predecessor() {
+        let mut runtime = runtime();
+        let first = SessionId::new();
+        let first_id = runtime.add_session_to_sync_cohort(first);
+        runtime
+            .sync_cohorts
+            .back_mut()
+            .expect("cohort")
+            .window_deadline = Instant::now();
+        let second = SessionId::new();
+        let second_id = runtime.add_session_to_sync_cohort(second);
+        assert_ne!(first_id, second_id);
+        assert_eq!(runtime.sync_cohorts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn late_preparation_stays_with_its_original_cohort() {
+        let mut runtime = runtime();
+        let first = SessionId::new();
+        let first_zone = zone_id();
+        let first_lifecycle = Arc::new(CancellationToken::new());
+        runtime.downstream_generations.insert(first, 1);
+        runtime.desired_playback.insert(first, true);
+        runtime
+            .downstream_lifecycles
+            .insert(first, first_lifecycle.clone());
+        let first_id = runtime.add_session_to_sync_cohort(first);
+        runtime
+            .sync_cohorts
+            .back_mut()
+            .expect("cohort")
+            .window_deadline = Instant::now();
+        let second = SessionId::new();
+        let second_id = runtime.add_session_to_sync_cohort(second);
+        runtime.sync_cohorts[0].window_deadline = Instant::now() + Duration::from_secs(1);
+
+        let mut prepared = prepared_downstream(first, first_zone, StreamCodec::Mp3);
+        prepared.cohort_id = first_id;
+        prepared.lifecycle = first_lifecycle;
+        runtime.handle_prepared_downstream(prepared).await;
+
+        assert_ne!(first_id, second_id);
+        assert!(runtime.sync_cohorts[0].prepared.contains_key(&first));
+        assert!(runtime.sync_cohorts[1].prepared.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deadline_retries_unprepared_members_instead_of_abandoning_them() {
+        let mut runtime = runtime();
+        let unprepared_id = SessionId::new();
+        let zone_id = zone_id();
+        runtime.sessions.insert(unprepared_id, zone_id);
+        runtime.desired_playback.insert(unprepared_id, true);
+        runtime.downstream_generations.insert(unprepared_id, 4);
+        runtime
+            .downstream_lifecycles
+            .insert(unprepared_id, Arc::new(CancellationToken::new()));
+        runtime.sync_cohorts.push_back(SyncCohort {
+            id: 1,
+            opened_at: Instant::now() - Duration::from_secs(3),
+            window_deadline: Instant::now() - Duration::from_secs(2),
+            start_deadline: Instant::now() - Duration::from_secs(1),
+            sessions: vec![unprepared_id],
+            prepared: HashMap::new(),
+        });
+
+        runtime.maybe_start_sync_cohorts();
+
+        assert!(runtime.sync_cohorts.is_empty());
+        assert_eq!(runtime.downstream_generations.get(&unprepared_id), Some(&5));
+        assert!(runtime.downstream_reset_needed.contains(&unprepared_id));
+        assert!(runtime.downstream_retry_tasks.contains_key(&unprepared_id));
+        runtime.cancel_downstream_retry(unprepared_id);
+    }
+
+    #[tokio::test]
+    async fn cohort_creation_and_joining_within_multi_select_window() {
+        let mut runtime = runtime();
+        let first = SessionId::new();
+        let second = SessionId::new();
+
+        let first_id = runtime.add_session_to_sync_cohort(first);
+        let second_id = runtime.add_session_to_sync_cohort(second);
+
+        assert_eq!(first_id, second_id);
+        assert_eq!(
+            runtime.sync_cohorts.front().expect("cohort").sessions,
+            vec![first, second]
+        );
+    }
+
     #[tokio::test]
     async fn pause_marks_session_as_needing_downstream_reset() {
         let mut runtime = runtime();
         let session_id = SessionId::new();
         let zone_id = zone_id();
         runtime.sessions.insert(session_id, zone_id.clone());
+        runtime.desired_playback.insert(session_id, true);
+        runtime.downstream_generations.insert(session_id, 1);
+        let lifecycle = Arc::new(CancellationToken::new());
+        runtime
+            .downstream_lifecycles
+            .insert(session_id, lifecycle.clone());
+        let cohort_id = runtime.add_session_to_sync_cohort(session_id);
+        let mut prepared = prepared_downstream(session_id, zone_id.clone(), StreamCodec::Mp3);
+        prepared.cohort_id = cohort_id;
+        prepared.lifecycle = lifecycle;
+        runtime
+            .sync_cohorts
+            .front_mut()
+            .expect("cohort")
+            .prepared
+            .insert(session_id, prepared);
 
         runtime
             .set_playback_state(session_id, zone_id, false)
@@ -1581,6 +1920,7 @@ mod tests {
 
         assert_eq!(runtime.desired_playback.get(&session_id), Some(&false));
         assert!(runtime.downstream_reset_needed.contains(&session_id));
+        assert!(runtime.sync_cohorts.is_empty());
     }
 
     #[test]
@@ -1592,61 +1932,6 @@ mod tests {
     fn duplicate_play_retries_when_downstream_reset_is_still_needed() {
         assert!(should_restart_downstream_for_play(Some(true), true));
         assert!(!should_restart_downstream_for_play(Some(true), false));
-    }
-
-    #[tokio::test]
-    async fn cohort_creation_and_joining_within_multi_select_window() {
-        let mut runtime = runtime();
-        let first = SessionId::new();
-        let second = SessionId::new();
-
-        runtime.add_session_to_sync_cohort(first);
-        runtime.add_session_to_sync_cohort(second);
-
-        let cohort = runtime.sync_cohort.expect("cohort");
-        assert_eq!(cohort.sessions, vec![first, second]);
-    }
-
-    #[test]
-    fn all_prepared_cohort_starts_immediately() {
-        let now = Instant::now();
-        let session_id = SessionId::new();
-        let mut cohort = SyncCohort {
-            opened_at: now,
-            window_deadline: now + Duration::from_secs(1),
-            start_deadline: now + Duration::from_secs(3),
-            sessions: vec![session_id],
-            prepared: HashMap::new(),
-        };
-        cohort.prepared.insert(
-            session_id,
-            prepared_downstream(session_id, zone_id(), StreamCodec::Mp3),
-        );
-
-        assert!(sync_cohort_should_start(&cohort, now, false));
-    }
-
-    #[test]
-    fn cohort_deadline_waits_until_window_and_start_deadline_pass() {
-        let now = Instant::now();
-        let cohort = SyncCohort {
-            opened_at: now,
-            window_deadline: now + Duration::from_millis(750),
-            start_deadline: now + Duration::from_millis(2_500),
-            sessions: vec![SessionId::new()],
-            prepared: HashMap::new(),
-        };
-
-        assert!(!sync_cohort_should_start(
-            &cohort,
-            now + Duration::from_millis(800),
-            false
-        ));
-        assert!(sync_cohort_should_start(
-            &cohort,
-            now + Duration::from_millis(2_600),
-            false
-        ));
     }
 
     #[test]
@@ -1675,6 +1960,55 @@ mod tests {
         runtime.apply_sync_anchors(std::slice::from_ref(&prepared));
 
         assert!(prepared.live_stream.timing().playback_anchor_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn slow_play_does_not_block_ingestion_and_drops_preplay_audio() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("read request");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write response");
+        });
+
+        let runtime = runtime();
+        let session_id = SessionId::new();
+        let zone_id = zone_id();
+        let live_stream = live_stream_for(session_id, zone_id.clone(), StreamCodec::Mp3);
+        live_stream.hold_delivery();
+        live_stream.on_subscriber_connected();
+        let mut subscriber = live_stream.subscribe();
+        let prepared = PreparedDownstream {
+            session_id,
+            zone_id,
+            generation: 1,
+            cohort_id: 1,
+            lifecycle: Arc::new(CancellationToken::new()),
+            zone_room_name: "Kitchen".to_owned(),
+            client: SonosClient::from_base_url(
+                Url::parse(&format!("http://{addr}")).expect("sonos url"),
+            )
+            .expect("client"),
+            live_stream: live_stream.clone(),
+            timing: ZoneStartupTiming::default(),
+        };
+
+        let started_at = Instant::now();
+        runtime.play_prepared_downstreams(vec![prepared]);
+        assert!(started_at.elapsed() < Duration::from_millis(50));
+        live_stream.publish(b"stale".as_slice().into());
+        assert!(subscriber.try_recv().is_err());
+
+        server.await.expect("server task");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        live_stream.publish(b"live".as_slice().into());
+        assert_eq!(&subscriber.recv().await.expect("live audio")[..], b"live");
     }
 
     #[tokio::test]
@@ -1746,20 +2080,66 @@ mod tests {
         let session_id = SessionId::new();
         let zone_id = zone_id();
         runtime.downstream_generations.insert(session_id, 2);
-        runtime.add_session_to_sync_cohort(session_id);
+        let cohort_id = runtime.add_session_to_sync_cohort(session_id);
 
         let mut prepared = prepared_downstream(session_id, zone_id, StreamCodec::Mp3);
         prepared.generation = 1;
+        prepared.cohort_id = cohort_id;
         runtime.handle_prepared_downstream(prepared).await;
 
         assert!(
             runtime
-                .sync_cohort
-                .as_ref()
+                .sync_cohorts
+                .front()
                 .expect("cohort")
                 .prepared
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn same_zone_connection_disconnect_keeps_audio_session_valid() {
+        let mut runtime = runtime();
+        let kept = SessionId::new();
+        let kept_zone = zone_id();
+        let cohort_id = runtime.add_session_to_sync_cohort(kept);
+        runtime.sessions.insert(kept, kept_zone.clone());
+        runtime.downstream_generations.insert(kept, 1);
+        runtime.desired_playback.insert(kept, true);
+
+        runtime
+            .handle_event(AirPlayEvent::ClientDisconnected {
+                zone_id: kept_zone,
+                addr: "127.0.0.1:1".to_owned(),
+            })
+            .await
+            .expect("disconnect");
+
+        assert_eq!(runtime.downstream_generations.get(&kept), Some(&1));
+        assert!(
+            runtime
+                .sync_cohorts
+                .iter()
+                .any(|cohort| cohort.id == cohort_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_member_late_prepare_cannot_start_standalone() {
+        let mut runtime = runtime();
+        let session_id = SessionId::new();
+        let zone = zone_id();
+        runtime.sessions.insert(session_id, zone.clone());
+        runtime.downstream_generations.insert(session_id, 1);
+        runtime.desired_playback.insert(session_id, true);
+        let cohort_id = runtime.add_session_to_sync_cohort(session_id);
+        runtime.invalidate_prepared_downstream(session_id);
+        let mut prepared = prepared_downstream(session_id, zone, StreamCodec::Mp3);
+        prepared.cohort_id = cohort_id;
+        runtime.handle_prepared_downstream(prepared).await;
+
+        assert!(runtime.sync_cohorts.is_empty());
+        assert!(runtime.downstream_result_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1808,7 +2188,7 @@ mod tests {
         assert!(!runtime.sessions.contains_key(&session_id));
         assert!(!runtime.session_formats.contains_key(&session_id));
         assert!(!runtime.desired_playback.contains_key(&session_id));
-        assert!(!runtime.downstream_generations.contains_key(&session_id));
+        assert_eq!(runtime.downstream_generations.get(&session_id), Some(&9));
         assert!(!runtime.downstream_reset_needed.contains(&session_id));
         assert!(!runtime.paused_cleanup_tasks.contains_key(&session_id));
         assert!(!runtime.playback_tasks.contains_key(&session_id));
