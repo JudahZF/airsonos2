@@ -9,6 +9,7 @@ use tokio::time;
 use url::Url;
 
 use crate::client::SonosClient;
+use crate::sonos_addr;
 use crate::topology::ZoneGroupMember;
 use crate::xml::{DeviceDescriptionError, parse_device_description};
 
@@ -159,10 +160,10 @@ pub async fn discover_sonos_zones_from_sources(
 }
 
 fn device_description_url(ip: IpAddr) -> Result<Url, url::ParseError> {
-    match ip {
-        IpAddr::V4(ip) => Url::parse(&format!("http://{ip}:1400/xml/device_description.xml")),
-        IpAddr::V6(ip) => Url::parse(&format!("http://[{ip}]:1400/xml/device_description.xml")),
-    }
+    Url::parse(&format!(
+        "http://{}/xml/device_description.xml",
+        sonos_addr(ip)
+    ))
 }
 
 async fn enrich_zone_topology(mut zones: Vec<SonosZone>) -> Result<Vec<SonosZone>, DiscoveryError> {
