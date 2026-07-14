@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+quick-xml-encoding = ["quick-xml/encoding"]
+
 [dependencies]
 airsonos2-core.workspace = true
 quick-xml.workspace = true
