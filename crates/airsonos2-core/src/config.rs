@@ -46,8 +46,8 @@ impl Config {
 #[serde(default)]
 pub struct ServerConfig {
     pub bind: IpAddr,
-    /// Explicit host advertised to Sonos in stream URLs. Required when `bind`
-    /// is unspecified (0.0.0.0/[::]) and the local address cannot be inferred.
+    /// Explicit IP address advertised to Sonos in stream URLs. Required when
+    /// `bind` is unspecified (0.0.0.0/[::]) and the local address cannot be inferred.
     pub advertise_addr: Option<IpAddr>,
     pub http_port: u16,
     pub state_dir: PathBuf,

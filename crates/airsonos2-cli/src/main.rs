@@ -1455,15 +1455,17 @@ async fn stream_url_for_zone(
     } else {
         None
     };
-    let host = resolve_stream_host(&config.server, inferred_local_ip)?;
+    let host = resolve_stream_host(&config.server, inferred_local_ip).map_err(|error| {
+        anyhow::anyhow!("cannot advertise stream to Sonos zone at {zone_ip}: {error}")
+    })?;
     let extension = match codec {
         StreamCodec::Mp3 => "mp3",
         StreamCodec::Aac => "aac",
         StreamCodec::Wav => "wav",
     };
+    let stream_addr = SocketAddr::new(host, config.server.http_port);
     let mut url = Url::parse(&format!(
-        "http://{}:{}/streams/{session_id}.{extension}",
-        host, config.server.http_port
+        "http://{stream_addr}/streams/{session_id}.{extension}"
     ))?;
     url.query_pairs_mut()
         .append_pair("gen", &generation.to_string());
@@ -1610,6 +1612,69 @@ mod tests {
 
     fn ip(value: &str) -> IpAddr {
         value.parse().expect("valid ip")
+    }
+
+    #[tokio::test]
+    async fn stream_url_formats_ipv4_advertise_addr() {
+        let mut config = Config::default();
+        config.server.advertise_addr = Some(ip("192.0.2.5"));
+
+        let url = stream_url_for_zone(
+            &config,
+            ip("192.0.2.50"),
+            SessionId::new(),
+            StreamCodec::Mp3,
+            7,
+        )
+        .await
+        .expect("stream url");
+
+        assert_eq!(url.host_str(), Some("192.0.2.5"));
+        assert_eq!(url.port(), Some(7000));
+        assert!(url.as_str().starts_with("http://192.0.2.5:7000/streams/"));
+        assert_eq!(url.query(), Some("gen=7"));
+    }
+
+    #[tokio::test]
+    async fn stream_url_brackets_ipv6_advertise_addr() {
+        let mut config = Config::default();
+        config.server.advertise_addr = Some(ip("2001:db8::5"));
+
+        let url = stream_url_for_zone(
+            &config,
+            ip("2001:db8::50"),
+            SessionId::new(),
+            StreamCodec::Wav,
+            11,
+        )
+        .await
+        .expect("stream url");
+
+        assert_eq!(url.host_str(), Some("[2001:db8::5]"));
+        assert_eq!(url.port(), Some(7000));
+        assert!(
+            url.as_str()
+                .starts_with("http://[2001:db8::5]:7000/streams/")
+        );
+        assert_eq!(url.query(), Some("gen=11"));
+    }
+
+    #[tokio::test]
+    async fn stream_url_error_identifies_sonos_zone() {
+        let mut config = Config::default();
+        config.server.advertise_addr = Some(ip("0.0.0.0"));
+
+        let error = stream_url_for_zone(
+            &config,
+            ip("192.0.2.50"),
+            SessionId::new(),
+            StreamCodec::Mp3,
+            1,
+        )
+        .await
+        .expect_err("unspecified advertise address must fail");
+
+        assert!(error.to_string().contains("Sonos zone at 192.0.2.50"));
     }
 
     #[test]

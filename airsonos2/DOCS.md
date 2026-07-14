@@ -21,6 +21,12 @@ ffmpeg_path = "/usr/bin/ffmpeg"
 metrics_addr = "0.0.0.0:9100"
 ```
 
+Set `advertise_addr` to the Home Assistant host address that Sonos should use when pulling audio streams if automatic route-based address detection is unavailable or chooses the wrong interface. Both IPv4 and IPv6 addresses are supported; IPv6 stream URLs are rendered with the required brackets.
+
+```yaml
+advertise_addr: 192.168.1.10
+```
+
 Use `static_ips` when SSDP multicast does not reach every Sonos speaker. Use `include_rooms` and `exclude_rooms` to limit which visible Sonos rooms receive AirPlay endpoints.
 
 `stream_codec` supports `mp3` and `wav`. MP3 is the compatibility default. WAV can reduce startup latency when your Sonos devices accept it.
