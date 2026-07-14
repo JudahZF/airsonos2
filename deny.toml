@@ -1,0 +1,14 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0071", # rsa: Marvin attack — no fix available (rsa 0.10 is RC)
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -17,6 +17,8 @@ jobs:
         run: nix develop -c cargo clippy --workspace --all-features -- -D warnings
       - name: Test
         run: nix develop -c cargo test --workspace --all-features
+      - name: Dependency policy
+        run: nix develop -c cargo deny check advisories bans sources
       - name: Docker build
         run: docker build -f packaging/docker/Dockerfile .
       - name: Home Assistant Docker build

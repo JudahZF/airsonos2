@@ -3,6 +3,9 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    # cargo-deny in nixos-25.05 (0.18.2) cannot parse CVSS 4.0 advisories;
+    # pull a newer one from nixos-25.11 (pinned commit).
+    nixpkgs-cargo-deny.url = "github:NixOS/nixpkgs/b6018f87da91d19d0ab4cf979885689b469cdd41";
     rust-overlay.url = "github:oxalica/rust-overlay";
   };
 
@@ -10,6 +13,7 @@
     {
       self,
       nixpkgs,
+      nixpkgs-cargo-deny,
       rust-overlay,
     }:
     let
@@ -50,7 +54,7 @@
           default = pkgs.mkShell {
             packages = [
               rustToolchain
-              pkgs.cargo-deny
+              nixpkgs-cargo-deny.legacyPackages.${pkgs.stdenv.hostPlatform.system}.cargo-deny
               pkgs.cargo-nextest
               pkgs.cargo-zigbuild
               pkgs.ffmpeg

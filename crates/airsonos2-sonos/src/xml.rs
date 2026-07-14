@@ -4,6 +4,8 @@ use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
 
+use crate::sonos_addr;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceDescription {
     pub room_name: String,
@@ -61,7 +63,7 @@ pub fn parse_device_description(
     let udn = device
         .udn
         .ok_or(DeviceDescriptionError::MissingField("UDN"))?;
-    let base_url = Url::parse(&format!("http://{ip}:1400"))?;
+    let base_url = Url::parse(&format!("http://{}", sonos_addr(ip)))?;
 
     Ok(DeviceDescription {
         room_name,
@@ -95,5 +97,24 @@ mod tests {
         assert_eq!(description.model_name, "Sonos Play:1");
         assert_eq!(description.rincon_id(), "RINCON_000E58AAAAAA01400");
         assert_eq!(description.base_url.as_str(), "http://192.0.2.11:1400/");
+    }
+
+    #[test]
+    fn builds_bracketed_base_url_for_ipv6() {
+        let xml = r#"
+        <root>
+          <device>
+            <friendlyName>Kitchen</friendlyName>
+            <roomName>Kitchen</roomName>
+            <modelName>Sonos Play:1</modelName>
+            <UDN>uuid:RINCON_000E58AAAAAA01400</UDN>
+          </device>
+        </root>
+        "#;
+
+        let description = parse_device_description(xml, "2001:db8::11".parse().expect("ip"))
+            .expect("description");
+
+        assert_eq!(description.base_url.as_str(), "http://[2001:db8::11]:1400/");
     }
 }

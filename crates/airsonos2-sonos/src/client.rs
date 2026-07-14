@@ -9,6 +9,7 @@ use crate::soap::{
     parse_get_volume_response, pause_body, play_body, set_av_transport_uri_body,
     set_av_transport_uri_metadata, set_volume_body, stop_body,
 };
+use crate::sonos_addr;
 use crate::topology::{ZoneGroupMember, parse_zone_group_state};
 
 #[derive(Clone, Debug)]
@@ -19,7 +20,7 @@ pub struct SonosClient {
 
 impl SonosClient {
     pub fn new(ip: IpAddr) -> Result<Self, SonosClientError> {
-        let base_url = Url::parse(&format!("http://{ip}:1400"))?;
+        let base_url = Url::parse(&format!("http://{}", sonos_addr(ip)))?;
         Self::from_base_url(base_url)
     }
 
@@ -127,5 +128,17 @@ pub enum SonosClientError {
 impl SonosClientError {
     pub fn is_timeout(&self) -> bool {
         matches!(self, Self::Http(error) if error.is_timeout())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_url_formats_ipv6_literals() {
+        let client = SonosClient::new("2001:db8::10".parse().expect("ipv6")).expect("client");
+
+        assert_eq!(client.base_url().as_str(), "http://[2001:db8::10]:1400/");
     }
 }
