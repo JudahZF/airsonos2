@@ -19,6 +19,7 @@ options:
   http_bind: "0.0.0.0"
   diagnostics_addr: "0.0.0.0:9100"
   run_doctor_on_start: false
+  advertise_addr: null
   name_template: "{room} AirSonos2"
   advertised_model: AudioAccessory5,1
   pin: "3939"
@@ -46,6 +47,7 @@ schema:
   http_bind: str
   diagnostics_addr: str
   run_doctor_on_start: bool
+  advertise_addr: str?
   name_template: str(1,)
   advertised_model: str(1,)
   pin: str(0,)

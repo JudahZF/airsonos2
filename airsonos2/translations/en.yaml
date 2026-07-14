@@ -11,6 +11,9 @@ configuration:
   run_doctor_on_start:
     name: Run doctor on start
     description: Run AirSonos2 diagnostics during startup and continue even if diagnostics warn or fail.
+  advertise_addr:
+    name: Advertised stream address
+    description: Optional host IP that Sonos uses to pull audio streams. Leave empty to detect it per speaker.
   name_template:
     name: AirPlay name template
     description: Display name pattern for generated AirPlay endpoints. Use {room} for the Sonos room name.
