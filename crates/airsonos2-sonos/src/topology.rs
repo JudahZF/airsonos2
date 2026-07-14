@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::{Decoder, Reader};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZoneGroupMember {
@@ -23,12 +23,14 @@ pub fn parse_zone_group_state(xml: &str) -> Vec<ZoneGroupMember> {
         match reader.read_event() {
             Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
                 if element.name().as_ref() == b"ZoneGroup" {
-                    current_coordinator = attr(&element, b"Coordinator");
+                    current_coordinator = attr(&element, b"Coordinator", reader.decoder());
                 } else if element.name().as_ref() == b"ZoneGroupMember" {
-                    let uuid = attr(&element, b"UUID").unwrap_or_default();
-                    let zone_name = attr(&element, b"ZoneName").unwrap_or_default();
-                    let location = attr(&element, b"Location");
-                    let invisible = attr(&element, b"Invisible").unwrap_or_default() == "1";
+                    let decoder = reader.decoder();
+                    let uuid = attr(&element, b"UUID", decoder).unwrap_or_default();
+                    let zone_name = attr(&element, b"ZoneName", decoder).unwrap_or_default();
+                    let location = attr(&element, b"Location", decoder);
+                    let invisible =
+                        attr(&element, b"Invisible", decoder).unwrap_or_default() == "1";
                     let is_group_coordinator = current_coordinator.as_deref() == Some(&uuid);
 
                     groups.push(ZoneGroupMember {
@@ -49,12 +51,17 @@ pub fn parse_zone_group_state(xml: &str) -> Vec<ZoneGroupMember> {
     groups
 }
 
-fn attr(element: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
+fn attr(
+    element: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+    decoder: Decoder,
+) -> Option<String> {
     element.attributes().flatten().find_map(|attribute| {
         if attribute.key.as_ref() == key {
             // Fall back to the raw value if unescaping fails (e.g. malformed entity).
+            #[allow(deprecated)]
             let value = attribute
-                .unescape_value()
+                .decode_and_unescape_value(decoder)
                 .map(Cow::into_owned)
                 .unwrap_or_else(|_| String::from_utf8_lossy(attribute.value.as_ref()).into_owned());
             Some(value)
@@ -106,6 +113,23 @@ mod tests {
             members[0].location.as_deref(),
             Some("http://192.0.2.1:1400/xml/device_description.xml?a=1&b=2")
         );
+        assert!(members[0].is_group_coordinator);
+    }
+
+    #[test]
+    fn preserves_raw_attribute_value_when_unescaping_fails() {
+        let xml = r#"
+        <ZoneGroups>
+          <ZoneGroup Coordinator="RINCON_KITCHEN" ID="RINCON_KITCHEN:1">
+            <ZoneGroupMember UUID="RINCON_KITCHEN" ZoneName="Kitchen &unknown; Den" Invisible="0" />
+          </ZoneGroup>
+        </ZoneGroups>
+        "#;
+
+        let members = parse_zone_group_state(xml);
+
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].zone_name, "Kitchen &unknown; Den");
         assert!(members[0].is_group_coordinator);
     }
 }
