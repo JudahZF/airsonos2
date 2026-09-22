@@ -52,7 +52,7 @@ nix develop -c docker build -f packaging/docker/Dockerfile .
 Start from [docs/config.example.toml](docs/config.example.toml).
 
 ```bash
-install -d ~/.local/state/airsonos2
+sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/airsonos2
 cargo run -p airsonos2-cli -- serve --config docs/config.example.toml
 ```
 
@@ -65,7 +65,9 @@ auto_discover = false
 static_ips = ["192.168.20.10", "192.168.20.11"]
 ```
 
-You can also leave `auto_discover = true` and use `static_ips` as extra discovery seeds.
+You can also leave `auto_discover = true` and use `static_ips` as fallback discovery seeds, including when multicast fails. Discovery has one overall deadline, tries up to four seeds at once, and uses the first nonempty topology. Only topology-confirmed visible rooms are advertised; nested satellite speakers stay hidden. Endpoints are sorted by stable zone ID so discovery response order does not change RTSP assignments.
+
+The source command above uses the example's `/var/lib/airsonos2` and assigns it to the current user. For the systemd service, create the `airsonos2` service user and use `sudo install -d -o airsonos2 -g airsonos2 /var/lib/airsonos2` instead; systemd also manages this directory through `StateDirectory=airsonos2`. Run doctor as the same user that runs the service.
 
 The service creates one virtual AirPlay endpoint per included Sonos room. It persists virtual endpoint identity metadata under `state_dir/endpoints` and AirPlay 2 pairing keys under `state_dir/pairings`.
 
@@ -113,3 +115,11 @@ See [playback timing and offset migration](docs/playback-timing.md) before reusi
 ## License Notice
 
 AirSonos2 is licensed as `MIT OR Apache-2.0`. The AirPlay receiver dependency `shairplay` is licensed `LGPL-3.0-or-later`; downstream distributors should review the LGPL obligations for their packaging model.
+
+## Operational checks
+
+`doctor` validates the selected codec, tests a short MP3 encode with a five-second deadline, and skips FFmpeg for native WAV. It discovers and filters the configured rooms before testing their exact RTSP port range, the HTTP listener, and the diagnostics listener. It writes and removes temporary probes in the state, endpoint and pairing directories to check the runtime user's access. Port checks require the service to be stopped.
+
+Stream HTTP exposes `/healthz` for container and Home Assistant health checks. Detailed `/metrics` is available only on `[diagnostics].metrics_addr` (default `0.0.0.0:9100`). Set that address to a local or management interface when needed. Device discovery and SOAP connect directly, ignore ambient HTTP proxies, refuse redirects, and bound response sizes.
+
+Release publication runs the reusable CI checks on the tagged commit. The tag, workspace Cargo version, and Home Assistant version must agree before either architecture is published.

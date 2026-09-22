@@ -12,6 +12,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("invalid configuration: {0}")]
+    Invalid(String),
     #[error("failed to parse config TOML: {0}")]
     Parse(#[from] toml::de::Error),
 }
@@ -29,7 +31,73 @@ pub struct Config {
 
 impl Config {
     pub fn from_toml_str(toml: &str) -> Result<Self, ConfigError> {
-        Ok(toml::from_str(toml)?)
+        let config: Self = toml::from_str(toml)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Shared validation for file configuration and Home Assistant options.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |message: &str| ConfigError::Invalid(message.to_owned());
+        if self.server.http_port == 0 || self.airplay.base_rtsp_port == 0 {
+            return Err(invalid("HTTP and base RTSP ports must be in 1..=65535"));
+        }
+        let diagnostics = self
+            .diagnostics
+            .metrics_addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| invalid("diagnostics.metrics_addr must be an IP address and port"))?;
+        if diagnostics.port() == 0 {
+            return Err(invalid(
+                "diagnostics.metrics_addr port must be in 1..=65535",
+            ));
+        }
+        if self.server.state_dir.as_os_str().is_empty() {
+            return Err(invalid("server.state_dir must not be empty"));
+        }
+        if self.airplay.name_template.trim().is_empty()
+            || self.airplay.advertised_model.trim().is_empty()
+        {
+            return Err(invalid(
+                "AirPlay name_template and advertised_model must not be empty",
+            ));
+        }
+        if !(8_000..=192_000).contains(&self.airplay.output_sample_rate)
+            || !(1..=2).contains(&self.airplay.output_channels)
+        {
+            return Err(invalid(
+                "AirPlay output must have 8000..=192000 samples/second and 1..=2 channels",
+            ));
+        }
+        if self.airplay.max_clients_per_zone == 0 {
+            return Err(invalid("airplay.max_clients_per_zone must be positive"));
+        }
+        if !matches!(self.stream.codec.as_str(), "mp3" | "wav") {
+            return Err(invalid("stream.codec must be mp3 or wav"));
+        }
+        if !(32..=320).contains(&self.stream.mp3_bitrate_kbps) {
+            return Err(invalid("stream.mp3_bitrate_kbps must be in 32..=320"));
+        }
+        if !(-10_000..=10_000).contains(&self.sync.default_offset_ms)
+            || self
+                .sync
+                .zone_offsets_ms
+                .values()
+                .any(|offset| !(-10_000..=10_000).contains(offset))
+        {
+            return Err(invalid(
+                "sync offsets must be in -10000..=10000 milliseconds",
+            ));
+        }
+        if self.sync.startup_sample_limit == 0
+            || self.sync.startup_min_samples == 0
+            || self.sync.startup_min_samples > self.sync.startup_sample_limit
+        {
+            return Err(invalid(
+                "sync startup sample counts must be positive and min_samples must not exceed sample_limit",
+            ));
+        }
+        Ok(())
     }
 
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -215,6 +283,25 @@ impl Default for SyncConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_offsets_that_can_overflow_runtime_deadlines() {
+        for value in [i64::MIN, -10_001, 10_001, i64::MAX] {
+            assert!(
+                Config::from_toml_str(&format!("[sync]\ndefault_offset_ms = {value}")).is_err()
+            );
+            assert!(
+                Config::from_toml_str(&format!("[sync.zone_offsets_ms]\nKitchen = {value}"))
+                    .is_err()
+            );
+        }
+        assert!(
+            Config::from_toml_str(
+                "[sync]\ndefault_offset_ms = -10000\n[sync.zone_offsets_ms]\nKitchen = 10000"
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn config_defaults_match_public_interface() {

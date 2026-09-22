@@ -12,7 +12,7 @@ use airsonos2_core::{
     VirtualAirPlayEndpoint, ZoneId, ZoneStartupTiming, configured_delays, filter_zones,
     sonos_volume_to_airplay_db, virtual_endpoint_for_zone,
 };
-use airsonos2_diagnostics::{CheckStatus, run_doctor};
+use airsonos2_diagnostics::{CheckStatus, run_doctor, serve_diagnostics};
 use airsonos2_sonos::{SonosClient, discover_sonos_zones_from_sources};
 use airsonos2_stream::{
     FfmpegEncoder, FfmpegEncoderConfig, LiveStream, StreamRegistry, serve_stream_http,
@@ -250,6 +250,7 @@ fn calibrate(zones: &[String], config: &Config) -> anyhow::Result<()> {
 }
 
 async fn serve(config: Config) -> anyhow::Result<()> {
+    let diagnostics_addr: SocketAddr = config.diagnostics.metrics_addr.parse()?;
     fs::create_dir_all(config.server.state_dir.join("endpoints"))?;
     fs::create_dir_all(config.server.state_dir.join("pairings"))?;
 
@@ -291,10 +292,22 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         config.stream.ffmpeg_path.clone(),
     ));
     info!("stream HTTP server listening on {}", http_addr);
+    let diagnostics_cancel = tokio_util::sync::CancellationToken::new();
+    let mut diagnostics_task = tokio::spawn(serve_diagnostics(
+        diagnostics_addr,
+        registry.clone(),
+        diagnostics_cancel.clone(),
+    ));
 
     let result = tokio::select! {
         result = runtime.run(events_rx, cleanup_rx) => result,
         signal = shutdown_signal() => signal,
+        diagnostics_result = &mut diagnostics_task => {
+            match diagnostics_result {
+                Ok(result) => result.map_err(Into::into),
+                Err(error) => Err(error.into()),
+            }
+        }
         http_result = &mut http_task => {
             match http_result {
                 Ok(result) => result.map_err(Into::into),
@@ -308,8 +321,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         http_task.abort();
         let _ = http_task.await;
     }
+    diagnostics_cancel.cancel();
     registry.close_all().await;
     let cleanup = async {
+        if !diagnostics_task.is_finished() {
+            let _ = (&mut diagnostics_task).await;
+        }
         for runner in &mut runners {
             runner.stop().await;
         }
@@ -319,6 +336,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         .await
         .is_err()
     {
+        diagnostics_task.abort();
         warn!("shutdown exceeded its 10 second deadline; cancelling remaining work");
     }
     result
