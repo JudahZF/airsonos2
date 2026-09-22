@@ -64,6 +64,9 @@
               pkgs.zig
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.alsa-lib
+              pkgs.wayland
+              pkgs.libxkbcommon
               pkgs.docker
             ];
 
