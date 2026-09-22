@@ -28,7 +28,13 @@ pub struct OutputConfig {
 }
 
 /// Run the realtime audio receiver loop.
-pub async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn AudioHandler>, output_config: OutputConfig) {
+pub async fn run(
+    socket: UdpSocket,
+    shk: [u8; 32],
+    handler: Arc<dyn AudioHandler>,
+    output_config: OutputConfig,
+    mut commands: tokio::sync::mpsc::Receiver<super::buffered_audio::PlayoutCommand>,
+) {
     let cipher = ChaCha20Poly1305::new((&shk).into());
     let mut buf = vec![0u8; 4096];
     let config = &output_config.alac;
@@ -42,15 +48,29 @@ pub async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn AudioHandler
     let mut resampler = StreamResampler::new(src_sr, target_sr, out_ch as usize);
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
 
+    let mut last_sequence: Option<u16> = None;
+    let mut playing = true;
     info!("Realtime ALAC receiver started");
 
     loop {
-        let n = match socket.recv(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                warn!("Realtime audio recv error: {e}");
-                break;
+        let n = tokio::select! {
+            result = socket.recv(&mut buf) => match result {
+                Ok(0) => break, Ok(n) => n,
+                Err(error) => { warn!(%error, "Realtime receive failed"); break; }
+            },
+            command = commands.recv() => {
+                match command {
+                    Some(super::buffered_audio::PlayoutCommand::Flush { until_seq, .. }) => {
+                        last_sequence = Some(until_seq as u16);
+                        decoder.set_info(&super::buffer::build_decoder_info(config));
+                        #[cfg(feature = "resample")]
+                        { resampler = StreamResampler::new(src_sr, target_sr, out_ch as usize); }
+                        if let Some(session) = &mut session { session.audio_flush(); }
+                    }
+                    Some(super::buffered_audio::PlayoutCommand::SetRate { rate, .. }) => { playing = rate != 0; },
+                    Some(super::buffered_audio::PlayoutCommand::Stop) | None => break,
+                }
+                continue;
             }
         };
 
@@ -73,6 +93,15 @@ pub async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn AudioHandler
                 continue;
             }
         };
+
+        let sequence = u16::from_be_bytes([packet[2], packet[3]]);
+        if last_sequence.is_some_and(|last| sequence.wrapping_sub(last) as i16 <= 0) {
+            continue;
+        }
+        last_sequence = Some(sequence);
+        if !playing {
+            continue;
+        }
 
         // Decode ALAC → f32 PCM
         let Some(mut samples) = decoder.decode_frame_f32(&alac_data) else {

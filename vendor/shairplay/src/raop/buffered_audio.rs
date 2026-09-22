@@ -132,7 +132,7 @@ impl BufferedAudioProcessor {
         output_config: OutputConfig,
         handler: Arc<dyn AudioHandler>,
         tasks: &mut tokio::task::JoinSet<()>,
-    ) -> tokio::sync::mpsc::Sender<PlayoutCommand> {
+    ) -> (tokio::sync::mpsc::Sender<PlayoutCommand>, tokio::task::AbortHandle) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
         let default_sr = output_config.sample_rate.unwrap_or(44100);
 
@@ -185,7 +185,7 @@ impl BufferedAudioProcessor {
             state: state.clone(),
             delivery: Some(delivery),
         };
-        tasks.spawn(async move {
+        let task = tasks.spawn(async move {
             let cleanup = cleanup;
             loop {
                 let cmd = tokio::select! {
@@ -249,7 +249,7 @@ impl BufferedAudioProcessor {
             while children.join_next().await.is_some() {}
         });
 
-        cmd_tx
+        (cmd_tx, task)
     }
 }
 
@@ -419,6 +419,9 @@ async fn receive_loop(
                 samples = rs.process(&samples);
             }
 
+            if samples.is_empty() {
+                continue;
+            }
             loop {
                 let admitted = {
                     let (lock, cvar) = &*state;
@@ -586,7 +589,7 @@ mod ownership_tests {
             let processor = BufferedAudioProcessor::bind("127.0.0.1:0").await.unwrap();
             let address = processor.listener.local_addr().unwrap();
             let mut tasks = tokio::task::JoinSet::new();
-            let commands = processor.start(
+            let (commands, _) = processor.start(
                 [0; 32],
                 OutputConfig {
                     sample_rate: None,

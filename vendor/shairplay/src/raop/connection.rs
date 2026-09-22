@@ -18,6 +18,7 @@ use std::sync::Arc;
 pub(crate) struct ControllerSession {
     pub owner: Option<String>,
     pub owner_connection: Option<String>,
+    pub media_abort: Option<tokio::task::AbortHandle>,
     pub playout: Option<tokio::sync::mpsc::Sender<super::buffered_audio::PlayoutCommand>>,
 }
 
@@ -75,6 +76,7 @@ impl HttpdCallbacks for RaopShared {
 
         let conn = handlers::RaopConnection {
             tasks: tokio::task::JoinSet::new(),
+            audio_tasks: tokio::task::JoinSet::new(),
             #[cfg(feature = "ap2")]
             controller_id: None,
             #[cfg(feature = "ap2")]
@@ -165,6 +167,9 @@ impl Drop for RaopConnectionHandler {
                 if let Some(cmd) = active.playout.take() {
                     let _ = cmd.try_send(super::buffered_audio::PlayoutCommand::Stop);
                 }
+                if let Some(task) = active.media_abort.take() {
+                    task.abort();
+                }
                 active.owner = None;
                 active.owner_connection = None;
             }
@@ -179,6 +184,7 @@ impl ConnectionHandler for RaopConnectionHandler {
             if let Some(mut rtp) = self.conn.raop_rtp.take() {
                 rtp.shutdown().await;
             }
+            self.conn.audio_tasks.shutdown().await;
             self.conn.tasks.shutdown().await;
         })
     }
