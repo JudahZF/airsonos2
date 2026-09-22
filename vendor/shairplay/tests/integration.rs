@@ -56,6 +56,7 @@ async fn start_server() -> (RaopServer, u16, TestState) {
     });
     let mut server = RaopServer::builder()
         .name("IntegrationTest")
+        .password("legacy-test")
         .hwaddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
         .port(0)
         .build(handler)
@@ -75,6 +76,18 @@ async fn send_rtsp(stream: &mut TcpStream, request: &str) -> String {
     let mut buf = vec![0u8; 4096];
     let n = stream.read(&mut buf).await.unwrap();
     String::from_utf8_lossy(&buf[..n]).to_string()
+}
+
+async fn authorize(stream: &mut TcpStream, method: &str, uri: &str) -> String {
+    use md5::{Digest, Md5};
+    let response = send_rtsp(stream, &format!("{method} {uri} RTSP/1.0\r\nCSeq: 0\r\n\r\n")).await;
+    let nonce = response.split("nonce=\"").nth(1).unwrap().split('"').next().unwrap();
+    let a = format!("{:x}", Md5::digest(b"test:airplay:legacy-test"));
+    let b = format!("{:x}", Md5::digest(format!("{method}:{uri}")));
+    let hash = format!("{:x}", Md5::digest(format!("{a}:{nonce}:{b}")));
+    format!(
+        "Authorization: Digest username=\"test\", realm=\"airplay\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{hash}\"\r\n"
+    )
 }
 
 fn empty_handler() -> Arc<TestHandler> {
@@ -283,7 +296,12 @@ async fn teardown_closes_connection() {
     let (mut server, port, _) = start_server().await;
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
-    let resp = send_rtsp(&mut stream, "TEARDOWN /test HTTP/1.0\r\nCSeq: 1\r\n\r\n").await;
+    let auth = authorize(&mut stream, "TEARDOWN", "/test").await;
+    let resp = send_rtsp(
+        &mut stream,
+        &format!("TEARDOWN /test HTTP/1.0\r\n{auth}CSeq: 1\r\n\r\n"),
+    )
+    .await;
     assert!(resp.contains("200 OK"));
     assert!(resp.contains("Connection: close"));
 
@@ -735,9 +753,10 @@ async fn set_parameter_volume_calls_handler() {
     let (mut server, port, state) = start_server().await;
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
 
+    let auth = authorize(&mut stream, "SET_PARAMETER", &format!("rtsp://127.0.0.1/{port}")).await;
     let body = "volume: -20.000000\r\n";
     let req = format!(
-        "SET_PARAMETER rtsp://127.0.0.1/{} RTSP/1.0\r\nCSeq: 1\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{}",
+        "SET_PARAMETER rtsp://127.0.0.1/{} RTSP/1.0\r\n{auth}CSeq: 1\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{}",
         port,
         body.len(),
         body
@@ -765,8 +784,9 @@ async fn set_parameter_metadata_calls_handler() {
         0x6d, 0x6c, 0x69, 0x74, 0x00, 0x00, 0x00, 0x0c, 0x6d, 0x69, 0x6e, 0x6d, 0x00, 0x00, 0x00, 0x04, 0x54, 0x65,
         0x73, 0x74,
     ];
+    let auth = authorize(&mut stream, "SET_PARAMETER", &format!("rtsp://127.0.0.1/{port}")).await;
     let header = format!(
-        "SET_PARAMETER rtsp://127.0.0.1/{} RTSP/1.0\r\nCSeq: 1\r\nContent-Type: application/x-dmap-tagged\r\nContent-Length: {}\r\n\r\n",
+        "SET_PARAMETER rtsp://127.0.0.1/{} RTSP/1.0\r\n{auth}CSeq: 1\r\nContent-Type: application/x-dmap-tagged\r\nContent-Length: {}\r\n\r\n",
         port,
         dmap.len()
     );
@@ -793,8 +813,9 @@ async fn set_parameter_coverart_calls_handler() {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
 
     let jpeg = b"\xff\xd8\xff\xe0fake-jpeg-data";
+    let auth = authorize(&mut stream, "SET_PARAMETER", &format!("rtsp://127.0.0.1/{port}")).await;
     let header = format!(
-        "SET_PARAMETER rtsp://127.0.0.1/{} RTSP/1.0\r\nCSeq: 1\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+        "SET_PARAMETER rtsp://127.0.0.1/{} RTSP/1.0\r\n{auth}CSeq: 1\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
         port,
         jpeg.len()
     );
@@ -811,5 +832,31 @@ async fn set_parameter_coverart_calls_handler() {
         assert_eq!(&art[0], jpeg);
     }
 
+    server.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn unauthenticated_second_connection_cannot_change_volume_or_pause() {
+    let (mut server, port, state) = start_server().await;
+    let mut owner = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let auth = authorize(&mut owner, "SET_PARAMETER", "/test").await;
+    let body = "volume: -10\r\n";
+    assert!(send_rtsp(&mut owner, &format!("SET_PARAMETER /test RTSP/1.0\r\n{auth}Content-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}", body.len())).await.contains("200 OK"));
+    let mut other = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    for method in ["SET_PARAMETER", "SETRATEANCHORTIME", "TEARDOWN"] {
+        assert!(
+            send_rtsp(
+                &mut other,
+                &format!(
+                    "{method} /test RTSP/1.0\r\nContent-Type: text/parameters\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+            )
+            .await
+            .contains("401 Unauthorized")
+        );
+    }
+    assert_eq!(*state.volumes.lock().unwrap(), vec![-10.0]);
     server.stop().await;
 }

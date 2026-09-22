@@ -470,6 +470,7 @@ pub type PairingKeyLookup<'a> = Option<&'a dyn Fn(&str) -> Option<[u8; 32]>>;
 
 /// Server-side pair-verify using Curve25519 ECDH + Ed25519 signatures.
 pub struct PairVerifyServer {
+    pub(crate) controller_id: Option<String>,
     device_id: String,
     server_sk: SigningKey,
     server_eph_sk: [u8; 32],
@@ -491,6 +492,7 @@ impl PairVerifyServer {
         let eph_pk = x25519_dalek::PublicKey::from(&static_secret);
 
         Self {
+            controller_id: None,
             device_id: device_id.to_string(),
             server_sk: sk,
             server_eph_sk: eph_sk_bytes,
@@ -594,6 +596,7 @@ impl PairVerifyServer {
                     .map_err(|_| CryptoError::PairingHandshake("Verify M3: invalid signature length".into()))?,
             );
             vk.verify(&info, &sig).map_err(|_| CryptoError::PairingVerify)?;
+            self.controller_id = Some(identifier.to_owned());
             tracing::info!("Pair-verify: client signature verified");
         }
 

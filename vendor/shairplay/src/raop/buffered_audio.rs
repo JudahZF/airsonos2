@@ -59,9 +59,10 @@ pub enum PlayoutCommand {
 struct PlayoutState {
     buffer: BTreeMap<u32, Vec<f32>>, // rtp_timestamp → F32 PCM samples
     anchor_rtp: u32,
-    anchor_local_ns: u64,
+    anchor_local: std::time::Instant,
     rate: u32,
     sample_rate: u32,
+    source_sample_rate: u32,
     channels: u8,
     stopped: bool,
     stop_reason: Option<AudioStopReason>,
@@ -98,9 +99,10 @@ impl BufferedAudioProcessor {
             Mutex::new(PlayoutState {
                 buffer: BTreeMap::new(),
                 anchor_rtp: 0,
-                anchor_local_ns: 0,
+                anchor_local: std::time::Instant::now(),
                 rate: 0,
                 sample_rate: default_sr,
+                source_sample_rate: 44100,
                 channels: 2,
                 stopped: false,
                 stop_reason: None,
@@ -139,10 +141,10 @@ impl BufferedAudioProcessor {
                             // Set anchor so the earliest buffered frame is deliverable
                             // with a small lead time for smooth playback
                             if let Some(&first_ts) = s.buffer.keys().next() {
-                                let lead_frames = s.sample_rate / 10; // 100ms lead
+                                let lead_frames = s.source_sample_rate / 10; // 100ms lead
                                 s.anchor_rtp = first_ts.wrapping_sub(lead_frames);
                             }
-                            s.anchor_local_ns = now_ns();
+                            s.anchor_local = std::time::Instant::now();
                             let stale: Vec<u32> = s
                                 .buffer
                                 .keys()
@@ -221,6 +223,22 @@ async fn receive_loop(
     let mut output_channels: u8 = 2;
 
     loop {
+        // Stop reading TCP at two seconds or 8 MiB of decoded PCM, whichever is
+        // smaller. One bounded decoded packet may wait outside the queue.
+        loop {
+            let full = {
+                let s = state.0.lock().unwrap();
+                if s.stopped {
+                    return;
+                }
+                let queued: usize = s.buffer.values().map(Vec::len).sum();
+                queued >= pcm_budget(s.sample_rate, s.channels) / 2
+            };
+            if !full {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         if stream.read_exact(&mut len_buf).await.is_err() {
             break;
         }
@@ -240,6 +258,27 @@ async fn receive_loop(
         let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
         let ssrc_val = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
         let ssrc = AudioSsrc::from_u32(ssrc_val);
+
+        // Decrypt
+        let pkt_len = packet.len();
+        let mut nonce = [0u8; 12];
+        nonce[4..12].copy_from_slice(&packet[pkt_len - NONCE_TRAIL_LEN..]);
+        let aad = packet[4..12].to_vec();
+        let ciphertext = &packet[RTP_HEADER_LEN..pkt_len - NONCE_TRAIL_LEN];
+
+        let plaintext = match cipher.decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        ) {
+            Ok(p) => p,
+            Err(_) => {
+                debug!("Audio decrypt failed");
+                continue;
+            }
+        };
 
         // Detect format change
         if ssrc != AudioSsrc::None && ssrc != current_ssrc {
@@ -268,31 +307,11 @@ async fn receive_loop(
             let (lock, cvar) = &*state;
             let mut s = lock.lock().unwrap();
             s.sample_rate = target_sr;
+            s.source_sample_rate = src_sr;
             s.channels = target_ch;
             s.format_changed = true;
             cvar.notify_all();
         }
-
-        // Decrypt
-        let pkt_len = packet.len();
-        let mut nonce = [0u8; 12];
-        nonce[4..12].copy_from_slice(&packet[pkt_len - NONCE_TRAIL_LEN..]);
-        let aad = packet[4..12].to_vec();
-        let ciphertext = &packet[RTP_HEADER_LEN..pkt_len - NONCE_TRAIL_LEN];
-
-        let plaintext = match cipher.decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        ) {
-            Ok(p) => p,
-            Err(_) => {
-                debug!("Audio decrypt failed");
-                continue;
-            }
-        };
 
         // Decode
         let pcm = if let Some(dec) = &mut decoder {
@@ -318,10 +337,31 @@ async fn receive_loop(
                 samples = rs.process(&samples);
             }
 
-            let (lock, cvar) = &*state;
-            let mut s = lock.lock().unwrap();
-            s.buffer.insert(timestamp, samples);
-            cvar.notify_all();
+            loop {
+                let admitted = {
+                    let (lock, cvar) = &*state;
+                    let mut s = lock.lock().unwrap();
+                    if s.stopped {
+                        return;
+                    }
+                    let budget = pcm_budget(s.sample_rate, s.channels);
+                    if samples.len() > budget {
+                        return;
+                    }
+                    let queued: usize = s.buffer.values().map(Vec::len).sum();
+                    if queued + samples.len() <= budget {
+                        s.buffer.insert(timestamp, std::mem::take(&mut samples));
+                        cvar.notify_all();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if admitted {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         }
     }
     debug!("Buffered audio receive loop ended");
@@ -377,9 +417,7 @@ fn delivery_loop(
             session = Some(handler.audio_init(format));
         }
 
-        let now = now_ns();
-        let elapsed_ns = now.saturating_sub(s.anchor_local_ns);
-        let elapsed_frames = (elapsed_ns as u128 * s.sample_rate as u128 / 1_000_000_000) as u32;
+        let elapsed_frames = source_frames(s.anchor_local.elapsed(), s.source_sample_rate);
         let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
 
         let ready: Vec<(u32, Vec<f32>)> = s
@@ -407,10 +445,21 @@ fn delivery_loop(
     info!("Delivery loop ended");
 }
 
-/// Current wall-clock time in nanoseconds since UNIX epoch.
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+fn source_frames(elapsed: std::time::Duration, sample_rate: u32) -> u32 {
+    (elapsed.as_nanos() * u128::from(sample_rate) / 1_000_000_000) as u32
+}
+
+fn pcm_budget(sample_rate: u32, channels: u8) -> usize {
+    (sample_rate as usize * channels as usize * 2).min(8 * 1024 * 1024 / 4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn resampled_playout_uses_source_clock() {
+        assert_eq!(source_frames(std::time::Duration::from_secs(1), 44100), 44100);
+        assert_eq!(pcm_budget(48000, 2), 192000);
+        assert!(pcm_budget(192000, 8) * 4 <= 8 * 1024 * 1024);
+    }
 }

@@ -141,10 +141,10 @@ pub struct RaopRtp {
 impl RaopRtp {
     /// Create a new RTP session from SDP parameters and AES session keys.
     /// Does not bind sockets or start receiving — call [`start`](Self::start) for that.
-    pub fn new(callbacks: Arc<dyn AudioHandler>, config: RtpConfig) -> Self {
-        let buffer = RaopBuffer::new(&config.rtpmap, &config.fmtp, &config.aes_key, &config.aes_iv);
+    pub fn new(callbacks: Arc<dyn AudioHandler>, config: RtpConfig) -> Option<Self> {
+        let buffer = RaopBuffer::new(&config.rtpmap, &config.fmtp, &config.aes_key, &config.aes_iv)?;
         let alac_config = buffer.config().clone();
-        Self {
+        Some(Self {
             handler: callbacks,
             remote: config.remote,
             local_addr: config.local_addr,
@@ -158,7 +158,7 @@ impl RaopRtp {
             control_lport: 0,
             timing_lport: 0,
             data_lport: 0,
-        }
+        })
     }
 
     /// Bind UDP/TCP sockets and spawn the async receive task.
@@ -203,7 +203,7 @@ impl RaopRtp {
                 codec: AudioCodec::Pcm,
                 bits: 32,
                 channels: config.num_channels,
-                sample_rate: config.sample_rate,
+                sample_rate: self.output_sample_rate.unwrap_or(config.sample_rate),
             });
 
             #[cfg(feature = "resample")]

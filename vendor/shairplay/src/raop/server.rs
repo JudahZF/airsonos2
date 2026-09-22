@@ -224,7 +224,22 @@ impl RaopServerBuilder {
         #[cfg(feature = "ap2")]
         let airplay_model = self.model.clone();
 
+        #[cfg(not(feature = "resample"))]
+        if self.output_sample_rate.is_some() {
+            return Err(ServerError::InvalidConfig("output rate requires resample feature".into()).into());
+        }
+        if self
+            .output_sample_rate
+            .is_some_and(|rate| !(8000..=192000).contains(&rate))
+            || self
+                .output_max_channels
+                .is_some_and(|channels| !(1..=2).contains(&channels))
+        {
+            return Err(ServerError::InvalidConfig("unsupported output format".into()).into());
+        }
         let shared = Arc::new(RaopShared {
+            #[cfg(feature = "ap2")]
+            controller_session: Default::default(),
             rsakey,
             pairing,
             hwaddr: hwaddr.clone(),

@@ -13,8 +13,27 @@ use crate::proto::http::{HttpRequest, HttpResponse};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+#[cfg(feature = "ap2")]
+#[derive(Default)]
+pub(crate) struct ControllerSession {
+    pub owner: Option<String>,
+    pub owner_connection: Option<String>,
+    pub playout: Option<tokio::sync::mpsc::UnboundedSender<super::buffered_audio::PlayoutCommand>>,
+}
+
+#[cfg(feature = "ap2")]
+impl ControllerSession {
+    pub fn permits(&self, authenticated: bool, controller: Option<&str>) -> bool {
+        self.owner
+            .as_deref()
+            .is_none_or(|owner| authenticated && controller == Some(owner))
+    }
+}
+
 /// Shared state passed to each connection.
 pub(crate) struct RaopShared {
+    #[cfg(feature = "ap2")]
+    pub(crate) controller_session: Arc<std::sync::Mutex<ControllerSession>>,
     pub(crate) rsakey: Arc<RsaKey>,
     pub(crate) pairing: Arc<Pairing>,
     pub(crate) hwaddr: Vec<u8>,
@@ -55,6 +74,10 @@ impl HttpdCallbacks for RaopShared {
         };
 
         let conn = handlers::RaopConnection {
+            #[cfg(feature = "ap2")]
+            controller_id: None,
+            #[cfg(feature = "ap2")]
+            controller_session: self.controller_session.clone(),
             raop_rtp: None,
             fairplay: FairPlay::new(),
             pairing: self.pairing.create_session(),
@@ -134,6 +157,17 @@ struct RaopConnectionHandler {
 
 impl Drop for RaopConnectionHandler {
     fn drop(&mut self) {
+        #[cfg(feature = "ap2")]
+        {
+            let mut active = self.conn.controller_session.lock().unwrap();
+            if active.owner_connection.as_ref() == Some(&self.conn.nonce) {
+                if let Some(cmd) = active.playout.take() {
+                    let _ = cmd.send(super::buffered_audio::PlayoutCommand::Stop);
+                }
+                active.owner = None;
+                active.owner_connection = None;
+            }
+        }
         self.conn.handler.on_client_disconnected(&self.remote_addr);
     }
 }
@@ -198,3 +232,19 @@ impl ConnectionHandler for RaopConnectionHandler {
 }
 
 // On drop, RTP session is cleaned up automatically (RaopRtp dropped → shutdown sent)
+
+#[cfg(all(test, feature = "ap2"))]
+mod authorization_tests {
+    use super::*;
+    #[test]
+    fn only_verified_same_controller_can_use_separate_connection() {
+        let active = ControllerSession {
+            owner: Some("paired-controller".into()),
+            ..Default::default()
+        };
+        assert!(!active.permits(false, None));
+        assert!(!active.permits(false, Some("paired-controller")));
+        assert!(!active.permits(true, Some("other-controller")));
+        assert!(active.permits(true, Some("paired-controller")));
+    }
+}

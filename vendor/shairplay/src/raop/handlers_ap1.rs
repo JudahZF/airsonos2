@@ -15,6 +15,10 @@ use crate::crypto::pairing_homekit::{PairVerifyServer, SrpServer};
 
 /// Per-connection state for RTSP handler dispatch. Equivalent to raop_conn_t.
 pub(crate) struct RaopConnection {
+    #[cfg(feature = "ap2")]
+    pub controller_id: Option<String>,
+    #[cfg(feature = "ap2")]
+    pub controller_session: Arc<std::sync::Mutex<super::connection::ControllerSession>>,
     pub raop_rtp: Option<RaopRtp>,
     pub fairplay: FairPlay,
     pub pairing: PairingSession,
@@ -213,12 +217,22 @@ pub(crate) fn handle_announce(
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
     let data = request.data()?;
+    if data.len() > 16 * 1024 {
+        *response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
+        return None;
+    }
     let sdp_str = std::str::from_utf8(data).ok()?;
     let sdp = Sdp::parse(sdp_str);
 
     let remote = sdp.connection()?;
     let rtpmap = sdp.rtpmap()?;
     let fmtp = sdp.fmtp()?;
+    if super::buffer::parse_fmtp(fmtp)
+        .is_none_or(|config| conn.output_max_channels.is_some_and(|max| config.num_channels > max))
+    {
+        *response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
+        return None;
+    }
     let aesiv_str = sdp.aesiv()?;
 
     let mut aeskey = [0u8; 16];
@@ -241,11 +255,17 @@ pub(crate) fn handle_announce(
     };
 
     let key_bytes = key_bytes?;
+    if key_bytes.len() != 16 {
+        return None;
+    }
     if key_bytes.len() >= 16 {
         aeskey.copy_from_slice(&key_bytes[..16]);
     }
 
     let iv_bytes = conn.rsakey.decode(aesiv_str).ok()?;
+    if iv_bytes.len() != 16 {
+        return None;
+    }
     if iv_bytes.len() >= 16 {
         aesiv.copy_from_slice(&iv_bytes[..16]);
     }
@@ -253,7 +273,7 @@ pub(crate) fn handle_announce(
     // Destroy existing RTP session if any
     conn.raop_rtp = None;
 
-    conn.raop_rtp = Some(RaopRtp::new(
+    conn.raop_rtp = RaopRtp::new(
         conn.handler.clone(),
         crate::raop::rtp::RtpConfig {
             remote: remote.to_string(),
@@ -265,7 +285,7 @@ pub(crate) fn handle_announce(
             output_sample_rate: conn.output_sample_rate,
             remote_socket: conn.remote_socket,
         },
-    ));
+    );
 
     if conn.raop_rtp.is_none() {
         response.set_disconnect(true);

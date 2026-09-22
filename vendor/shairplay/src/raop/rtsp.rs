@@ -184,16 +184,67 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
     response.add_header("CSeq", cseq);
     response.add_header("Apple-Jack-Status", "connected; type=analog");
 
-    // --- Middleware: authentication ---
-    if method != "OPTIONS" && !conn.password.is_empty() {
-        let authorization = request.header("Authorization");
-        if !digest::is_valid("airplay", &conn.password, &conn.nonce, method, url, authorization) {
-            let auth_str = format!("Digest realm=\"airplay\", nonce=\"{}\"", conn.nonce);
+    // Pairing and capability negotiation are public. Every mutating route requires
+    // either a completed AP2 handshake or explicitly configured legacy credentials.
+    let public = method == "OPTIONS"
+        || (method == "GET" && matches!(url, "/info" | "/server-info"))
+        || (method == "POST" && matches!(url, "/pair-setup" | "/pair-verify" | "/fp-setup"));
+    if !public
+        && matches!(
+            method,
+            "ANNOUNCE"
+                | "SETUP"
+                | "RECORD"
+                | "PAUSE"
+                | "FLUSH"
+                | "FLUSHBUFFERED"
+                | "TEARDOWN"
+                | "SET_PARAMETER"
+                | "GET_PARAMETER"
+                | "SETRATEANCHORTIME"
+                | "SETPEERS"
+                | "SETPEERSX"
+                | "POST"
+                | "PUT"
+        )
+    {
+        #[cfg(feature = "ap2")]
+        let ap2_authenticated = conn.ap2_shared_secret.is_some() && conn.controller_id.is_some();
+        #[cfg(not(feature = "ap2"))]
+        let ap2_authenticated = false;
+        let legacy_authenticated = !conn.password.is_empty()
+            && digest::is_valid(
+                "airplay",
+                &conn.password,
+                &conn.nonce,
+                method,
+                url,
+                request.header("Authorization"),
+            );
+        if !ap2_authenticated && !legacy_authenticated {
             response = HttpResponse::new("RTSP/1.0", 401, "Unauthorized");
             response.add_header("CSeq", cseq);
-            response.add_header("WWW-Authenticate", &auth_str);
+            response.add_header(
+                "WWW-Authenticate",
+                &format!("Digest realm=\"airplay\", nonce=\"{}\"", conn.nonce),
+            );
             response.finish(None);
             return response;
+        }
+        #[cfg(feature = "ap2")]
+        {
+            let active = conn.controller_session.lock().unwrap();
+            if !active.permits(ap2_authenticated, conn.controller_id.as_deref()) {
+                response = HttpResponse::new("RTSP/1.0", 403, "Forbidden");
+                response.add_header("CSeq", cseq);
+                response.finish(None);
+                return response;
+            }
+            // A separately verified control connection for the same identity may
+            // control the active pipeline; an address alone never grants access.
+            if conn.playout_cmd.is_none() && ap2_authenticated {
+                conn.playout_cmd = active.playout.clone();
+            }
         }
     }
 

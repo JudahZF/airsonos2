@@ -87,6 +87,12 @@ pub fn mixdown(input: &[f32], in_channels: usize, out_channels: usize) -> Vec<f3
     if in_channels == out_channels {
         return input.to_vec();
     }
+    if out_channels == 1 && in_channels > 0 {
+        return input
+            .chunks_exact(in_channels)
+            .map(|frame| (frame.iter().sum::<f32>() / in_channels as f32).clamp(-1.0, 1.0))
+            .collect();
+    }
     if out_channels != 2 {
         return input.to_vec();
     }
@@ -150,5 +156,13 @@ mod tests {
     #[test]
     fn resample_passthrough_returns_none() {
         assert!(StreamResampler::new(44100, 44100, 2).is_none());
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    #[test]
+    fn stereo_downmix_has_one_sample_per_frame() {
+        assert_eq!(super::mixdown(&[0.25, 0.75, -0.5, 0.5], 2, 1), vec![0.5, 0.0]);
     }
 }
