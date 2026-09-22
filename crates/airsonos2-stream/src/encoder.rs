@@ -198,6 +198,21 @@ impl FfmpegEncoder {
         }
     }
 
+    /// A stalled encoder must not suspend other rooms. False means the bounded
+    /// input queue was full and this realtime frame was dropped.
+    pub fn try_write_frame(&self, frame: PcmFrame) -> Result<bool, EncoderError> {
+        match self
+            .input
+            .as_ref()
+            .ok_or(EncoderError::InputClosed)?
+            .try_send(frame)
+        {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(EncoderError::InputClosed),
+        }
+    }
+
     pub async fn write_frame(&self, frame: PcmFrame) -> Result<(), EncoderError> {
         self.input
             .as_ref()
