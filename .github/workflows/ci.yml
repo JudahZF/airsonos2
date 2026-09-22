@@ -63,3 +63,6 @@ jobs:
         env:
           VENDOR_FEATURES: ${{ matrix.features }}
         run: nix develop -c cargo test --manifest-path vendor/shairplay/Cargo.toml --features "$VENDOR_FEATURES" --locked
+      - name: Standalone receiver dependency policy
+        if: matrix.features == ''
+        run: nix develop -c cargo deny --manifest-path vendor/shairplay/Cargo.toml --locked check advisories bans licenses sources

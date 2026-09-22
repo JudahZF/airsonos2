@@ -1,5 +1,11 @@
 [graph]
 all-features = true
+# These are the supported runtime/development platforms. The vendored desktop
+# example also has WASM-only dependencies, but this project does not ship WASM.
+targets = [
+    "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin", "aarch64-apple-darwin",
+]
 
 [advisories]
 ignore = [
