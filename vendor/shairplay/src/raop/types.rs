@@ -138,6 +138,12 @@ pub enum AudioStopReason {
 pub trait AudioSession: Send + Sync {
     /// Receive decoded f32 interleaved PCM audio samples.
     fn audio_process(&mut self, samples: &[f32]);
+    /// PCM with a validated source presentation time in the local monotonic clock.
+    /// `None` means the source clock mapping is unavailable; callback arrival is
+    /// not a presentation timestamp. Existing clients retain the PCM callback.
+    fn audio_process_timed(&mut self, samples: &[f32], _presentation_time: Option<std::time::Instant>) {
+        self.audio_process(samples);
+    }
     /// Flush the audio buffer (e.g. on seek).
     fn audio_flush(&mut self) {}
     /// Called when the audio stream ends, before the session is dropped.

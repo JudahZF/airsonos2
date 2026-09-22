@@ -9,8 +9,8 @@ use airsonos2_airplay::{
 };
 use airsonos2_core::{
     Config, EncoderState, SessionId, SonosZone, StartupDelayEstimator, StreamCodec, StreamSession,
-    VirtualAirPlayEndpoint, ZoneId, ZoneStartupTiming, combine_sync_delay, delays_from_offsets,
-    filter_zones, sonos_volume_to_airplay_db, virtual_endpoint_for_zone,
+    VirtualAirPlayEndpoint, ZoneId, ZoneStartupTiming, configured_delays, filter_zones,
+    sonos_volume_to_airplay_db, virtual_endpoint_for_zone,
 };
 use airsonos2_diagnostics::{CheckStatus, run_doctor};
 use airsonos2_sonos::{SonosClient, discover_sonos_zones_from_sources};
@@ -228,19 +228,15 @@ fn calibrate(zones: &[String], config: &Config) -> anyhow::Result<()> {
         anyhow::bail!("--zones must contain at least one room or zone id");
     }
 
-    let offsets = zones
+    let rooms = zones
         .iter()
-        .map(|zone| {
-            let offset = config
-                .sync
-                .zone_offsets_ms
-                .get(zone)
-                .copied()
-                .unwrap_or(config.sync.default_offset_ms);
-            (ZoneId::new(zone.clone()), offset)
-        })
-        .collect();
-    let delays = delays_from_offsets(&offsets);
+        .map(|zone| (ZoneId::new(zone.clone()), zone.clone()))
+        .collect::<Vec<_>>();
+    let delays = configured_delays(
+        &rooms,
+        &config.sync.zone_offsets_ms,
+        config.sync.default_offset_ms,
+    );
 
     println!("Current delay plan from configured offsets:");
     for delay in delays {
@@ -887,6 +883,7 @@ impl BridgeRuntime {
                 session_id, frame, ..
             } => {
                 if let Some(session) = self.sessions.get_mut(&session_id)
+                    && frame.playback_epoch == session.playback_epoch
                     && let Some(encoder) = &session.encoder
                 {
                     match encoder.try_write_frame(frame) {
@@ -924,23 +921,27 @@ impl BridgeRuntime {
                 zone_id,
                 playing,
             } => self.set_playback_state(session_id, zone_id, playing).await,
-            AirPlayEvent::Flushed { session_id, .. } => {
-                debug!(%session_id, "AirPlay buffer flushed; keeping bridge session alive");
-                if let Some(stream) = self.registry.get(&session_id).await {
-                    stream.arm_playback_anchor_on_next_timed_pcm();
+            AirPlayEvent::Flushed {
+                session_id,
+                zone_id,
+                playback_epoch,
+            } => {
+                let Some(session) = self.sessions.get_mut(&session_id) else {
+                    return Ok(());
+                };
+                if playback_epoch <= session.playback_epoch {
+                    return Ok(());
                 }
-                if self
-                    .sessions
-                    .get(&session_id)
-                    .is_some_and(|session| !session.desired_playback)
-                    || self
-                        .sessions
-                        .get(&session_id)
-                        .is_some_and(|session| session.observed == ObservedPlayback::Stopped)
-                {
-                    if let Some(session) = self.sessions.get_mut(&session_id) {
-                        session.reset_needed = true;
-                    }
+                session.playback_epoch = playback_epoch;
+                let playing = session.desired_playback;
+                if playing {
+                    self.restart_downstream_for_play(session_id, zone_id)
+                        .await?;
+                } else {
+                    let encoder = session.encoder.take();
+                    self.registry.remove(&session_id).await;
+                    self.retire_encoder(encoder);
+                    self.set_playback_state(session_id, zone_id, false).await?;
                 }
                 Ok(())
             }
@@ -1032,9 +1033,11 @@ impl BridgeRuntime {
             encoder_state: EncoderState::Starting,
         };
         let live_stream = LiveStream::new(stream_session);
-        if stream_codec == StreamCodec::Wav {
-            live_stream.arm_playback_anchor_on_next_timed_pcm();
-        }
+        live_stream.set_playback_epoch(
+            self.sessions
+                .get(&session_id)
+                .map_or(0, |session| session.playback_epoch),
+        );
         let encoder = FfmpegEncoder::spawn(
             FfmpegEncoderConfig {
                 ffmpeg_path: self.config.stream.ffmpeg_path.clone(),
@@ -1174,42 +1177,36 @@ impl BridgeRuntime {
     }
 
     fn apply_sync_anchors(&self, prepared: &[PreparedDownstream]) {
-        let zone_ids: Vec<ZoneId> = prepared
+        let rooms = prepared
             .iter()
-            .map(|stream| stream.zone_id.clone())
-            .collect();
-        let base_anchor = Instant::now() + Duration::from_millis(120);
-        for stream in prepared {
-            let auto_delay_ms = if self.config.sync.startup_compensation {
-                self.startup_estimator.automatic_delay_ms(
-                    &zone_ids,
-                    &stream.zone_id,
-                    self.config.sync.startup_max_compensation_ms,
-                )
-            } else {
-                0
-            };
-            let manual_offset = self
-                .config
-                .sync
-                .zone_offsets_ms
-                .get(&stream.zone_room_name)
-                .copied()
-                .unwrap_or(0);
-            let delay = combine_sync_delay(
-                auto_delay_ms,
-                manual_offset,
-                self.config.sync.default_offset_ms,
+            .map(|stream| (stream.zone_id.clone(), stream.zone_room_name.clone()))
+            .collect::<Vec<_>>();
+        let delays = configured_delays(
+            &rooms,
+            &self.config.sync.zone_offsets_ms,
+            self.config.sync.default_offset_ms,
+        );
+        let common_sample = Instant::now() + Duration::from_millis(120);
+        if self.config.sync.startup_compensation {
+            warn!(
+                "automatic sync compensation is disabled: SOAP and HTTP timings are not acoustic latency measurements"
             );
+        }
+        for stream in prepared {
             if stream.live_stream.session.codec == StreamCodec::Wav {
-                stream.live_stream.set_playback_anchor(base_anchor + delay);
-            } else if prepared.len() > 1 {
-                info!(
-                    session_id = %stream.session_id,
-                    zone_id = %stream.zone_id,
-                    codec = ?stream.live_stream.session.codec,
-                    "coordinated Play is best-effort without WAV playback anchors"
-                );
+                let delay = delays
+                    .iter()
+                    .find(|delay| delay.zone_id == stream.zone_id)
+                    .map_or(0, |delay| delay.delay_ms);
+                stream
+                    .live_stream
+                    .set_playback_plan(common_sample, common_sample + Duration::from_millis(delay));
+            } else if prepared.len() > 1
+                || self.config.sync.default_offset_ms != 0
+                || !self.config.sync.zone_offsets_ms.is_empty()
+            {
+                warn!(session_id = %stream.session_id, codec = ?stream.live_stream.session.codec,
+                    "MP3 does not support sample-aligned WAV offsets; group startup is best effort");
             }
         }
     }
@@ -1539,6 +1536,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flush_closes_old_generation_and_rejects_late_old_pcm() {
+        let mut runtime = runtime();
+        runtime.config.stream.codec = "wav".into();
+        runtime.config.server.bind = "127.0.0.1".parse().unwrap();
+        let id = SessionId::new();
+        let zone = zone_id();
+        let mut session = SessionRuntime::new(zone.clone(), format());
+        session.desired_playback = false;
+        runtime.sessions.insert(id, session);
+        let old = live_stream_for(id, zone.clone(), StreamCodec::Wav);
+        runtime.registry.insert(old.clone()).await;
+        runtime
+            .handle_event(AirPlayEvent::Flushed {
+                session_id: id,
+                zone_id: zone.clone(),
+                playback_epoch: 1,
+            })
+            .await
+            .unwrap();
+        assert!(old.is_closed());
+        assert!(runtime.registry.is_empty().await);
+        assert_eq!(runtime.sessions[&id].playback_epoch, 1);
+        let (new, encoder, _) = runtime
+            .create_downstream_stream(id, zone.clone(), "127.0.0.1".parse().unwrap(), format(), 2)
+            .await
+            .unwrap();
+        let (header, mut output) = new.attach_subscriber();
+        if header.is_none() {
+            assert_eq!(output.recv().await.unwrap().len(), 44);
+        }
+        new.arm_playback_anchor_on_next_timed_pcm();
+        runtime.sessions.get_mut(&id).unwrap().encoder = Some(encoder);
+        for epoch in [0, 1] {
+            runtime
+                .handle_event(AirPlayEvent::Pcm {
+                    session_id: id,
+                    zone_id: zone.clone(),
+                    frame: airsonos2_core::PcmFrame {
+                        playback_epoch: epoch,
+                        sample_rate: 44100,
+                        channels: 2,
+                        samples_f32_interleaved: vec![if epoch == 0 { -1.0 } else { 1.0 }; 2],
+                        presentation_time: None,
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        let pcm = tokio::time::timeout(Duration::from_secs(1), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pcm.as_ref(), &[255, 127, 255, 127]);
+        assert!(output.try_recv().is_err());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn delayed_room_transport_does_not_suspend_other_room_pcm() {
         use crate::bridge::tests::FakeSonos;
         let mut fake = FakeSonos::start().await;
@@ -1582,6 +1637,9 @@ mod tests {
                 });
                 let (request, hold_stop) = fake.request().await;
                 assert!(request.contains("#Stop"));
+                if let Some(stream) = runtime.registry.get(&session_b).await {
+                    stream.arm_playback_anchor_on_next_timed_pcm();
+                }
                 feed_pcm(&mut runtime, session_b, b.clone()).await;
                 let bytes = tokio::time::timeout(Duration::from_secs(1), audio.recv())
                     .await
@@ -1590,6 +1648,9 @@ mod tests {
                 assert_eq!(bytes.len(), 16);
                 hold_stop.send(()).unwrap();
                 break;
+            }
+            if let Some(stream) = runtime.registry.get(&session_b).await {
+                stream.arm_playback_anchor_on_next_timed_pcm();
             }
             feed_pcm(&mut runtime, session_b, b.clone()).await;
             let header = tokio::time::timeout(Duration::from_secs(1), audio.recv())
@@ -1613,6 +1674,7 @@ mod tests {
                 session_id,
                 zone_id,
                 frame: airsonos2_core::PcmFrame {
+                    playback_epoch: 0,
                     sample_rate: 44_100,
                     channels: 2,
                     samples_f32_interleaved: vec![0.25; 8],

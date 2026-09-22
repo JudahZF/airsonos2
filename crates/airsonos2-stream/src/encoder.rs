@@ -92,9 +92,13 @@ impl FfmpegEncoder {
 
         let task = tokio::spawn(async move {
             let terminal = stream.clone();
+            let input_stream = stream.clone();
             let writer = async move {
                 let mut stdin = stdin;
                 while let Some(frame) = rx.recv().await {
+                    if !input_stream.accepts_epoch(frame.playback_epoch) {
+                        continue;
+                    }
                     if !first_pcm_reader.swap(true, Ordering::Relaxed) {
                         debug!(
                             sample_rate = frame.sample_rate,
@@ -155,13 +159,22 @@ impl FfmpegEncoder {
     fn spawn_wav(config: FfmpegEncoderConfig, stream: LiveStream) -> Self {
         let (input, mut rx) = mpsc::channel::<PcmFrame>(512);
         let task = tokio::spawn(async move {
-            let mut sent_header = false;
+            stream.publish_prelude(Bytes::from(wav_stream_header(
+                config.sample_rate,
+                config.channels,
+            )));
+            if !stream.wait_for_playback_release().await {
+                return Ok(());
+            }
             let mut first_pcm = false;
 
             while let Some(frame) = tokio::select! {
                 _ = stream.closed() => None,
                 frame = rx.recv() => frame,
             } {
+                if !stream.accepts_epoch(frame.playback_epoch) {
+                    continue;
+                }
                 if !first_pcm {
                     first_pcm = true;
                     debug!(
@@ -170,15 +183,6 @@ impl FfmpegEncoder {
                         samples = frame.samples_f32_interleaved.len(),
                         "first PCM frame received for WAV stream"
                     );
-                }
-
-                if !sent_header {
-                    sent_header = true;
-                    stream.publish_prelude(Bytes::from(wav_stream_header(
-                        config.sample_rate,
-                        config.channels,
-                    )));
-                    debug!("WAV stream header published");
                 }
 
                 stream.publish_timed_pcm(
@@ -306,6 +310,89 @@ pub enum EncoderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_stream() -> LiveStream {
+        use airsonos2_core::{EncoderState, SessionId, StreamSession, ZoneId};
+        LiveStream::new(StreamSession {
+            session_id: SessionId::new(),
+            zone_id: ZoneId::new("test"),
+            codec: StreamCodec::Wav,
+            generation: 1,
+            local_url: url::Url::parse("http://localhost/stream.wav").unwrap(),
+            encoder_state: EncoderState::Running,
+        })
+    }
+
+    fn wav_config() -> FfmpegEncoderConfig {
+        FfmpegEncoderConfig {
+            ffmpeg_path: "unused".into(),
+            sample_rate: 1000,
+            channels: 1,
+            mp3_bitrate_kbps: 128,
+            codec: StreamCodec::Wav,
+        }
+    }
+
+    #[tokio::test]
+    async fn wav_waits_for_shared_sample_and_rejects_old_epoch() {
+        let first = test_stream();
+        let second = test_stream();
+        first.set_playback_epoch(1);
+        second.set_playback_epoch(1);
+        let first_encoder = FfmpegEncoder::spawn(wav_config(), first.clone()).unwrap();
+        let (header, mut first_rx) = first.attach_subscriber();
+        if header.is_none() {
+            assert_eq!(first_rx.recv().await.unwrap().len(), 44);
+        }
+        let second_encoder = FfmpegEncoder::spawn(wav_config(), second.clone()).unwrap();
+        let (header, mut second_rx) = second.attach_subscriber();
+        if header.is_none() {
+            assert_eq!(second_rx.recv().await.unwrap().len(), 44);
+        }
+        let source_time = std::time::Instant::now();
+        for encoder in [&first_encoder, &second_encoder] {
+            encoder
+                .write_frame(PcmFrame {
+                    playback_epoch: 0,
+                    sample_rate: 1000,
+                    channels: 1,
+                    samples_f32_interleaved: vec![-1.0; 8],
+                    presentation_time: Some(source_time),
+                })
+                .await
+                .unwrap();
+            encoder
+                .write_frame(PcmFrame {
+                    playback_epoch: 1,
+                    sample_rate: 1000,
+                    channels: 1,
+                    samples_f32_interleaved: vec![0.25, 0.5, 0.75, 1.0],
+                    presentation_time: Some(source_time),
+                })
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        assert!(first_rx.try_recv().is_err());
+        assert!(second_rx.try_recv().is_err());
+        let release = std::time::Instant::now() + Duration::from_millis(20);
+        let cutoff = source_time + Duration::from_millis(2);
+        first.set_playback_plan(cutoff, release);
+        second.set_playback_plan(cutoff, release + Duration::from_millis(20));
+        let a = tokio::time::timeout(Duration::from_secs(1), first_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::time::Instant::now() >= release);
+        let b = tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.as_ref(), f32_pcm_to_s16le_bytes(&[0.75, 1.0]));
+        first_encoder.shutdown().await.unwrap();
+        second_encoder.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn stderr_retains_only_bounded_tail_and_drains_input() {

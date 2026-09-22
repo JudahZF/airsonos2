@@ -242,7 +242,7 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
             }
             // A separately verified control connection for the same identity may
             // control the active pipeline; an address alone never grants access.
-            if conn.playout_cmd.is_none() && ap2_authenticated {
+            if ap2_authenticated {
                 conn.playout_cmd = active.playout.clone();
             }
         }
@@ -328,17 +328,27 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
 
 /// FLUSH: parse RTP-Info header and flush the buffer inline.
 fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
-    if let Some(rtp_info) = request.header("RTP-Info")
-        && let Some(seq_str) = rtp_info.strip_prefix("seq=")
-        && let Ok(next_seq) = seq_str.parse::<i32>()
-        && let Some(rtp) = &conn.raop_rtp
-    {
-        rtp.flush(next_seq);
+    let next_seq = request
+        .header("RTP-Info")
+        .and_then(|info| info.split(';').find_map(|field| field.trim().strip_prefix("seq=")))
+        .and_then(|sequence| sequence.parse::<u16>().ok());
+    if let Some(next_seq) = next_seq {
+        if let Some(rtp) = &conn.raop_rtp {
+            rtp.flush(i32::from(next_seq));
+        }
+        #[cfg(feature = "ap2")]
+        if let Some(commands) = &conn.playout_cmd {
+            let _ = commands.try_send(super::buffered_audio::PlayoutCommand::Flush {
+                from_seq: 0,
+                until_seq: u32::from(next_seq),
+            });
+        }
     }
 }
 
 /// TEARDOWN: stop RTP, stop buffered audio, close connection.
 fn handle_teardown(conn: &mut RaopConnection, _request: &HttpRequest, response: &mut HttpResponse) -> Option<Vec<u8>> {
+    conn.audio_tasks.abort_all();
     conn.tasks.abort_all();
     response.add_header("Connection", "close");
     response.set_disconnect(true);

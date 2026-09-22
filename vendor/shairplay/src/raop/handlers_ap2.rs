@@ -25,6 +25,18 @@ fn bind_udp(addr: std::net::SocketAddr) -> Option<tokio::net::UdpSocket> {
 
 #[cfg(feature = "ap2")]
 impl RaopConnection {
+    fn replace_audio(&mut self) {
+        self.audio_tasks.abort_all();
+        while self.audio_tasks.try_join_next().is_some() {}
+        let mut active = self.controller_session.lock().unwrap();
+        if let Some(task) = active.media_abort.take() {
+            task.abort();
+        }
+        active.owner = self.controller_id.clone();
+        active.owner_connection = Some(self.nonce.clone());
+        active.playout = None;
+    }
+
     /// Decouple network event stream listener spawning from high-level RTSP handlers.
     pub fn spawn_event_channel(
         &mut self,
@@ -269,11 +281,6 @@ pub(crate) fn handle_setup(
         let mut stream_resp = plist::Dictionary::new();
         stream_resp.insert("type".into(), plist::Value::Integer(stream_type.into()));
 
-        if matches!(stream_type, 96 | 103) {
-            let mut active = conn.controller_session.lock().unwrap();
-            active.owner = conn.controller_id.clone();
-            active.owner_connection = Some(conn.nonce.clone());
-        }
         match stream_type {
             96 => {
                 let sr = stream0.get("sr").and_then(|v| v.as_unsigned_integer()).unwrap_or(44100);
@@ -303,12 +310,19 @@ pub(crate) fn handle_setup(
                         max_channels: conn.output_max_channels,
                     };
 
-                    conn.tasks.spawn(crate::raop::realtime_audio::run(
+                    conn.replace_audio();
+                    let (commands, receiver) = tokio::sync::mpsc::channel(64);
+                    let task = conn.audio_tasks.spawn(crate::raop::realtime_audio::run(
                         socket,
                         shk_arr,
                         handler,
                         output_config,
+                        receiver,
                     ));
+                    let mut active = conn.controller_session.lock().unwrap();
+                    active.media_abort = Some(task);
+                    active.playout = Some(commands.clone());
+                    conn.playout_cmd = Some(commands);
 
                     stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
                 } else {
@@ -381,8 +395,11 @@ pub(crate) fn handle_setup(
                     listener,
                     port: audio_port,
                 };
-                let cmd_tx = proc.start(shk_arr, output_config, handler, &mut conn.tasks);
-                conn.controller_session.lock().unwrap().playout = Some(cmd_tx.clone());
+                conn.replace_audio();
+                let (cmd_tx, task) = proc.start(shk_arr, output_config, handler, &mut conn.audio_tasks);
+                let mut active = conn.controller_session.lock().unwrap();
+                active.playout = Some(cmd_tx.clone());
+                active.media_abort = Some(task);
                 conn.playout_cmd = Some(cmd_tx);
 
                 stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
@@ -805,7 +822,7 @@ pub(crate) fn handle_set_rate_anchor_time(
 
     // Convert network time to nanoseconds
     let frac_ns = ((net_frac >> 32) * 1_000_000_000) >> 32;
-    let anchor_time_ns = net_secs * 1_000_000_000 + frac_ns;
+    let anchor_time_ns = net_secs.checked_mul(1_000_000_000)?.checked_add(frac_ns)?;
 
     let playing = rate & 1 != 0;
     if playing {

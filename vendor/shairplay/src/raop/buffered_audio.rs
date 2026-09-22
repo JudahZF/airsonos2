@@ -45,19 +45,27 @@ pub enum PlayoutCommand {
         /// Playback rate (1 = playing, 0 = paused).
         rate: u32,
     },
-    /// Flush buffered frames in the given RTP timestamp range.
+    /// Flush buffered packets in the inclusive RTP sequence range.
     Flush {
-        /// First timestamp to flush.
+        /// First 16-bit sequence to flush.
         from_seq: u32,
-        /// Last timestamp to flush.
+        /// Last 16-bit sequence to flush.
         until_seq: u32,
     },
     /// Stop playback and tear down.
     Stop,
 }
 
+#[derive(Clone)]
+struct BufferedFrame {
+    sequence: u16,
+    samples: Vec<f32>,
+}
+
 struct PlayoutState {
-    buffer: BTreeMap<u32, Vec<f32>>, // rtp_timestamp → F32 PCM samples
+    buffer: BTreeMap<u32, BufferedFrame>, // source RTP timestamp → decoded packet
+    epoch: u64,
+    flush_range: Option<(u16, u16)>,
     anchor_rtp: u32,
     anchor_local: std::time::Instant,
     rate: u32,
@@ -67,6 +75,19 @@ struct PlayoutState {
     stopped: bool,
     stop_reason: Option<AudioStopReason>,
     format_changed: bool,
+}
+
+fn sequence_in_range(sequence: u16, from: u16, until: u16) -> bool {
+    sequence.wrapping_sub(from) <= until.wrapping_sub(from)
+}
+
+impl PlayoutState {
+    fn flush(&mut self, from: u16, until: u16) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.flush_range = Some((from, until));
+        self.buffer
+            .retain(|_, frame| !sequence_in_range(frame.sequence, from, until));
+    }
 }
 
 struct StopOnDrop {
@@ -111,13 +132,15 @@ impl BufferedAudioProcessor {
         output_config: OutputConfig,
         handler: Arc<dyn AudioHandler>,
         tasks: &mut tokio::task::JoinSet<()>,
-    ) -> tokio::sync::mpsc::Sender<PlayoutCommand> {
+    ) -> (tokio::sync::mpsc::Sender<PlayoutCommand>, tokio::task::AbortHandle) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
         let default_sr = output_config.sample_rate.unwrap_or(44100);
 
         let state = Arc::new((
             Mutex::new(PlayoutState {
                 buffer: BTreeMap::new(),
+                epoch: 0,
+                flush_range: None,
                 anchor_rtp: 0,
                 anchor_local: std::time::Instant::now(),
                 rate: 0,
@@ -162,7 +185,7 @@ impl BufferedAudioProcessor {
             state: state.clone(),
             delivery: Some(delivery),
         };
-        tasks.spawn(async move {
+        let task = tasks.spawn(async move {
             let cleanup = cleanup;
             loop {
                 let cmd = tokio::select! {
@@ -209,16 +232,8 @@ impl BufferedAudioProcessor {
                         cvar.notify_all();
                     }
                     PlayoutCommand::Flush { from_seq, until_seq } => {
-                        let keys: Vec<u32> = s
-                            .buffer
-                            .keys()
-                            .filter(|&&ts| ts >= from_seq && ts <= until_seq)
-                            .copied()
-                            .collect();
-                        for k in &keys {
-                            s.buffer.remove(k);
-                        }
-                        debug!(flushed = keys.len(), "Flushed");
+                        s.flush(from_seq as u16, until_seq as u16);
+                        cvar.notify_all();
                     }
                     PlayoutCommand::Stop => {
                         s.stop_reason = Some(AudioStopReason::Teardown);
@@ -234,7 +249,7 @@ impl BufferedAudioProcessor {
             while children.join_next().await.is_some() {}
         });
 
-        cmd_tx
+        (cmd_tx, task)
     }
 }
 
@@ -254,6 +269,7 @@ async fn receive_loop(
     let mut stream_resampler: Option<crate::codec::resample::StreamResampler> = None;
     let mut source_channels: u8 = 2;
     let mut output_channels: u8 = 2;
+    let mut decode_epoch = 0;
 
     loop {
         // Stop reading TCP at two seconds or 8 MiB of decoded PCM, whichever is
@@ -264,7 +280,7 @@ async fn receive_loop(
                 if s.stopped {
                     return;
                 }
-                let queued: usize = s.buffer.values().map(Vec::len).sum();
+                let queued: usize = s.buffer.values().map(|frame| frame.samples.len()).sum();
                 queued >= pcm_budget(s.sample_rate, s.channels) / 2
             };
             if !full {
@@ -288,6 +304,7 @@ async fn receive_loop(
             continue;
         }
 
+        let sequence = u16::from_be_bytes([packet[2], packet[3]]);
         let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
         let ssrc_val = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
         let ssrc = AudioSsrc::from_u32(ssrc_val);
@@ -312,6 +329,38 @@ async fn receive_loop(
                 continue;
             }
         };
+
+        let packet_epoch = {
+            let mut s = state.0.lock().unwrap();
+            if s.stopped {
+                return;
+            }
+            if s.flush_range
+                .is_some_and(|(from, until)| sequence_in_range(sequence, from, until))
+            {
+                continue;
+            }
+            // The old interval is no longer relevant once the sender advances;
+            // retaining a 16-bit sequence filter forever would drop audio each wrap.
+            if s.flush_range
+                .is_some_and(|(_, until)| sequence.wrapping_sub(until) as i16 > 0)
+            {
+                s.flush_range = None;
+            }
+            s.epoch
+        };
+        if packet_epoch != decode_epoch {
+            decode_epoch = packet_epoch;
+            if current_ssrc != AudioSsrc::None {
+                let source_rate = current_ssrc.sample_rate();
+                decoder = AacDecoder::new(source_rate, source_channels).ok();
+                stream_resampler = crate::codec::resample::StreamResampler::new(
+                    source_rate,
+                    output_config.sample_rate.unwrap_or(source_rate),
+                    output_channels as usize,
+                );
+            }
+        }
 
         // Detect format change
         if ssrc != AudioSsrc::None && ssrc != current_ssrc {
@@ -370,6 +419,9 @@ async fn receive_loop(
                 samples = rs.process(&samples);
             }
 
+            if samples.is_empty() {
+                continue;
+            }
             loop {
                 let admitted = {
                     let (lock, cvar) = &*state;
@@ -377,13 +429,22 @@ async fn receive_loop(
                     if s.stopped {
                         return;
                     }
+                    if s.epoch != packet_epoch {
+                        break;
+                    }
                     let budget = pcm_budget(s.sample_rate, s.channels);
                     if samples.len() > budget {
                         return;
                     }
-                    let queued: usize = s.buffer.values().map(Vec::len).sum();
+                    let queued: usize = s.buffer.values().map(|frame| frame.samples.len()).sum();
                     if queued + samples.len() <= budget {
-                        s.buffer.insert(timestamp, std::mem::take(&mut samples));
+                        s.buffer.insert(
+                            timestamp,
+                            BufferedFrame {
+                                sequence,
+                                samples: std::mem::take(&mut samples),
+                            },
+                        );
                         cvar.notify_all();
                         true
                     } else {
@@ -421,11 +482,12 @@ fn delivery_loop(
 ) {
     let (lock, cvar) = &*state;
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
+    let mut delivered_epoch = 0;
 
     loop {
         let mut s = lock.lock().unwrap();
 
-        while !s.stopped && (s.rate == 0 || s.buffer.is_empty()) {
+        while !s.stopped && s.epoch == delivered_epoch && (s.rate == 0 || s.buffer.is_empty()) {
             s = cvar.wait(s).unwrap();
         }
         if s.stopped {
@@ -435,6 +497,15 @@ fn delivery_loop(
                 sess.audio_stopped(reason);
             }
             break;
+        }
+
+        if delivered_epoch != s.epoch {
+            delivered_epoch = s.epoch;
+            drop(s);
+            if let Some(sess) = &mut session {
+                sess.audio_flush();
+            }
+            continue;
         }
 
         // Lazy init or reinit session on format change
@@ -453,7 +524,7 @@ fn delivery_loop(
         let elapsed_frames = source_frames(s.anchor_local.elapsed(), s.source_sample_rate);
         let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
 
-        let ready: Vec<(u32, Vec<f32>)> = s
+        let ready: Vec<(u32, BufferedFrame)> = s
             .buffer
             .iter()
             .filter(|(ts, _)| (target_rtp.wrapping_sub(**ts) as i32) >= 0)
@@ -467,7 +538,8 @@ fn delivery_loop(
 
         if let Some(ref mut sess) = session {
             for (_, frame) in &ready {
-                sess.audio_process(frame);
+                // There is no validated PTP-to-Instant mapping in this receiver yet.
+                sess.audio_process_timed(&frame.samples, None);
             }
         }
 
@@ -517,7 +589,7 @@ mod ownership_tests {
             let processor = BufferedAudioProcessor::bind("127.0.0.1:0").await.unwrap();
             let address = processor.listener.local_addr().unwrap();
             let mut tasks = tokio::task::JoinSet::new();
-            let commands = processor.start(
+            let (commands, _) = processor.start(
                 [0; 32],
                 OutputConfig {
                     sample_rate: None,
@@ -542,5 +614,106 @@ mod ownership_tests {
             assert!(commands.is_closed());
             assert!(TcpStream::connect(address).await.is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    fn state() -> PlayoutState {
+        PlayoutState {
+            buffer: BTreeMap::new(),
+            epoch: 0,
+            flush_range: None,
+            anchor_rtp: 0,
+            anchor_local: std::time::Instant::now(),
+            rate: 1,
+            sample_rate: 48000,
+            source_sample_rate: 44100,
+            channels: 2,
+            stopped: false,
+            stop_reason: None,
+            format_changed: false,
+        }
+    }
+    #[test]
+    fn flush_uses_sequence_not_timestamp_and_wraps() {
+        let mut s = state();
+        for (timestamp, sequence) in [(10000, 65534), (10352, 65535), (10704, 0), (11056, 1), (11408, 2)] {
+            s.buffer.insert(
+                timestamp,
+                BufferedFrame {
+                    sequence,
+                    samples: vec![sequence as f32],
+                },
+            );
+        }
+        s.flush(65535, 1);
+        assert_eq!(s.buffer.keys().copied().collect::<Vec<_>>(), vec![10000, 11408]);
+        assert_eq!(s.epoch, 1);
+    }
+
+    #[test]
+    fn flush_callback_precedes_new_pcm_even_while_paused() {
+        struct Handler(std::sync::mpsc::Sender<&'static str>);
+        struct Session(std::sync::mpsc::Sender<&'static str>);
+        impl AudioHandler for Handler {
+            fn audio_init(&self, _: AudioFormat) -> Box<dyn crate::raop::AudioSession> {
+                Box::new(Session(self.0.clone()))
+            }
+        }
+        impl crate::raop::AudioSession for Session {
+            fn audio_process(&mut self, samples: &[f32]) {
+                self.0.send(if samples[0] == 1.0 { "old" } else { "new" }).unwrap();
+            }
+            fn audio_flush(&mut self) {
+                self.0.send("flush").unwrap();
+            }
+        }
+        let mut s = state();
+        s.buffer.insert(
+            0,
+            BufferedFrame {
+                sequence: 1,
+                samples: vec![1.0, 1.0],
+            },
+        );
+        let shared = Arc::new((Mutex::new(s), Condvar::new()));
+        let worker_state = shared.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            delivery_loop(
+                worker_state,
+                Arc::new(Handler(tx)),
+                OutputConfig {
+                    sample_rate: None,
+                    max_channels: None,
+                },
+            )
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "old");
+        {
+            let mut s = shared.0.lock().unwrap();
+            s.rate = 0;
+            s.flush(1, 1);
+            shared.1.notify_all();
+        }
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "flush");
+        {
+            let mut s = shared.0.lock().unwrap();
+            s.rate = 1;
+            s.buffer.insert(
+                0,
+                BufferedFrame {
+                    sequence: 2,
+                    samples: vec![2.0, 2.0],
+                },
+            );
+            shared.1.notify_all();
+        }
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "new");
+        shared.0.lock().unwrap().stopped = true;
+        shared.1.notify_all();
+        thread.join().unwrap();
     }
 }

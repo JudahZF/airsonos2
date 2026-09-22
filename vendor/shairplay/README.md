@@ -260,3 +260,10 @@ ALAC is limited to validated S16 mono/stereo, 8–192 kHz, and at most 4096 samp
 per packet. Unsupported precision and AP1 channel conversion are rejected.
 Buffered decoded PCM is limited to two seconds or 8 MiB, whichever is smaller,
 plus one bounded packet being decoded. Paused playback applies TCP backpressure.
+
+The PCM timing callback distinguishes source presentation time from callback
+arrival. The current receiver has no validated PTP-to-local monotonic clock
+mapping, so `audio_process_timed` supplies `None`. Buffered playout uses a local
+monotonic source-rate clock as a fallback; this does not establish acoustic sync.
+`audio_flush` is serialized on the delivery thread, including while paused, so
+adapters can advance their playback epoch before admitting subsequent PCM.

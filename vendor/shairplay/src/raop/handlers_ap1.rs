@@ -16,6 +16,7 @@ use crate::crypto::pairing_homekit::{PairVerifyServer, SrpServer};
 /// Per-connection state for RTSP handler dispatch. Equivalent to raop_conn_t.
 pub(crate) struct RaopConnection {
     pub tasks: tokio::task::JoinSet<()>,
+    pub audio_tasks: tokio::task::JoinSet<()>,
     #[cfg(feature = "ap2")]
     pub controller_id: Option<String>,
     #[cfg(feature = "ap2")]
