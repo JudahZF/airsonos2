@@ -26,6 +26,7 @@ fn bind_udp(addr: std::net::SocketAddr) -> Option<tokio::net::UdpSocket> {
 #[cfg(feature = "ap2")]
 impl RaopConnection {
     fn replace_audio(&mut self) {
+        self.has_owned_audio = true;
         self.audio_tasks.abort_all();
         while self.audio_tasks.try_join_next().is_some() {}
         let mut active = self.controller_session.lock().unwrap();
@@ -803,7 +804,7 @@ pub(crate) fn handle_record(
 pub(crate) fn handle_set_rate_anchor_time(
     conn: &mut RaopConnection,
     request: &HttpRequest,
-    _response: &mut HttpResponse,
+    response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
     let data = request.data()?;
     let plist_val: plist::Value = plist::from_bytes(data).ok()?;
@@ -830,16 +831,20 @@ pub(crate) fn handle_set_rate_anchor_time(
     } else {
         tracing::info!("AP2 play pause");
     }
-    conn.handler.on_playback_rate(playing);
 
-    if let Some(cmd) = &conn.playout_cmd {
-        let _ = cmd.try_send(crate::raop::buffered_audio::PlayoutCommand::SetRate {
+    if !super::rtsp::send_playout_command(
+        conn,
+        crate::raop::buffered_audio::PlayoutCommand::SetRate {
             anchor_rtp: rtp_time,
             anchor_time_ns,
             rate,
-        });
+        },
+        response,
+    ) {
+        return None;
     }
 
+    conn.handler.on_playback_rate(playing);
     None
 }
 
@@ -865,7 +870,7 @@ pub(crate) fn handle_set_peers(
 pub(crate) fn handle_flush_buffered(
     conn: &mut RaopConnection,
     request: &HttpRequest,
-    _response: &mut HttpResponse,
+    response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
     if let Some(data) = request.data()
         && let Ok(plist_val) = plist::from_bytes::<plist::Value>(data)
@@ -880,9 +885,11 @@ pub(crate) fn handle_flush_buffered(
             .and_then(|v| v.as_unsigned_integer())
             .unwrap_or(0) as u32;
         tracing::debug!(from_seq, until_seq, "FLUSHBUFFERED");
-        if let Some(cmd) = &conn.playout_cmd {
-            let _ = cmd.try_send(crate::raop::buffered_audio::PlayoutCommand::Flush { from_seq, until_seq });
-        }
+        super::rtsp::send_playout_command(
+            conn,
+            crate::raop::buffered_audio::PlayoutCommand::Flush { from_seq, until_seq },
+            response,
+        );
     }
     None
 }

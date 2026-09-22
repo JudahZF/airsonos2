@@ -17,8 +17,6 @@ type Handler = fn(&mut RaopConnection, &HttpRequest, &mut HttpResponse) -> Optio
 
 /// Result of route resolution.
 enum RouteResolution {
-    /// Request is handled inline and has no body.
-    NoBody,
     /// Request should be passed to a handler function.
     Handler(Handler),
 }
@@ -234,6 +232,14 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
         #[cfg(feature = "ap2")]
         {
             let active = conn.controller_session.lock().unwrap();
+            // A former media connection is tied to its old stream. Only a separate
+            // control-only connection may follow replacements for the same identity.
+            if conn.has_owned_audio && active.owner_connection.as_deref() != Some(conn.nonce.as_str()) {
+                response = HttpResponse::new("RTSP/1.0", 409, "Stale Session");
+                response.add_header("CSeq", cseq);
+                response.finish(None);
+                return response;
+            }
             if !active.permits(ap2_authenticated, conn.controller_id.as_deref()) {
                 response = HttpResponse::new("RTSP/1.0", 403, "Forbidden");
                 response.add_header("CSeq", cseq);
@@ -258,7 +264,6 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
     // --- Route resolution ---
     let response_data = match resolve_handler(conn, request, method, url) {
         Some(RouteResolution::Handler(handler)) => handler(conn, request, &mut response),
-        Some(RouteResolution::NoBody) => None,
         None => {
             tracing::debug!(method, url, "Unhandled RTSP request");
             response = HttpResponse::new("RTSP/1.0", 404, "Not Found");
@@ -267,6 +272,9 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
             return response;
         }
     };
+    if response.status_code() != 200 {
+        response.add_header("CSeq", cseq);
+    }
     response.finish(response_data.as_deref());
     response
 }
@@ -294,10 +302,7 @@ fn resolve_handler(
     match method {
         "SETUP" => resolve_setup(conn, request).map(RouteResolution::Handler),
         "RECORD" => resolve_record(conn).map(RouteResolution::Handler),
-        "FLUSH" => {
-            handle_flush_inline(conn, request);
-            Some(RouteResolution::NoBody)
-        }
+        "FLUSH" => Some(RouteResolution::Handler(handle_flush_inline)),
         "TEARDOWN" => Some(RouteResolution::Handler(handle_teardown as Handler)),
         _ => None,
     }
@@ -326,8 +331,32 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
     None
 }
 
+#[cfg(feature = "ap2")]
+pub(crate) fn send_playout_command(
+    conn: &RaopConnection,
+    command: super::buffered_audio::PlayoutCommand,
+    response: &mut HttpResponse,
+) -> bool {
+    match conn.playout_cmd.as_ref().map(|sender| sender.try_send(command)) {
+        Some(Ok(())) => true,
+        Some(Err(tokio::sync::mpsc::error::TrySendError::Full(_))) => {
+            *response = HttpResponse::new("RTSP/1.0", 503, "Control Queue Full");
+            response.add_header("Retry-After", "1");
+            false
+        }
+        None | Some(Err(tokio::sync::mpsc::error::TrySendError::Closed(_))) => {
+            *response = HttpResponse::new("RTSP/1.0", 454, "Session Not Found");
+            false
+        }
+    }
+}
+
 /// FLUSH: parse RTP-Info header and flush the buffer inline.
-fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
+fn handle_flush_inline(
+    conn: &mut RaopConnection,
+    request: &HttpRequest,
+    _response: &mut HttpResponse,
+) -> Option<Vec<u8>> {
     let next_seq = request
         .header("RTP-Info")
         .and_then(|info| info.split(';').find_map(|field| field.trim().strip_prefix("seq=")))
@@ -337,13 +366,18 @@ fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
             rtp.flush(i32::from(next_seq));
         }
         #[cfg(feature = "ap2")]
-        if let Some(commands) = &conn.playout_cmd {
-            let _ = commands.try_send(super::buffered_audio::PlayoutCommand::Flush {
-                from_seq: 0,
-                until_seq: u32::from(next_seq),
-            });
+        if conn.raop_rtp.is_none() {
+            send_playout_command(
+                conn,
+                super::buffered_audio::PlayoutCommand::Flush {
+                    from_seq: 0,
+                    until_seq: u32::from(next_seq),
+                },
+                _response,
+            );
         }
     }
+    None
 }
 
 /// TEARDOWN: stop RTP, stop buffered audio, close connection.
@@ -356,8 +390,16 @@ fn handle_teardown(conn: &mut RaopConnection, _request: &HttpRequest, response: 
         rtp.stop();
     }
     #[cfg(feature = "ap2")]
-    if let Some(cmd) = &conn.playout_cmd {
-        let _ = cmd.try_send(crate::raop::buffered_audio::PlayoutCommand::Stop);
+    {
+        let mut active = conn.controller_session.lock().unwrap();
+        // Terminal cancellation bypasses the bounded command queue, including
+        // when TEARDOWN arrives on an associated control-only connection.
+        if let Some(task) = active.media_abort.take() {
+            task.abort();
+        }
+        active.playout = None;
+        active.owner = None;
+        active.owner_connection = None;
     }
     None
 }

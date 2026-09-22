@@ -78,6 +78,8 @@ impl HttpdCallbacks for RaopShared {
             tasks: tokio::task::JoinSet::new(),
             audio_tasks: tokio::task::JoinSet::new(),
             #[cfg(feature = "ap2")]
+            has_owned_audio: false,
+            #[cfg(feature = "ap2")]
             controller_id: None,
             #[cfg(feature = "ap2")]
             controller_session: self.controller_session.clone(),

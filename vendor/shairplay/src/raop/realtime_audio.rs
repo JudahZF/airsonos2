@@ -136,3 +136,124 @@ pub async fn run(
 
     debug!("Realtime ALAC receiver ended");
 }
+
+#[cfg(test)]
+mod acceptance {
+    use super::*;
+    use crate::raop::{AudioSession, buffered_audio::PlayoutCommand};
+    enum Event {
+        Pcm(Vec<f32>),
+        Flush,
+    }
+    struct Handler(tokio::sync::mpsc::UnboundedSender<Event>);
+    struct Session(tokio::sync::mpsc::UnboundedSender<Event>);
+    impl AudioHandler for Handler {
+        fn audio_init(&self, _: AudioFormat) -> Box<dyn AudioSession> {
+            Box::new(Session(self.0.clone()))
+        }
+    }
+    impl AudioSession for Session {
+        fn audio_process(&mut self, samples: &[f32]) {
+            self.0.send(Event::Pcm(samples.to_vec())).unwrap();
+        }
+        fn audio_process_timed(&mut self, samples: &[f32], time: Option<std::time::Instant>) {
+            assert!(time.is_none());
+            self.audio_process(samples);
+        }
+        fn audio_flush(&mut self) {
+            self.0.send(Event::Flush).unwrap();
+        }
+    }
+    fn packet(sequence: u16, value: u16) -> Vec<u8> {
+        let mut bits = Vec::new();
+        let mut write = |value: u32, count: usize| {
+            for bit in (0..count).rev() {
+                bits.push(((value >> bit) & 1) as u8);
+            }
+        };
+        write(1, 3);
+        write(0, 4);
+        write(0, 12);
+        write(1, 1);
+        write(0, 2);
+        write(1, 1);
+        write(2, 32);
+        for _ in 0..4 {
+            write(u32::from(value), 16);
+        }
+        let mut alac = vec![0; bits.len().div_ceil(8)];
+        for (index, bit) in bits.into_iter().enumerate() {
+            alac[index / 8] |= bit << (7 - index % 8);
+        }
+        let mut header = vec![0x80, 96];
+        header.extend_from_slice(&sequence.to_be_bytes());
+        header.extend_from_slice(&(u32::from(sequence) * 352).to_be_bytes());
+        header.extend_from_slice(&[0; 4]);
+        let mut nonce = [0; 12];
+        nonce[10..].copy_from_slice(&sequence.to_be_bytes());
+        let encrypted = ChaCha20Poly1305::new((&[7; 32]).into())
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &alac,
+                    aad: &header[4..12],
+                },
+            )
+            .unwrap();
+        header.extend_from_slice(&encrypted);
+        header.extend_from_slice(&nonce[4..]);
+        header
+    }
+    #[tokio::test]
+    async fn authenticated_realtime_alac_flush_drops_old_sequence_before_new_pcm() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (commands, receiver) = tokio::sync::mpsc::channel(8);
+        let alac = super::super::buffer::parse_fmtp("96 352 0 16 40 10 14 2 255 0 0 44100").unwrap();
+        let task = tokio::spawn(run(
+            socket,
+            [7; 32],
+            Arc::new(Handler(events)),
+            OutputConfig {
+                sample_rate: None,
+                max_channels: None,
+                alac,
+            },
+            receiver,
+        ));
+        sender.send_to(&packet(10, 1000), address).await.unwrap();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(next,Event::Pcm(samples) if samples == vec![1000.0/32768.0;4]));
+        commands
+            .send(PlayoutCommand::Flush {
+                from_seq: 0,
+                until_seq: 10,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+                .await
+                .unwrap(),
+            Some(Event::Flush)
+        ));
+        sender.send_to(&packet(10, 1000), address).await.unwrap();
+        sender.send_to(&packet(11, 2000), address).await.unwrap();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(next,Event::Pcm(samples) if samples == vec![2000.0/32768.0;4]));
+        commands.send(PlayoutCommand::Stop).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(received.try_recv().is_err());
+    }
+}
