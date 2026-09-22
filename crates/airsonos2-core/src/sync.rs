@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::Duration;
 
 use crate::ZoneId;
 
@@ -97,13 +96,25 @@ impl StartupDelayEstimator {
     }
 }
 
-pub fn combine_sync_delay(
-    automatic_delay_ms: u64,
-    manual_offset_ms: i64,
+/// Positive offsets describe late rooms. Delay faster rooms to the largest
+/// configured latency; the default is only a fallback, never an added delay.
+pub fn configured_delays(
+    zones: &[(ZoneId, String)],
+    explicit: &BTreeMap<String, i64>,
     default_offset_ms: i64,
-) -> Duration {
-    let manual_ms = manual_offset_ms.saturating_add(default_offset_ms).max(0) as u64;
-    Duration::from_millis(automatic_delay_ms.saturating_add(manual_ms))
+) -> Vec<ZoneDelay> {
+    let offsets = zones
+        .iter()
+        .map(|(id, name)| {
+            let offset = explicit
+                .get(&id.to_string())
+                .or_else(|| explicit.get(name))
+                .copied()
+                .unwrap_or(default_offset_ms);
+            (id.clone(), offset)
+        })
+        .collect();
+    delays_from_offsets(&offsets)
 }
 
 #[cfg(test)]
@@ -183,7 +194,22 @@ mod tests {
     }
 
     #[test]
-    fn manual_offsets_combine_with_learned_compensation() {
-        assert_eq!(combine_sync_delay(40, 80, 10), Duration::from_millis(130));
+    fn configured_offsets_share_calibration_and_runtime_semantics() {
+        let zones = vec![
+            (ZoneId::new("a"), "Kitchen".into()),
+            (ZoneId::new("b"), "Office".into()),
+            (ZoneId::new("c"), "Den".into()),
+        ];
+        let explicit = BTreeMap::from([("Kitchen".into(), -20), ("b".into(), 80)]);
+        let delays = configured_delays(&zones, &explicit, 30);
+        assert_eq!(
+            delays.iter().map(|d| d.delay_ms).collect::<Vec<_>>(),
+            [100, 0, 50]
+        );
+        assert!(
+            configured_delays(&zones, &BTreeMap::new(), -40)
+                .iter()
+                .all(|d| d.delay_ms == 0)
+        );
     }
 }

@@ -38,6 +38,7 @@ pub enum AirPlayEvent {
     },
     Flushed {
         session_id: SessionId,
+        playback_epoch: u64,
         zone_id: ZoneId,
     },
     Volume {
@@ -376,6 +377,8 @@ impl AudioHandler for BridgeAudioHandler {
             events: self.events.clone(),
             active_session: self.active_session.clone(),
             stop_notified: false,
+            playback_epoch: 0,
+            warned_missing_timing: false,
         })
     }
 
@@ -441,15 +444,26 @@ struct BridgeAudioSession {
     events: mpsc::UnboundedSender<AirPlayEvent>,
     active_session: Arc<Mutex<Option<SessionId>>>,
     stop_notified: bool,
+    playback_epoch: u64,
+    warned_missing_timing: bool,
 }
 
 impl AudioSession for BridgeAudioSession {
     fn audio_process(&mut self, samples: &[f32]) {
+        self.audio_process_timed(samples, None);
+    }
+
+    fn audio_process_timed(&mut self, samples: &[f32], presentation_time: Option<Instant>) {
+        if presentation_time.is_none() && !self.warned_missing_timing {
+            self.warned_missing_timing = true;
+            warn!(session_id = %self.session_id, "source presentation timing unavailable; group playback uses best-effort release without sample alignment");
+        }
         let frame = PcmFrame {
+            playback_epoch: self.playback_epoch,
             sample_rate: self.format.sample_rate,
             channels: self.format.channels,
             samples_f32_interleaved: samples.to_vec(),
-            presentation_time: Some(Instant::now()),
+            presentation_time,
         };
         let _ = self.events.send(AirPlayEvent::Pcm {
             session_id: self.session_id,
@@ -459,6 +473,7 @@ impl AudioSession for BridgeAudioSession {
     }
 
     fn audio_flush(&mut self) {
+        self.playback_epoch = self.playback_epoch.saturating_add(1);
         debug!(
             zone_id = %self.zone_id,
             session_id = %self.session_id,
@@ -466,6 +481,7 @@ impl AudioSession for BridgeAudioSession {
         );
         let _ = self.events.send(AirPlayEvent::Flushed {
             session_id: self.session_id,
+            playback_epoch: self.playback_epoch,
             zone_id: self.zone_id.clone(),
         });
     }
@@ -600,6 +616,8 @@ mod tests {
             events: tx,
             active_session: active_session.clone(),
             stop_notified: false,
+            playback_epoch: 0,
+            warned_missing_timing: false,
         };
 
         session.audio_stopped(AudioStopReason::StreamEndedWhilePaused);
@@ -627,6 +645,8 @@ mod tests {
             events: tx,
             active_session: active_session.clone(),
             stop_notified: false,
+            playback_epoch: 0,
+            warned_missing_timing: false,
         };
 
         session.audio_stopped(AudioStopReason::Teardown);
@@ -654,6 +674,8 @@ mod tests {
             events: tx,
             active_session,
             stop_notified: false,
+            playback_epoch: 0,
+            warned_missing_timing: false,
         };
 
         session.audio_flush();

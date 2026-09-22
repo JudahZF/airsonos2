@@ -9,8 +9,8 @@ use airsonos2_airplay::{
 };
 use airsonos2_core::{
     Config, EncoderState, SessionId, SonosZone, StartupDelayEstimator, StreamCodec, StreamSession,
-    VirtualAirPlayEndpoint, ZoneId, ZoneStartupTiming, combine_sync_delay, delays_from_offsets,
-    filter_zones, sonos_volume_to_airplay_db, virtual_endpoint_for_zone,
+    VirtualAirPlayEndpoint, ZoneId, ZoneStartupTiming, configured_delays, filter_zones,
+    sonos_volume_to_airplay_db, virtual_endpoint_for_zone,
 };
 use airsonos2_diagnostics::{CheckStatus, run_doctor};
 use airsonos2_sonos::{SonosClient, discover_sonos_zones_from_sources};
@@ -228,19 +228,15 @@ fn calibrate(zones: &[String], config: &Config) -> anyhow::Result<()> {
         anyhow::bail!("--zones must contain at least one room or zone id");
     }
 
-    let offsets = zones
+    let rooms = zones
         .iter()
-        .map(|zone| {
-            let offset = config
-                .sync
-                .zone_offsets_ms
-                .get(zone)
-                .copied()
-                .unwrap_or(config.sync.default_offset_ms);
-            (ZoneId::new(zone.clone()), offset)
-        })
-        .collect();
-    let delays = delays_from_offsets(&offsets);
+        .map(|zone| (ZoneId::new(zone.clone()), zone.clone()))
+        .collect::<Vec<_>>();
+    let delays = configured_delays(
+        &rooms,
+        &config.sync.zone_offsets_ms,
+        config.sync.default_offset_ms,
+    );
 
     println!("Current delay plan from configured offsets:");
     for delay in delays {
@@ -1032,9 +1028,6 @@ impl BridgeRuntime {
             encoder_state: EncoderState::Starting,
         };
         let live_stream = LiveStream::new(stream_session);
-        if stream_codec == StreamCodec::Wav {
-            live_stream.arm_playback_anchor_on_next_timed_pcm();
-        }
         let encoder = FfmpegEncoder::spawn(
             FfmpegEncoderConfig {
                 ffmpeg_path: self.config.stream.ffmpeg_path.clone(),
@@ -1174,42 +1167,36 @@ impl BridgeRuntime {
     }
 
     fn apply_sync_anchors(&self, prepared: &[PreparedDownstream]) {
-        let zone_ids: Vec<ZoneId> = prepared
+        let rooms = prepared
             .iter()
-            .map(|stream| stream.zone_id.clone())
-            .collect();
-        let base_anchor = Instant::now() + Duration::from_millis(120);
-        for stream in prepared {
-            let auto_delay_ms = if self.config.sync.startup_compensation {
-                self.startup_estimator.automatic_delay_ms(
-                    &zone_ids,
-                    &stream.zone_id,
-                    self.config.sync.startup_max_compensation_ms,
-                )
-            } else {
-                0
-            };
-            let manual_offset = self
-                .config
-                .sync
-                .zone_offsets_ms
-                .get(&stream.zone_room_name)
-                .copied()
-                .unwrap_or(0);
-            let delay = combine_sync_delay(
-                auto_delay_ms,
-                manual_offset,
-                self.config.sync.default_offset_ms,
+            .map(|stream| (stream.zone_id.clone(), stream.zone_room_name.clone()))
+            .collect::<Vec<_>>();
+        let delays = configured_delays(
+            &rooms,
+            &self.config.sync.zone_offsets_ms,
+            self.config.sync.default_offset_ms,
+        );
+        let common_sample = Instant::now() + Duration::from_millis(120);
+        if self.config.sync.startup_compensation {
+            warn!(
+                "automatic sync compensation is disabled: SOAP and HTTP timings are not acoustic latency measurements"
             );
+        }
+        for stream in prepared {
             if stream.live_stream.session.codec == StreamCodec::Wav {
-                stream.live_stream.set_playback_anchor(base_anchor + delay);
-            } else if prepared.len() > 1 {
-                info!(
-                    session_id = %stream.session_id,
-                    zone_id = %stream.zone_id,
-                    codec = ?stream.live_stream.session.codec,
-                    "coordinated Play is best-effort without WAV playback anchors"
-                );
+                let delay = delays
+                    .iter()
+                    .find(|delay| delay.zone_id == stream.zone_id)
+                    .map_or(0, |delay| delay.delay_ms);
+                stream
+                    .live_stream
+                    .set_playback_plan(common_sample, common_sample + Duration::from_millis(delay));
+            } else if prepared.len() > 1
+                || self.config.sync.default_offset_ms != 0
+                || !self.config.sync.zone_offsets_ms.is_empty()
+            {
+                warn!(session_id = %stream.session_id, codec = ?stream.live_stream.session.codec,
+                    "MP3 does not support sample-aligned WAV offsets; group startup is best effort");
             }
         }
     }

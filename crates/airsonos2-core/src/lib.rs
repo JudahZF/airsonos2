@@ -10,7 +10,7 @@ pub use config::{
 };
 pub use ids::{PortAllocationError, SessionId, ZoneId, allocate_rtsp_port, stable_virtual_hwaddr};
 pub use sync::{
-    StartupDelayEstimator, ZoneDelay, ZoneStartupTiming, combine_sync_delay, delays_from_offsets,
+    StartupDelayEstimator, ZoneDelay, ZoneStartupTiming, configured_delays, delays_from_offsets,
     recommended_delay_for_zone,
 };
 pub use types::{

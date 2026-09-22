@@ -202,7 +202,7 @@ impl Default for SyncConfig {
             default_offset_ms: 0,
             multi_select_window_ms: 750,
             start_deadline_ms: 2_500,
-            startup_compensation: true,
+            startup_compensation: false,
             startup_sample_limit: 20,
             startup_min_samples: 3,
             startup_max_compensation_ms: 1_000,
@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(config.sync.default_offset_ms, 0);
         assert_eq!(config.sync.multi_select_window_ms, 750);
         assert_eq!(config.sync.start_deadline_ms, 2_500);
-        assert!(config.sync.startup_compensation);
+        assert!(!config.sync.startup_compensation);
         assert_eq!(config.sync.startup_sample_limit, 20);
         assert_eq!(config.sync.startup_min_samples, 3);
         assert_eq!(config.sync.startup_max_compensation_ms, 1_000);

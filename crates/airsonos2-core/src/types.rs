@@ -39,9 +39,12 @@ pub struct AirPlaySession {
 
 #[derive(Clone, Debug)]
 pub struct PcmFrame {
+    /// FLUSH advances this counter before the next callback is admitted.
+    pub playback_epoch: u64,
     pub sample_rate: u32,
     pub channels: u8,
     pub samples_f32_interleaved: Vec<f32>,
+    /// Source presentation time mapped to the local monotonic clock, when available.
     pub presentation_time: Option<Instant>,
 }
 

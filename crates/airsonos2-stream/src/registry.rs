@@ -133,6 +133,8 @@ pub struct LiveStream {
     ready: watch::Sender<bool>,
     subscriber: watch::Sender<bool>,
     closed: watch::Sender<bool>,
+    playback_release: watch::Sender<Option<Instant>>,
+    playback_epoch: Arc<AtomicU64>,
     subscriber_count: Arc<AtomicU64>,
     playback_anchor: Arc<std::sync::Mutex<PlaybackAnchorState>>,
     first_encoded_at: Arc<std::sync::Mutex<Option<Instant>>>,
@@ -146,6 +148,7 @@ impl LiveStream {
         let (ready, _) = watch::channel(false);
         let (subscriber, _) = watch::channel(false);
         let (closed, _) = watch::channel(false);
+        let (playback_release, _) = watch::channel(None);
         Self {
             session,
             sender,
@@ -159,6 +162,8 @@ impl LiveStream {
             ready,
             subscriber,
             closed,
+            playback_release,
+            playback_epoch: Arc::new(AtomicU64::new(0)),
             subscriber_count: Arc::new(AtomicU64::new(0)),
             playback_anchor: Arc::new(std::sync::Mutex::new(PlaybackAnchorState::Unset)),
             first_encoded_at: Arc::new(std::sync::Mutex::new(None)),
@@ -391,6 +396,7 @@ impl LiveStream {
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::At(anchor);
         }
+        self.playback_release.send_replace(Some(anchor));
         let timing = self.timing();
         info!(
             session_id = %self.session.session_id,
@@ -405,6 +411,7 @@ impl LiveStream {
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::NextTimedPcm;
         }
+        self.playback_release.send_replace(Some(Instant::now()));
         let timing = self.timing();
         info!(
             session_id = %self.session.session_id,
@@ -415,7 +422,42 @@ impl LiveStream {
         );
     }
 
+    pub fn set_playback_plan(&self, source_cutoff: Instant, release_at: Instant) {
+        if let Ok(mut anchor) = self.playback_anchor.lock() {
+            *anchor = PlaybackAnchorState::At(source_cutoff);
+        }
+        self.playback_release.send_replace(Some(release_at));
+    }
+
+    pub async fn wait_for_playback_release(&self) -> bool {
+        let mut release = self.playback_release.subscribe();
+        loop {
+            let deadline = *release.borrow_and_update();
+            match deadline {
+                Some(deadline) => tokio::select! {
+                    biased;
+                    _ = self.closed() => return false,
+                    changed = release.changed() => if changed.is_err() { return false; },
+                    _ = tokio::time::sleep_until(deadline.into()) => return true,
+                },
+                None => tokio::select! {
+                    _ = self.closed() => return false,
+                    changed = release.changed() => if changed.is_err() { return false; },
+                },
+            }
+        }
+    }
+
+    pub fn set_playback_epoch(&self, epoch: u64) {
+        self.playback_epoch.store(epoch, Ordering::Release);
+    }
+
+    pub fn accepts_epoch(&self, epoch: u64) -> bool {
+        !self.is_closed() && self.playback_epoch.load(Ordering::Acquire) == epoch
+    }
+
     pub fn clear_playback_anchor(&self) {
+        self.playback_release.send_replace(None);
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::Unset;
         }
