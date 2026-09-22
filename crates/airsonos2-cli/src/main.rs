@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+mod bridge;
 mod home_assistant;
+use bridge::{TransportCommand, ZoneWorker};
 
 /// How long to keep a bridge session alive after the buffered audio stream
 /// closes while AirPlay playback is paused.
@@ -507,24 +509,21 @@ fn build_sonos_clients(
         .collect()
 }
 
+struct PausedCleanup {
+    session_id: SessionId,
+    generation: u64,
+}
+
 struct BridgeRuntime {
     config: Config,
     registry: StreamRegistry,
     sonos: HashMap<ZoneId, (SonosZone, SonosClient)>,
     volume_states: HashMap<ZoneId, ZoneVolumeState>,
-    encoders: HashMap<SessionId, FfmpegEncoder>,
-    sessions: HashMap<SessionId, ZoneId>,
-    session_formats: HashMap<SessionId, PcmFormat>,
-    downstream_generations: HashMap<SessionId, u64>,
-    downstream_reset_needed: HashSet<SessionId>,
-    desired_playback: HashMap<SessionId, bool>,
-    /// Last known Sonos playback state per session (`true` = playing).
-    playback_state: HashMap<SessionId, bool>,
-    playback_tasks: HashMap<SessionId, JoinHandle<()>>,
-    paused_cleanup_tasks: HashMap<SessionId, JoinHandle<()>>,
-    downstream_retry_tasks: HashMap<SessionId, JoinHandle<()>>,
-    downstream_retry_attempts: HashMap<SessionId, u32>,
-    cleanup_tx: mpsc::UnboundedSender<SessionId>,
+    sessions: HashMap<SessionId, SessionRuntime>,
+    zone_workers: HashMap<ZoneId, ZoneWorker>,
+    next_generation: u64,
+    pending_cohorts: VecDeque<SyncCohort>,
+    cleanup_tx: mpsc::UnboundedSender<PausedCleanup>,
     downstream_result_tx: mpsc::UnboundedSender<DownstreamStartResult>,
     downstream_result_rx: mpsc::UnboundedReceiver<DownstreamStartResult>,
     downstream_retry_tx: mpsc::UnboundedSender<DownstreamRetry>,
@@ -538,6 +537,56 @@ struct BridgeRuntime {
     tasks: tokio::task::JoinSet<()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservedPlayback {
+    Unknown,
+    Playing,
+    Stopped,
+}
+
+struct SessionRuntime {
+    zone_id: ZoneId,
+    format: PcmFormat,
+    generation: u64,
+    playback_epoch: u64,
+    desired_playback: bool,
+    observed: ObservedPlayback,
+    reset_needed: bool,
+    encoder: Option<FfmpegEncoder>,
+    prepared: Option<PreparedDownstream>,
+    retry_attempts: u32,
+    retry_task: Option<JoinHandle<()>>,
+    cleanup_task: Option<JoinHandle<()>>,
+}
+
+impl SessionRuntime {
+    fn new(zone_id: ZoneId, format: PcmFormat) -> Self {
+        Self {
+            zone_id,
+            format,
+            generation: 0,
+            playback_epoch: 0,
+            desired_playback: true,
+            observed: ObservedPlayback::Unknown,
+            reset_needed: false,
+            encoder: None,
+            prepared: None,
+            retry_attempts: 0,
+            retry_task: None,
+            cleanup_task: None,
+        }
+    }
+}
+
+impl Drop for SessionRuntime {
+    fn drop(&mut self) {
+        for task in [&self.retry_task, &self.cleanup_task].into_iter().flatten() {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Clone)]
 struct SonosStreamPrepare {
     session_id: SessionId,
     zone_id: ZoneId,
@@ -554,7 +603,11 @@ struct SonosStreamPrepare {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DownstreamStartOutcome {
     Started,
+    Stopped,
+    StopUnknown,
+    Unknown,
     Failed,
+    PermanentFailure,
 }
 
 #[derive(Clone, Debug)]
@@ -599,7 +652,7 @@ impl BridgeRuntime {
         registry: StreamRegistry,
         sonos: HashMap<ZoneId, (SonosZone, SonosClient)>,
         volume_states: HashMap<ZoneId, ZoneVolumeState>,
-        cleanup_tx: mpsc::UnboundedSender<SessionId>,
+        cleanup_tx: mpsc::UnboundedSender<PausedCleanup>,
     ) -> Self {
         let (downstream_result_tx, downstream_result_rx) = mpsc::unbounded_channel();
         let (downstream_retry_tx, downstream_retry_rx) = mpsc::unbounded_channel();
@@ -614,17 +667,10 @@ impl BridgeRuntime {
             registry,
             sonos,
             volume_states,
-            encoders: HashMap::new(),
             sessions: HashMap::new(),
-            session_formats: HashMap::new(),
-            downstream_generations: HashMap::new(),
-            downstream_reset_needed: HashSet::new(),
-            desired_playback: HashMap::new(),
-            playback_state: HashMap::new(),
-            playback_tasks: HashMap::new(),
-            paused_cleanup_tasks: HashMap::new(),
-            downstream_retry_tasks: HashMap::new(),
-            downstream_retry_attempts: HashMap::new(),
+            zone_workers: HashMap::new(),
+            next_generation: 0,
+            pending_cohorts: VecDeque::new(),
             cleanup_tx,
             downstream_result_tx,
             downstream_result_rx,
@@ -643,7 +689,7 @@ impl BridgeRuntime {
     async fn run(
         &mut self,
         mut events_rx: mpsc::UnboundedReceiver<AirPlayEvent>,
-        mut cleanup_rx: mpsc::UnboundedReceiver<SessionId>,
+        mut cleanup_rx: mpsc::UnboundedReceiver<PausedCleanup>,
     ) -> anyhow::Result<()> {
         loop {
             tokio::select! {
@@ -655,9 +701,8 @@ impl BridgeRuntime {
                     }
                 }
                 session_id = cleanup_rx.recv() => {
-                    let Some(session_id) = session_id else { continue };
-                    if self.sessions.contains_key(&session_id)
-                        && self.desired_playback.get(&session_id) == Some(&false)
+                    let Some(PausedCleanup { session_id, generation }) = session_id else { continue };
+                    if self.sessions.get(&session_id).is_some_and(|session| session.generation == generation && !session.desired_playback)
                     {
                         info!(
                             %session_id,
@@ -694,38 +739,47 @@ impl BridgeRuntime {
         Ok(())
     }
 
-    fn cancel_paused_cleanup(&mut self, session_id: SessionId) {
-        if let Some(task) = self.paused_cleanup_tasks.remove(&session_id) {
-            task.abort();
+    fn worker(&mut self, zone_id: &ZoneId) -> Option<&ZoneWorker> {
+        if !self.zone_workers.contains_key(zone_id) {
+            let client = self.sonos.get(zone_id)?.1.clone();
+            let worker = ZoneWorker::new(
+                client,
+                self.downstream_result_tx.clone(),
+                Duration::from_millis(self.config.stream.startup_wait_ms()),
+                Duration::from_millis(self.config.stream.prebuffer_ms),
+            );
+            self.zone_workers.insert(zone_id.clone(), worker);
         }
+        self.zone_workers.get(zone_id)
     }
 
-    fn clear_session_runtime_state(&mut self, session_id: SessionId) {
-        self.playback_state.remove(&session_id);
-        self.session_formats.remove(&session_id);
-        self.downstream_generations.remove(&session_id);
-        self.downstream_reset_needed.remove(&session_id);
-        self.desired_playback.remove(&session_id);
-        self.downstream_retry_attempts.remove(&session_id);
-        self.cancel_paused_cleanup(session_id);
-        self.cancel_downstream_retry(session_id);
-        if let Some(task) = self.playback_tasks.remove(&session_id) {
+    fn cancel_paused_cleanup(&mut self, session_id: SessionId) {
+        if let Some(session) = self.sessions.get_mut(&session_id)
+            && let Some(task) = session.cleanup_task.take()
+        {
             task.abort();
         }
     }
 
     fn schedule_paused_cleanup(&mut self, session_id: SessionId) {
         self.cancel_paused_cleanup(session_id);
-        let tx = self.cleanup_tx.clone();
-        let task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(PAUSED_SESSION_GRACE_SECS)).await;
-            let _ = tx.send(session_id);
-        });
-        self.paused_cleanup_tasks.insert(session_id, task);
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            let tx = self.cleanup_tx.clone();
+            let generation = session.generation;
+            session.cleanup_task = Some(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(PAUSED_SESSION_GRACE_SECS)).await;
+                let _ = tx.send(PausedCleanup {
+                    session_id,
+                    generation,
+                });
+            }));
+        }
     }
 
     fn cancel_downstream_retry(&mut self, session_id: SessionId) {
-        if let Some(task) = self.downstream_retry_tasks.remove(&session_id) {
+        if let Some(session) = self.sessions.get_mut(&session_id)
+            && let Some(task) = session.retry_task.take()
+        {
             task.abort();
         }
     }
@@ -737,81 +791,85 @@ impl BridgeRuntime {
         generation: u64,
     ) {
         self.cancel_downstream_retry(session_id);
-        let attempt = self.downstream_retry_attempt(session_id);
-        let delay = downstream_retry_delay(attempt);
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if session.retry_attempts >= 6 {
+            error!(%session_id, %zone_id, "downstream retry budget exhausted; session requires a new playback request");
+            return;
+        }
+        let delay = downstream_retry_delay(session.retry_attempts);
+        session.retry_attempts += 1;
         let tx = self.downstream_retry_tx.clone();
-        let task = tokio::spawn(async move {
+        session.retry_task = Some(tokio::spawn(async move {
             tokio::time::sleep(delay).await;
             let _ = tx.send(DownstreamRetry {
                 session_id,
                 zone_id,
                 generation,
             });
-        });
-        self.downstream_retry_tasks.insert(session_id, task);
-    }
-
-    fn downstream_retry_attempt(&mut self, session_id: SessionId) -> u32 {
-        let attempts = self
-            .downstream_retry_attempts
-            .entry(session_id)
-            .or_insert(0);
-        let current = *attempts;
-        *attempts = attempts.saturating_add(1);
-        current
+        }));
     }
 
     fn handle_downstream_start_result(&mut self, result: DownstreamStartResult) {
-        if self.downstream_generations.get(&result.session_id) != Some(&result.generation) {
-            debug!(
-                session_id = %result.session_id,
-                zone_id = %result.zone_id,
-                generation = result.generation,
-                "ignoring stale downstream start result"
-            );
+        let Some(session) = self.sessions.get_mut(&result.session_id) else {
+            return;
+        };
+        if session.generation != result.generation {
             return;
         }
-
-        if let Some(timing) = &result.timing {
-            self.startup_estimator
-                .record(result.zone_id.clone(), timing);
+        if !session.desired_playback {
+            session.observed = if result.outcome == DownstreamStartOutcome::Stopped {
+                ObservedPlayback::Stopped
+            } else {
+                ObservedPlayback::Unknown
+            };
+            return;
         }
-
         match result.outcome {
+            DownstreamStartOutcome::Stopped | DownstreamStartOutcome::StopUnknown => {}
             DownstreamStartOutcome::Started => {
-                if self.desired_playback.get(&result.session_id) == Some(&true) {
-                    self.downstream_reset_needed.remove(&result.session_id);
-                    self.downstream_retry_attempts.remove(&result.session_id);
-                    self.cancel_downstream_retry(result.session_id);
+                session.observed = ObservedPlayback::Playing;
+                session.reset_needed = false;
+                session.retry_attempts = 0;
+                if let Some(timing) = result.timing {
+                    self.startup_estimator.record(result.zone_id, &timing);
                 }
+                self.cancel_downstream_retry(result.session_id);
             }
-            DownstreamStartOutcome::Failed => {
-                self.downstream_reset_needed.insert(result.session_id);
-                if self.desired_playback.get(&result.session_id) == Some(&true) {
-                    self.schedule_downstream_retry(
-                        result.session_id,
-                        result.zone_id,
-                        result.generation,
-                    );
-                }
+            DownstreamStartOutcome::PermanentFailure => {
+                session.observed = ObservedPlayback::Unknown;
+                session.retry_attempts = 6;
+                error!(session_id = %result.session_id, "permanent Sonos error; automatic retries stopped");
+                self.cancel_downstream_retry(result.session_id);
+            }
+            _ => {
+                session.observed = ObservedPlayback::Unknown;
+                session.reset_needed = session.prepared.is_none();
+                self.schedule_downstream_retry(
+                    result.session_id,
+                    result.zone_id,
+                    result.generation,
+                );
             }
         }
     }
 
     async fn handle_downstream_retry(&mut self, retry: DownstreamRetry) -> anyhow::Result<()> {
-        self.downstream_retry_tasks.remove(&retry.session_id);
-        if self.downstream_generations.get(&retry.session_id) != Some(&retry.generation) {
-            debug!(
-                session_id = %retry.session_id,
-                zone_id = %retry.zone_id,
-                generation = retry.generation,
-                "ignoring stale downstream retry"
-            );
+        let Some(session) = self.sessions.get_mut(&retry.session_id) else {
+            return Ok(());
+        };
+        if session.generation != retry.generation || !session.desired_playback {
             return Ok(());
         }
-        if self.desired_playback.get(&retry.session_id) == Some(&true)
-            && self.downstream_reset_needed.contains(&retry.session_id)
-        {
+        if let Some(task) = session.retry_task.take() {
+            task.abort();
+        }
+        if let Some(prepared) = session.prepared.clone() {
+            if let Some(worker) = self.worker(&retry.zone_id) {
+                worker.command(TransportCommand::Play(prepared));
+            }
+        } else {
             self.restart_downstream_for_play(retry.session_id, retry.zone_id)
                 .await?;
         }
@@ -828,8 +886,36 @@ impl BridgeRuntime {
             AirPlayEvent::Pcm {
                 session_id, frame, ..
             } => {
-                if let Some(encoder) = self.encoders.get(&session_id) {
-                    encoder.write_frame(frame).await?;
+                if let Some(session) = self.sessions.get_mut(&session_id)
+                    && let Some(encoder) = &session.encoder
+                {
+                    match encoder.try_write_frame(frame) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            debug!(%session_id, "encoder input full; dropping realtime frame")
+                        }
+                        Err(error) => {
+                            warn!(%session_id, "encoder input closed: {error}");
+                            session.prepared = None;
+                            session.reset_needed = true;
+                            let zone_id = session.zone_id.clone();
+                            let desired_playback = session.desired_playback;
+                            let encoder = session.encoder.take();
+                            let generation = self.next_downstream_generation(session_id);
+                            self.registry.remove(&session_id).await;
+                            self.retire_encoder(encoder);
+                            if let Some(worker) = self.worker(&zone_id) {
+                                worker.command(TransportCommand::Stop {
+                                    session_id,
+                                    zone_id: zone_id.clone(),
+                                    generation,
+                                });
+                            }
+                            if desired_playback {
+                                self.schedule_downstream_retry(session_id, zone_id, generation);
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -843,10 +929,18 @@ impl BridgeRuntime {
                 if let Some(stream) = self.registry.get(&session_id).await {
                     stream.arm_playback_anchor_on_next_timed_pcm();
                 }
-                if self.desired_playback.get(&session_id) == Some(&false)
-                    || self.playback_state.get(&session_id) == Some(&false)
+                if self
+                    .sessions
+                    .get(&session_id)
+                    .is_some_and(|session| !session.desired_playback)
+                    || self
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|session| session.observed == ObservedPlayback::Stopped)
                 {
-                    self.downstream_reset_needed.insert(session_id);
+                    if let Some(session) = self.sessions.get_mut(&session_id) {
+                        session.reset_needed = true;
+                    }
                 }
                 Ok(())
             }
@@ -855,14 +949,19 @@ impl BridgeRuntime {
                 zone_id,
             } => {
                 if self.sessions.contains_key(&session_id)
-                    && self.desired_playback.get(&session_id) != Some(&true)
+                    && !self
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|session| session.desired_playback)
                 {
                     debug!(
                         %session_id,
                         %zone_id,
                         "AirPlay audio stream ended while paused; deferring bridge session cleanup"
                     );
-                    self.downstream_reset_needed.insert(session_id);
+                    if let Some(session) = self.sessions.get_mut(&session_id) {
+                        session.reset_needed = true;
+                    }
                     self.schedule_paused_cleanup(session_id);
                 } else {
                     debug!(
@@ -878,8 +977,8 @@ impl BridgeRuntime {
                 sonos_volume,
                 ..
             } => {
-                if let Some((_, client)) = self.sonos.get(&zone_id) {
-                    client.set_volume(sonos_volume).await?;
+                if let Some(worker) = self.worker(&zone_id) {
+                    worker.set_volume(sonos_volume);
                 }
                 Ok(())
             }
@@ -952,9 +1051,14 @@ impl BridgeRuntime {
     }
 
     fn next_downstream_generation(&mut self, session_id: SessionId) -> u64 {
-        let generation = self.downstream_generations.entry(session_id).or_insert(0);
-        *generation = generation.saturating_add(1);
-        *generation
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("generation space exhausted");
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.generation = self.next_generation;
+        }
+        self.next_generation
     }
 
     fn schedule_cohort_wake(&mut self, delay: Duration) {
@@ -966,90 +1070,107 @@ impl BridgeRuntime {
     }
 
     fn add_session_to_sync_cohort(&mut self, session_id: SessionId) {
-        let now = Instant::now();
-        let multi_select_window = Duration::from_millis(self.config.sync.multi_select_window_ms);
-        let start_deadline = Duration::from_millis(self.config.sync.start_deadline_ms);
-        let should_open = self
+        // Remove a prior generation before admitting this session again.
+        for cohort in self
             .sync_cohort
-            .as_ref()
-            .is_none_or(|cohort| now >= cohort.window_deadline || now >= cohort.start_deadline);
-
-        if should_open {
-            self.sync_cohort = Some(SyncCohort {
-                opened_at: now,
-                window_deadline: now + multi_select_window,
-                start_deadline: now + start_deadline,
-                sessions: Vec::new(),
-                prepared: HashMap::new(),
-            });
-            self.schedule_cohort_wake(multi_select_window);
-            self.schedule_cohort_wake(start_deadline);
+            .iter_mut()
+            .chain(self.pending_cohorts.iter_mut())
+        {
+            cohort.sessions.retain(|id| *id != session_id);
+            cohort.prepared.remove(&session_id);
         }
-
-        if let Some(cohort) = self.sync_cohort.as_mut()
-            && !cohort.sessions.contains(&session_id)
+        let now = Instant::now();
+        let last = self
+            .pending_cohorts
+            .back_mut()
+            .or(self.sync_cohort.as_mut());
+        if let Some(cohort) = last
+            && now < cohort.window_deadline
+            && now < cohort.start_deadline
         {
             cohort.sessions.push(session_id);
+            return;
         }
+        let window = Duration::from_millis(self.config.sync.multi_select_window_ms);
+        let deadline = Duration::from_millis(self.config.sync.start_deadline_ms);
+        let cohort = SyncCohort {
+            opened_at: now,
+            window_deadline: now + window,
+            start_deadline: now + deadline,
+            sessions: vec![session_id],
+            prepared: HashMap::new(),
+        };
+        if self.sync_cohort.is_none() {
+            self.sync_cohort = Some(cohort);
+        } else {
+            self.pending_cohorts.push_back(cohort);
+        }
+        self.schedule_cohort_wake(window);
+        self.schedule_cohort_wake(deadline);
     }
 
     async fn handle_prepared_downstream(&mut self, prepared: PreparedDownstream) {
-        if self.downstream_generations.get(&prepared.session_id) != Some(&prepared.generation) {
-            debug!(
-                session_id = %prepared.session_id,
-                zone_id = %prepared.zone_id,
-                generation = prepared.generation,
-                "ignoring stale prepared downstream"
-            );
+        let Some(session) = self.sessions.get_mut(&prepared.session_id) else {
+            return;
+        };
+        if session.generation != prepared.generation || !session.desired_playback {
             return;
         }
-        self.startup_estimator
-            .record(prepared.zone_id.clone(), &prepared.timing);
-
-        let joined_cohort = self
+        session.prepared = Some(prepared.clone());
+        for cohort in self
             .sync_cohort
-            .as_ref()
-            .is_some_and(|cohort| cohort.sessions.contains(&prepared.session_id));
-        if joined_cohort {
-            if let Some(cohort) = self.sync_cohort.as_mut() {
+            .iter_mut()
+            .chain(self.pending_cohorts.iter_mut())
+        {
+            if cohort.sessions.contains(&prepared.session_id) {
                 cohort.prepared.insert(prepared.session_id, prepared);
+                self.maybe_start_sync_cohort(false).await;
+                return;
             }
-            self.maybe_start_sync_cohort(false).await;
-            return;
         }
-
         self.play_prepared_downstreams(vec![prepared]).await;
     }
 
     async fn maybe_start_sync_cohort(&mut self, force: bool) {
-        let Some(cohort) = self.sync_cohort.as_ref() else {
-            return;
-        };
-        let now = Instant::now();
-        let should_start = sync_cohort_should_start(cohort, now, force);
-        let all_prepared =
-            !cohort.sessions.is_empty() && cohort.sessions.len() == cohort.prepared.len();
-        let deadline_expired = now >= cohort.start_deadline;
-        if !should_start {
-            return;
-        }
-
-        let cohort = self.sync_cohort.take().expect("cohort exists");
-        let mut prepared = Vec::new();
-        for session_id in cohort.sessions {
-            if let Some(stream) = cohort.prepared.get(&session_id) {
-                prepared.push(stream.clone());
+        loop {
+            if self.sync_cohort.is_none() {
+                self.sync_cohort = self.pending_cohorts.pop_front();
             }
+            let Some(cohort) = self.sync_cohort.as_mut() else {
+                return;
+            };
+            cohort.sessions.retain(|id| {
+                self.sessions
+                    .get(id)
+                    .is_some_and(|session| session.desired_playback)
+            });
+            cohort.prepared.retain(|id, prepared| {
+                cohort.sessions.contains(id)
+                    && self
+                        .sessions
+                        .get(id)
+                        .is_some_and(|session| session.generation == prepared.generation)
+            });
+            if cohort.sessions.is_empty() {
+                self.sync_cohort = None;
+                continue;
+            }
+            if !sync_cohort_should_start(cohort, Instant::now(), force) {
+                return;
+            }
+            let cohort = self.sync_cohort.take().expect("cohort exists");
+            let prepared = cohort
+                .sessions
+                .iter()
+                .filter_map(|id| cohort.prepared.get(id).cloned())
+                .collect();
+            info!(
+                age_ms = cohort.opened_at.elapsed().as_millis(),
+                "releasing prepared sync cohort"
+            );
+            self.play_prepared_downstreams(prepared).await;
+            // A promoted cohort may already have an expired deadline.
         }
-        if prepared.is_empty() {
-            return;
-        }
-        let age_ms = cohort.opened_at.elapsed().as_millis();
-        info!(
-            sessions = prepared.len(),
-            age_ms, all_prepared, deadline_expired, "starting AirPlay multi-select sync cohort"
-        );
-        self.play_prepared_downstreams(prepared).await;
     }
 
     fn apply_sync_anchors(&self, prepared: &[PreparedDownstream]) {
@@ -1093,214 +1214,13 @@ impl BridgeRuntime {
         }
     }
 
-    async fn play_prepared_downstreams(&self, prepared: Vec<PreparedDownstream>) {
+    async fn play_prepared_downstreams(&mut self, prepared: Vec<PreparedDownstream>) {
         self.apply_sync_anchors(&prepared);
-
-        let play_started_at = Instant::now();
-        let mut tasks = tokio::task::JoinSet::new();
         for stream in prepared {
-            let result_tx = self.downstream_result_tx.clone();
-            tasks.spawn(async move {
-                info!(session_id = %stream.session_id, zone_id = %stream.zone_id, "starting Sonos playback");
-                let play_start = Instant::now();
-                let mut startup_timing = stream.timing.clone();
-                let outcome = match stream.client.play().await {
-                    Ok(()) => {
-                        startup_timing.play_ms = Some(play_start.elapsed().as_millis() as u64);
-                        let timing = stream.live_stream.timing();
-                        debug!(
-                            session_id = %stream.session_id,
-                            zone_id = %stream.zone_id,
-                            elapsed_ms = play_start.elapsed().as_millis(),
-                            skipped_bytes = timing.bytes_skipped,
-                            "Sonos play request completed"
-                        );
-                        DownstreamStartOutcome::Started
-                    }
-                    Err(error) => {
-                        if error.is_timeout() {
-                            startup_timing.play_ms = Some(play_start.elapsed().as_millis() as u64);
-                            warn!(
-                                session_id = %stream.session_id,
-                                zone_id = %stream.zone_id,
-                                "Sonos play request timed out; keeping stream alive because playback state is ambiguous: {error:#}"
-                            );
-                            DownstreamStartOutcome::Started
-                        } else {
-                            warn!(session_id = %stream.session_id, zone_id = %stream.zone_id, "Sonos play request failed: {error:#}");
-                            DownstreamStartOutcome::Failed
-                        }
-                    }
-                };
-                let _ = result_tx.send(DownstreamStartResult {
-                    session_id: stream.session_id,
-                    zone_id: stream.zone_id,
-                    generation: stream.generation,
-                    outcome,
-                    timing: Some(startup_timing),
-                });
-            });
+            if let Some(worker) = self.worker(&stream.zone_id) {
+                worker.command(TransportCommand::Play(stream));
+            }
         }
-
-        let mut last_completion = play_started_at;
-        while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result {
-                warn!("Sonos play task failed to join: {error}");
-            }
-            last_completion = Instant::now();
-        }
-        let spread_ms = last_completion
-            .saturating_duration_since(play_started_at)
-            .as_millis() as u64;
-        if spread_ms > self.config.sync.play_command_spread_warn_ms {
-            warn!(
-                spread_ms,
-                warn_ms = self.config.sync.play_command_spread_warn_ms,
-                "coordinated Sonos Play commands completed slowly"
-            );
-        }
-    }
-
-    fn start_sonos_prepare_task(&self, start: SonosStreamPrepare) -> JoinHandle<()> {
-        let subscriber_wait = Duration::from_millis(self.config.stream.startup_wait_ms());
-        let prebuffer_ms = self.config.stream.prebuffer_ms;
-        let SonosStreamPrepare {
-            session_id,
-            zone_id,
-            generation,
-            zone,
-            client,
-            live_stream,
-            local_url,
-            force_standalone_on_start,
-            prepared_tx,
-            result_tx,
-        } = start;
-        tokio::spawn(async move {
-            if force_standalone_on_start {
-                info!(%session_id, %zone_id, "setting Sonos zone standalone");
-                let started_at = Instant::now();
-                if let Err(error) = client.become_coordinator_of_standalone_group().await {
-                    warn!(%session_id, %zone_id, "Sonos standalone request failed: {error:#}");
-                    let _ = result_tx.send(DownstreamStartResult {
-                        session_id,
-                        zone_id: zone_id.clone(),
-                        generation,
-                        outcome: DownstreamStartOutcome::Failed,
-                        timing: None,
-                    });
-                    return;
-                }
-                debug!(
-                    %session_id,
-                    %zone_id,
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    "Sonos standalone request completed"
-                );
-            } else {
-                debug!(
-                    %session_id,
-                    %zone_id,
-                    "Sonos zone already appears standalone; skipping standalone request"
-                );
-            }
-
-            info!(%session_id, %zone_id, %local_url, "setting Sonos stream URI");
-            let prepare_started_at = Instant::now();
-            let uri_started_at = Instant::now();
-            if let Err(error) = client
-                .set_av_transport_uri(local_url.as_str(), &format!("{} AirSonos2", zone.room_name))
-                .await
-            {
-                warn!(%session_id, %zone_id, "Sonos stream URI request failed: {error:#}");
-                let _ = result_tx.send(DownstreamStartResult {
-                    session_id,
-                    zone_id: zone_id.clone(),
-                    generation,
-                    outcome: DownstreamStartOutcome::Failed,
-                    timing: None,
-                });
-                return;
-            }
-            debug!(
-                %session_id,
-                %zone_id,
-                elapsed_ms = uri_started_at.elapsed().as_millis(),
-                "Sonos stream URI request completed"
-            );
-
-            let subscriber_ready = live_stream.wait_for_subscriber(subscriber_wait).await;
-            if live_stream.session.codec == StreamCodec::Wav {
-                let prebuffer = Duration::from_millis(prebuffer_ms);
-                let ready = live_stream.wait_until_ready(prebuffer).await;
-                if !ready {
-                    warn!(
-                        %session_id,
-                        %zone_id,
-                        prebuffer_ms = prebuffer.as_millis(),
-                        "WAV stream not ready before prebuffer timeout; starting playback anyway"
-                    );
-                }
-            }
-            let timing = live_stream.timing();
-            if subscriber_ready {
-                let connect_lag_ms = timing.subscriber_connected_at.and_then(|connected| {
-                    timing
-                        .first_encoded_at
-                        .map(|first| connected.saturating_duration_since(first).as_millis())
-                });
-                info!(
-                    %session_id,
-                    %zone_id,
-                    encoded_bytes = timing.encoded_bytes,
-                    bytes_dropped = timing.bytes_dropped,
-                    chunks_dropped = timing.chunks_dropped,
-                    connect_lag_ms,
-                    "Sonos HTTP subscriber connected; starting playback at live edge"
-                );
-            } else {
-                warn!(
-                    %session_id,
-                    %zone_id,
-                    subscriber_wait_ms = subscriber_wait.as_millis(),
-                    encoded_bytes = timing.encoded_bytes,
-                    bytes_dropped = timing.bytes_dropped,
-                    "Sonos HTTP subscriber not connected before timeout; starting playback anyway"
-                );
-            }
-
-            let stream_timing = live_stream.timing();
-            let timing = ZoneStartupTiming {
-                set_uri_ms: Some(uri_started_at.elapsed().as_millis() as u64),
-                subscriber_connect_ms: stream_timing
-                    .subscriber_connected_at
-                    .map(|at| at.saturating_duration_since(prepare_started_at).as_millis() as u64),
-                first_bytes_ms: stream_timing
-                    .first_served_at
-                    .map(|at| at.saturating_duration_since(prepare_started_at).as_millis() as u64),
-                play_ms: None,
-            };
-            if prepared_tx
-                .send(PreparedDownstream {
-                    session_id,
-                    zone_id: zone_id.clone(),
-                    generation,
-                    zone_room_name: zone.room_name,
-                    client,
-                    live_stream,
-                    timing,
-                })
-                .is_err()
-            {
-                let _ = result_tx.send(DownstreamStartResult {
-                    session_id,
-                    zone_id: zone_id.clone(),
-                    generation,
-                    outcome: DownstreamStartOutcome::Failed,
-                    timing: None,
-                });
-            }
-        })
     }
 
     async fn start_session(
@@ -1309,52 +1229,31 @@ impl BridgeRuntime {
         zone_id: ZoneId,
         format: PcmFormat,
     ) -> anyhow::Result<()> {
-        let old_sessions: Vec<SessionId> = self
+        let old_sessions: Vec<_> = self
             .sessions
             .iter()
-            .filter_map(|(sid, zid)| (zid == &zone_id && *sid != session_id).then_some(*sid))
+            .filter_map(|(id, session)| (session.zone_id == zone_id).then_some(*id))
             .collect();
         for old_id in old_sessions {
-            info!(%old_id, %zone_id, "replacing prior bridge session for zone");
-            self.stop_session(old_id, Some(zone_id.clone())).await?;
+            self.stop_session(old_id, None).await?;
         }
-        self.cancel_paused_cleanup(session_id);
+        anyhow::ensure!(
+            self.sonos.contains_key(&zone_id),
+            "no Sonos client for zone {zone_id}"
+        );
+        self.sessions
+            .insert(session_id, SessionRuntime::new(zone_id.clone(), format));
+        self.restart_downstream_for_play(session_id, zone_id).await
+    }
 
-        let (zone, client) = self
-            .sonos
-            .get(&zone_id)
-            .ok_or_else(|| anyhow::anyhow!("no Sonos client for zone {zone_id}"))?
-            .clone();
-        self.clear_session_runtime_state(session_id);
-        let generation = self.next_downstream_generation(session_id);
-        let (live_stream, encoder, local_url) = self
-            .create_downstream_stream(session_id, zone_id.clone(), zone.ip, format, generation)
-            .await?;
-
-        self.encoders.insert(session_id, encoder);
-        self.sessions.insert(session_id, zone_id.clone());
-        self.session_formats.insert(session_id, format);
-        self.desired_playback.insert(session_id, true);
-        info!(%session_id, %zone_id, %local_url, "bridge session started");
-
-        let force_standalone_on_start =
-            self.config.sonos.force_standalone_on_start && !zone.is_group_coordinator;
-        self.add_session_to_sync_cohort(session_id);
-        let task = self.start_sonos_prepare_task(SonosStreamPrepare {
-            session_id,
-            zone_id: zone_id.clone(),
-            generation,
-            zone,
-            client,
-            live_stream,
-            local_url,
-            force_standalone_on_start,
-            prepared_tx: self.prepared_tx.clone(),
-            result_tx: self.downstream_result_tx.clone(),
-        });
-        self.playback_tasks.insert(session_id, task);
-
-        Ok(())
+    fn retire_encoder(&mut self, encoder: Option<FfmpegEncoder>) {
+        if let Some(encoder) = encoder {
+            self.tasks.spawn(async move {
+                if let Err(error) = encoder.shutdown().await {
+                    warn!("encoder shutdown failed: {error}");
+                }
+            });
+        }
     }
 
     async fn restart_downstream_for_play(
@@ -1362,56 +1261,63 @@ impl BridgeRuntime {
         session_id: SessionId,
         zone_id: ZoneId,
     ) -> anyhow::Result<()> {
-        self.downstream_reset_needed.insert(session_id);
         self.cancel_downstream_retry(session_id);
-        let Some(format) = self.session_formats.get(&session_id).copied() else {
-            warn!(%session_id, %zone_id, "cannot restart downstream stream without session format");
+        let Some(session) = self.sessions.get_mut(&session_id) else {
             return Ok(());
         };
-        let Some((zone, client)) = self.sonos.get(&zone_id).cloned() else {
-            warn!(%session_id, %zone_id, "cannot restart downstream stream without Sonos client");
-            return Ok(());
-        };
-
-        if let Some(task) = self.playback_tasks.remove(&session_id) {
-            task.abort();
-        }
+        let format = session.format;
+        session.reset_needed = true;
+        session.observed = ObservedPlayback::Unknown;
+        session.prepared = None;
+        let encoder = session.encoder.take();
+        debug!(%session_id, playback_epoch = session.playback_epoch, "replacing downstream generation");
         self.registry.remove(&session_id).await;
-        if let Some(encoder) = self.encoders.remove(&session_id)
-            && let Err(error) = encoder.shutdown().await
-        {
-            warn!(%session_id, "encoder shutdown failed during downstream reset: {error}");
-        }
-
+        self.retire_encoder(encoder);
         let generation = self.next_downstream_generation(session_id);
-        let (live_stream, encoder, local_url) = self
+        let Some((zone, client)) = self.sonos.get(&zone_id).cloned() else {
+            return Ok(());
+        };
+        // Invalidate queued/in-flight preparation before attempting encoder construction.
+        if let Some(worker) = self.worker(&zone_id) {
+            worker.command(TransportCommand::Stop {
+                session_id,
+                zone_id: zone_id.clone(),
+                generation,
+            });
+        }
+        let (live_stream, encoder, local_url) = match self
             .create_downstream_stream(session_id, zone_id.clone(), zone.ip, format, generation)
-            .await?;
-        self.encoders.insert(session_id, encoder);
-
-        info!(
-            %session_id,
-            %zone_id,
-            generation,
-            %local_url,
-            "recreated downstream stream for AirPlay playback"
-        );
-
+            .await
+        {
+            Ok(created) => created,
+            Err(error) => {
+                warn!(%session_id, "encoder construction failed: {error:#}");
+                self.schedule_downstream_retry(session_id, zone_id, generation);
+                return Ok(());
+            }
+        };
+        self.sessions
+            .get_mut(&session_id)
+            .expect("session exists")
+            .encoder = Some(encoder);
         self.add_session_to_sync_cohort(session_id);
-        let task = self.start_sonos_prepare_task(SonosStreamPrepare {
+        let start = SonosStreamPrepare {
             session_id,
             zone_id: zone_id.clone(),
             generation,
+            force_standalone_on_start: self.config.sonos.force_standalone_on_start
+                && !zone.is_group_coordinator,
             zone,
             client,
             live_stream,
             local_url,
-            force_standalone_on_start: false,
             prepared_tx: self.prepared_tx.clone(),
             result_tx: self.downstream_result_tx.clone(),
-        });
-        self.playback_tasks.insert(session_id, task);
-
+        };
+        if let Some(worker) = self.worker(&zone_id) {
+            worker.command(TransportCommand::Prepare(start));
+        }
+        self.maybe_start_sync_cohort(false).await;
         Ok(())
     }
 
@@ -1421,39 +1327,34 @@ impl BridgeRuntime {
         zone_id: ZoneId,
         playing: bool,
     ) -> anyhow::Result<()> {
-        if !self.sessions.contains_key(&session_id) {
-            return Ok(());
-        }
-
-        self.desired_playback.insert(session_id, playing);
-        let previous = self.playback_state.insert(session_id, playing);
-        if playing {
-            self.cancel_paused_cleanup(session_id);
-            if should_restart_downstream_for_play(
-                previous,
-                self.downstream_reset_needed.contains(&session_id),
-            ) {
-                return self.restart_downstream_for_play(session_id, zone_id).await;
-            }
-            return Ok(());
-        }
-
-        self.downstream_reset_needed.insert(session_id);
-        self.cancel_downstream_retry(session_id);
-        if let Some(task) = self.playback_tasks.remove(&session_id) {
-            task.abort();
-        }
-        let Some((_, client)) = self.sonos.get(&zone_id).cloned() else {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
             return Ok(());
         };
-        let task = tokio::spawn(async move {
-            info!(%session_id, %zone_id, "stopping Sonos playback for AirPlay pause");
-            if let Err(error) = client.stop().await {
-                warn!(%session_id, %zone_id, "Sonos stop request failed for AirPlay pause: {error:#}");
+        let previous = session.desired_playback;
+        session.desired_playback = playing;
+        if playing {
+            let restart = should_restart_downstream_for_play(Some(previous), session.reset_needed);
+            session.retry_attempts = 0;
+            self.cancel_paused_cleanup(session_id);
+            if restart {
+                self.restart_downstream_for_play(session_id, zone_id)
+                    .await?;
             }
-        });
-        self.playback_tasks.insert(session_id, task);
-
+        } else {
+            session.reset_needed = true;
+            session.observed = ObservedPlayback::Unknown;
+            session.prepared = None;
+            self.cancel_downstream_retry(session_id);
+            let generation = self.next_downstream_generation(session_id);
+            if let Some(worker) = self.worker(&zone_id) {
+                worker.command(TransportCommand::Stop {
+                    session_id,
+                    zone_id,
+                    generation,
+                });
+            }
+            self.maybe_start_sync_cohort(false).await;
+        }
         Ok(())
     }
 
@@ -1462,47 +1363,40 @@ impl BridgeRuntime {
         session_id: SessionId,
         fallback_zone_id: Option<ZoneId>,
     ) -> anyhow::Result<()> {
-        let zone_id = self.sessions.remove(&session_id).or(fallback_zone_id);
-        self.clear_session_runtime_state(session_id);
+        let Some(mut session) = self.sessions.remove(&session_id) else {
+            return Ok(());
+        };
+        let zone_id = fallback_zone_id.unwrap_or_else(|| session.zone_id.clone());
         self.registry.remove(&session_id).await;
-        if let Some(encoder) = self.encoders.remove(&session_id)
-            && let Err(error) = encoder.shutdown().await
-        {
-            warn!(%session_id, "encoder shutdown failed: {error}");
+        self.retire_encoder(session.encoder.take());
+        let command = if self.config.sonos.stop_on_disconnect {
+            TransportCommand::Stop {
+                session_id,
+                zone_id: zone_id.clone(),
+                generation: session.generation,
+            }
+        } else {
+            TransportCommand::Idle
+        };
+        if let Some(worker) = self.worker(&zone_id) {
+            worker.command(command);
         }
-
-        if self.config.sonos.stop_on_disconnect
-            && let Some(zone_id) = zone_id
-            && let Some((_, client)) = self.sonos.get(&zone_id)
-        {
-            client.stop().await?;
-        }
-
+        self.maybe_start_sync_cohort(false).await;
         info!(%session_id, "bridge session stopped");
         Ok(())
     }
 
     async fn shutdown(&mut self) {
-        self.tasks.shutdown().await;
         let session_ids: Vec<_> = self.sessions.keys().copied().collect();
         for session_id in session_ids {
-            if let Err(error) = self.stop_session(session_id, None).await {
-                error!(%session_id, "failed to stop session during shutdown: {error}");
-            }
+            let _ = self.stop_session(session_id, None).await;
         }
-    }
-}
-
-impl Drop for BridgeRuntime {
-    fn drop(&mut self) {
-        for task in self
-            .playback_tasks
-            .values()
-            .chain(self.paused_cleanup_tasks.values())
-            .chain(self.downstream_retry_tasks.values())
-        {
-            task.abort();
+        let mut workers = tokio::task::JoinSet::new();
+        for (_, worker) in self.zone_workers.drain() {
+            workers.spawn(worker.shutdown());
         }
+        while workers.join_next().await.is_some() {}
+        self.tasks.shutdown().await;
     }
 }
 
@@ -1610,7 +1504,7 @@ mod tests {
         })
     }
 
-    fn prepared_downstream(
+    pub(crate) fn prepared_downstream(
         session_id: SessionId,
         zone_id: ZoneId,
         codec: StreamCodec,
@@ -1630,6 +1524,218 @@ mod tests {
                 ..ZoneStartupTiming::default()
             },
         }
+    }
+
+    pub(crate) fn zone(id: ZoneId) -> SonosZone {
+        SonosZone {
+            rincon_id: id.to_string(),
+            id,
+            room_name: "Test".into(),
+            ip: "127.0.0.1".parse().unwrap(),
+            model: "fake".into(),
+            is_visible_room: true,
+            is_group_coordinator: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_room_transport_does_not_suspend_other_room_pcm() {
+        use crate::bridge::tests::FakeSonos;
+        let mut fake = FakeSonos::start().await;
+        let mut runtime = runtime();
+        let a = zone_id();
+        let b = ZoneId::new("ROOM_B");
+        runtime
+            .sonos
+            .insert(a.clone(), (zone(a.clone()), fake.client.clone()));
+        let session_a = SessionId::new();
+        let mut prepared = prepared_downstream(session_a, a.clone(), StreamCodec::Mp3);
+        prepared.client = fake.client.clone();
+        runtime.play_prepared_downstreams(vec![prepared]).await;
+        let (request, hold_play) = fake.request().await;
+        assert!(request.contains("#Play"));
+        let session_b = SessionId::new();
+        let live = live_stream_for(session_b, b.clone(), StreamCodec::Wav);
+        live.set_playback_anchor(Instant::now());
+        let (_, mut audio) = live.attach_subscriber();
+        let encoder = FfmpegEncoder::spawn(
+            FfmpegEncoderConfig {
+                ffmpeg_path: PathBuf::new(),
+                sample_rate: 44_100,
+                channels: 2,
+                mp3_bitrate_kbps: 192,
+                codec: StreamCodec::Wav,
+            },
+            live,
+        )
+        .unwrap();
+        let mut session = SessionRuntime::new(b.clone(), format());
+        session.encoder = Some(encoder);
+        runtime.sessions.insert(session_b, session);
+        for stop in [false, true] {
+            if stop {
+                hold_play.send(()).unwrap();
+                runtime.worker(&a).unwrap().command(TransportCommand::Stop {
+                    session_id: session_a,
+                    zone_id: a.clone(),
+                    generation: 1,
+                });
+                let (request, hold_stop) = fake.request().await;
+                assert!(request.contains("#Stop"));
+                feed_pcm(&mut runtime, session_b, b.clone()).await;
+                let bytes = tokio::time::timeout(Duration::from_secs(1), audio.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(bytes.len(), 16);
+                hold_stop.send(()).unwrap();
+                break;
+            }
+            feed_pcm(&mut runtime, session_b, b.clone()).await;
+            let header = tokio::time::timeout(Duration::from_secs(1), audio.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&header[..4], b"RIFF");
+            let pcm = tokio::time::timeout(Duration::from_secs(1), audio.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(pcm.len(), 16);
+        }
+        runtime.shutdown().await;
+    }
+
+    async fn feed_pcm(runtime: &mut BridgeRuntime, session_id: SessionId, zone_id: ZoneId) {
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            runtime.handle_event(AirPlayEvent::Pcm {
+                session_id,
+                zone_id,
+                frame: airsonos2_core::PcmFrame {
+                    sample_rate: 44_100,
+                    channels: 2,
+                    samples_f32_interleaved: vec![0.25; 8],
+                    presentation_time: None,
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_active_cohort_promotes_expired_pending_cohort() {
+        let mut fake = crate::bridge::tests::FakeSonos::start().await;
+        let mut runtime = runtime();
+        let a = SessionId::new();
+        let b = SessionId::new();
+        let room_b = ZoneId::new("ROOM_B");
+        runtime
+            .sonos
+            .insert(room_b.clone(), (zone(room_b.clone()), fake.client.clone()));
+        runtime
+            .sessions
+            .insert(a, SessionRuntime::new(zone_id(), format()));
+        let mut session = SessionRuntime::new(room_b.clone(), format());
+        session.generation = 1;
+        runtime.sessions.insert(b, session);
+        runtime.add_session_to_sync_cohort(a);
+        runtime.sync_cohort.as_mut().unwrap().window_deadline = Instant::now();
+        runtime.add_session_to_sync_cohort(b);
+        let mut prepared = prepared_downstream(b, room_b, StreamCodec::Mp3);
+        prepared.client = fake.client.clone();
+        let pending = runtime.pending_cohorts.front_mut().unwrap();
+        pending.start_deadline = Instant::now();
+        pending.prepared.insert(b, prepared);
+        runtime.stop_session(a, None).await.unwrap();
+        assert!(runtime.sync_cohort.is_none());
+        assert!(runtime.pending_cohorts.is_empty());
+        let (request, release) = fake.request().await;
+        assert!(request.contains("#Play"));
+        release.send(()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn encoder_construction_failure_retries_and_stale_retry_cannot_revive_stop() {
+        let mut runtime = runtime();
+        runtime.config.stream.ffmpeg_path = PathBuf::from("/nonexistent/ffmpeg");
+        runtime.config.server.bind = "127.0.0.1".parse().unwrap();
+        let id = zone_id();
+        runtime.sonos.insert(
+            id.clone(),
+            (
+                zone(id.clone()),
+                SonosClient::new("127.0.0.1".parse().unwrap()).unwrap(),
+            ),
+        );
+        let session_id = SessionId::new();
+        runtime
+            .start_session(session_id, id.clone(), format())
+            .await
+            .unwrap();
+        assert!(runtime.registry.is_empty().await);
+        assert_eq!(runtime.sessions[&session_id].retry_attempts, 1);
+        let generation = runtime.sessions[&session_id].generation;
+        runtime.config.stream.codec = "wav".into();
+        runtime
+            .handle_downstream_retry(DownstreamRetry {
+                session_id,
+                zone_id: id.clone(),
+                generation,
+            })
+            .await
+            .unwrap();
+        assert!(runtime.sessions[&session_id].encoder.is_some());
+        assert!(runtime.registry.get(&session_id).await.is_some());
+        runtime.stop_session(session_id, None).await.unwrap();
+        runtime
+            .handle_downstream_retry(DownstreamRetry {
+                session_id,
+                zone_id: id,
+                generation,
+            })
+            .await
+            .unwrap();
+        assert!(!runtime.sessions.contains_key(&session_id));
+        assert!(runtime.registry.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn unknown_play_retries_same_generation_without_recording_timing() {
+        let mut runtime = runtime();
+        runtime.config.sync.startup_min_samples = 1;
+        let id = zone_id();
+        let session_id = SessionId::new();
+        let prepared = prepared_downstream(session_id, id.clone(), StreamCodec::Mp3);
+        let mut session = SessionRuntime::new(id.clone(), format());
+        session.generation = 7;
+        session.prepared = Some(prepared);
+        runtime.sessions.insert(session_id, session);
+        runtime.handle_downstream_start_result(DownstreamStartResult {
+            session_id,
+            zone_id: id.clone(),
+            generation: 7,
+            outcome: DownstreamStartOutcome::Unknown,
+            timing: None,
+        });
+        assert_eq!(
+            runtime.sessions[&session_id].observed,
+            ObservedPlayback::Unknown
+        );
+        assert!(!runtime.sessions[&session_id].reset_needed);
+        assert!(runtime.startup_estimator.median_lag_ms(&id).is_none());
+        runtime
+            .handle_downstream_retry(DownstreamRetry {
+                session_id,
+                zone_id: id,
+                generation: 7,
+            })
+            .await
+            .unwrap();
+        assert_eq!(runtime.sessions[&session_id].generation, 7);
+        assert!(runtime.sessions[&session_id].prepared.is_some());
     }
 
     #[tokio::test]
@@ -1655,15 +1761,17 @@ mod tests {
         let mut runtime = runtime();
         let session_id = SessionId::new();
         let zone_id = zone_id();
-        runtime.sessions.insert(session_id, zone_id.clone());
+        runtime
+            .sessions
+            .insert(session_id, SessionRuntime::new(zone_id.clone(), format()));
 
         runtime
             .set_playback_state(session_id, zone_id, false)
             .await
             .expect("pause");
 
-        assert_eq!(runtime.desired_playback.get(&session_id), Some(&false));
-        assert!(runtime.downstream_reset_needed.contains(&session_id));
+        assert!(!runtime.sessions[&session_id].desired_playback);
+        assert!(runtime.sessions[&session_id].reset_needed);
     }
 
     #[test]
@@ -1765,10 +1873,22 @@ mod tests {
         let mut runtime = runtime();
         let session_id = SessionId::new();
         let zone_id = zone_id();
-        runtime.downstream_generations.insert(session_id, 3);
-        runtime.downstream_reset_needed.insert(session_id);
-        runtime.desired_playback.insert(session_id, true);
-        runtime.downstream_retry_attempts.insert(session_id, 2);
+        runtime
+            .sessions
+            .entry(session_id)
+            .or_insert_with(|| SessionRuntime::new(zone_id.clone(), format()))
+            .generation = 3;
+        runtime.sessions.get_mut(&session_id).unwrap().reset_needed = true;
+        runtime
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .desired_playback = true;
+        runtime
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .retry_attempts = 2;
 
         runtime.handle_downstream_start_result(DownstreamStartResult {
             session_id,
@@ -1778,8 +1898,8 @@ mod tests {
             timing: None,
         });
 
-        assert!(!runtime.downstream_reset_needed.contains(&session_id));
-        assert!(!runtime.downstream_retry_attempts.contains_key(&session_id));
+        assert!(!runtime.sessions[&session_id].reset_needed);
+        assert!(runtime.sessions[&session_id].retry_attempts == 0);
     }
 
     #[tokio::test]
@@ -1787,8 +1907,16 @@ mod tests {
         let mut runtime = runtime();
         let session_id = SessionId::new();
         let zone_id = zone_id();
-        runtime.downstream_generations.insert(session_id, 4);
-        runtime.desired_playback.insert(session_id, true);
+        runtime
+            .sessions
+            .entry(session_id)
+            .or_insert_with(|| SessionRuntime::new(zone_id.clone(), format()))
+            .generation = 4;
+        runtime
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .desired_playback = true;
 
         runtime.handle_downstream_start_result(DownstreamStartResult {
             session_id,
@@ -1798,8 +1926,8 @@ mod tests {
             timing: None,
         });
 
-        assert!(runtime.downstream_reset_needed.contains(&session_id));
-        assert!(runtime.downstream_retry_tasks.contains_key(&session_id));
+        assert!(runtime.sessions[&session_id].reset_needed);
+        assert!(runtime.sessions[&session_id].retry_task.is_some());
         runtime.cancel_downstream_retry(session_id);
     }
 
@@ -1808,9 +1936,17 @@ mod tests {
         let mut runtime = runtime();
         let session_id = SessionId::new();
         let zone_id = zone_id();
-        runtime.downstream_generations.insert(session_id, 5);
-        runtime.downstream_reset_needed.insert(session_id);
-        runtime.desired_playback.insert(session_id, true);
+        runtime
+            .sessions
+            .entry(session_id)
+            .or_insert_with(|| SessionRuntime::new(zone_id.clone(), format()))
+            .generation = 5;
+        runtime.sessions.get_mut(&session_id).unwrap().reset_needed = true;
+        runtime
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .desired_playback = true;
 
         runtime.handle_downstream_start_result(DownstreamStartResult {
             session_id,
@@ -1820,7 +1956,7 @@ mod tests {
             timing: None,
         });
 
-        assert!(runtime.downstream_reset_needed.contains(&session_id));
+        assert!(runtime.sessions[&session_id].reset_needed);
     }
 
     #[tokio::test]
@@ -1828,7 +1964,11 @@ mod tests {
         let mut runtime = runtime();
         let session_id = SessionId::new();
         let zone_id = zone_id();
-        runtime.downstream_generations.insert(session_id, 2);
+        runtime
+            .sessions
+            .entry(session_id)
+            .or_insert_with(|| SessionRuntime::new(zone_id.clone(), format()))
+            .generation = 2;
         runtime.add_session_to_sync_cohort(session_id);
 
         let mut prepared = prepared_downstream(session_id, zone_id, StreamCodec::Mp3);
@@ -1850,8 +1990,14 @@ mod tests {
         let mut runtime = runtime();
         let session_id = SessionId::new();
         let zone_id = zone_id();
-        runtime.sessions.insert(session_id, zone_id.clone());
-        runtime.desired_playback.insert(session_id, true);
+        runtime
+            .sessions
+            .insert(session_id, SessionRuntime::new(zone_id.clone(), format()));
+        runtime
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .desired_playback = true;
 
         runtime
             .handle_event(AirPlayEvent::StreamEndedWhilePaused {
@@ -1861,8 +2007,8 @@ mod tests {
             .await
             .expect("stream ended");
 
-        assert!(!runtime.downstream_reset_needed.contains(&session_id));
-        assert!(!runtime.paused_cleanup_tasks.contains_key(&session_id));
+        assert!(!runtime.sessions[&session_id].reset_needed);
+        assert!(runtime.sessions[&session_id].cleanup_task.is_none());
     }
 
     #[tokio::test]
@@ -1870,18 +2016,11 @@ mod tests {
         let mut runtime = runtime();
         let session_id = SessionId::new();
         let zone_id = zone_id();
-        runtime.sessions.insert(session_id, zone_id);
-        runtime.session_formats.insert(session_id, format());
-        runtime.desired_playback.insert(session_id, true);
-        runtime.downstream_generations.insert(session_id, 8);
-        runtime.downstream_reset_needed.insert(session_id);
+        runtime
+            .sessions
+            .insert(session_id, SessionRuntime::new(zone_id.clone(), format()));
+        runtime.sessions.get_mut(&session_id).unwrap().generation = 8;
         runtime.schedule_paused_cleanup(session_id);
-        runtime.playback_tasks.insert(
-            session_id,
-            tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }),
-        );
 
         runtime
             .stop_session(session_id, None)
@@ -1889,12 +2028,6 @@ mod tests {
             .expect("stop session");
 
         assert!(!runtime.sessions.contains_key(&session_id));
-        assert!(!runtime.session_formats.contains_key(&session_id));
-        assert!(!runtime.desired_playback.contains_key(&session_id));
-        assert!(!runtime.downstream_generations.contains_key(&session_id));
-        assert!(!runtime.downstream_reset_needed.contains(&session_id));
-        assert!(!runtime.paused_cleanup_tasks.contains_key(&session_id));
-        assert!(!runtime.playback_tasks.contains_key(&session_id));
     }
 
     #[test]
