@@ -1097,10 +1097,10 @@ impl BridgeRuntime {
         self.apply_sync_anchors(&prepared);
 
         let play_started_at = Instant::now();
-        let mut tasks = Vec::with_capacity(prepared.len());
+        let mut tasks = tokio::task::JoinSet::new();
         for stream in prepared {
             let result_tx = self.downstream_result_tx.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 info!(session_id = %stream.session_id, zone_id = %stream.zone_id, "starting Sonos playback");
                 let play_start = Instant::now();
                 let mut startup_timing = stream.timing.clone();
@@ -1139,12 +1139,12 @@ impl BridgeRuntime {
                     outcome,
                     timing: Some(startup_timing),
                 });
-            }));
+            });
         }
 
         let mut last_completion = play_started_at;
-        for task in tasks {
-            if let Err(error) = task.await {
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
                 warn!("Sonos play task failed to join: {error}");
             }
             last_completion = Instant::now();
