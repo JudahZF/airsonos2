@@ -16,6 +16,8 @@ backup: cold
 watchdog: http://[HOST]:7000/healthz
 options:
   log_level: info
+  http_bind: "0.0.0.0"
+  diagnostics_addr: "0.0.0.0:9100"
   run_doctor_on_start: false
   name_template: "{room} AirSonos2"
   advertised_model: AudioAccessory5,1
@@ -38,7 +40,7 @@ options:
   default_offset_ms: 0
   multi_select_window_ms: 750
   start_deadline_ms: 2500
-  startup_compensation: true
+  startup_compensation: false
   startup_sample_limit: 20
   startup_min_samples: 3
   startup_max_compensation_ms: 1000
@@ -46,14 +48,16 @@ options:
   zone_offsets: []
 schema:
   log_level: list(trace|debug|info|warn|error)
+  http_bind: str
+  diagnostics_addr: str
   run_doctor_on_start: bool
   name_template: str(1,)
   advertised_model: str(1,)
   pin: str(0,)
   rtsp_password: password?
   base_rtsp_port: port
-  output_sample_rate: int(8000,)
-  output_channels: int(1,8)
+  output_sample_rate: int(8000,192000)
+  output_channels: int(1,2)
   max_clients_per_zone: int(1,)
   auto_discover: bool
   static_ips:

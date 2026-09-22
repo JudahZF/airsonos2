@@ -52,3 +52,9 @@ The bridge serves:
 /test-tone.mp3
 /streams/<session>
 ```
+
+## Listener addresses and diagnostics
+
+`http_bind` selects the local IP address used by stream HTTP and the AirPlay listeners (default `0.0.0.0`). It must be reachable from the speakers and Home Assistant Supervisor. The HTTP port stays at 7000 so the Supervisor watchdog and stream health endpoint agree. `diagnostics_addr` accepts an IP address and port, such as `127.0.0.1:9201`, for detailed `/metrics` and `/healthz`. IPv6 addresses use brackets: `[::1]:9201`. These options are checked by the same Rust validation as file configuration.
+
+The renderer rejects unsupported codecs and output formats. Output supports one or two channels at 8000–192000 Hz; a short doctor MP3 encode checks the installed encoder against the configured rate and bitrate. Doctor also checks the configured listener addresses and actual filtered room ports. Hardware visibility and playback remain separate acceptance checks.

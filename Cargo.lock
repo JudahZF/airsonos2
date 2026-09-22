@@ -84,10 +84,14 @@ version = "0.1.0"
 dependencies = [
  "airsonos2-core",
  "airsonos2-sonos",
+ "airsonos2-stream",
+ "axum",
  "reqwest",
  "serde",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

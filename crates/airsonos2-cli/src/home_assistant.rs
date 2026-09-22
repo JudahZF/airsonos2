@@ -16,6 +16,8 @@ const HA_METRICS_ADDR: &str = "0.0.0.0:9100";
 #[serde(default)]
 pub(crate) struct HomeAssistantOptions {
     pub(crate) log_level: String,
+    pub(crate) http_bind: IpAddr,
+    pub(crate) diagnostics_addr: String,
     pub(crate) run_doctor_on_start: bool,
     pub(crate) name_template: String,
     pub(crate) advertised_model: String,
@@ -57,6 +59,8 @@ impl Default for HomeAssistantOptions {
         let config = Config::default();
         Self {
             log_level: config.server.log_level,
+            http_bind: HA_BIND.parse().expect("HA bind"),
+            diagnostics_addr: HA_METRICS_ADDR.to_owned(),
             run_doctor_on_start: false,
             name_template: config.airplay.name_template,
             advertised_model: config.airplay.advertised_model,
@@ -107,7 +111,7 @@ impl HomeAssistantOptions {
     pub(crate) fn to_config(&self) -> anyhow::Result<Config> {
         let mut config = Config::default();
 
-        config.server.bind = HA_BIND.parse()?;
+        config.server.bind = self.http_bind;
         config.server.http_port = HA_HTTP_PORT;
         config.server.state_dir = PathBuf::from(HA_STATE_DIR);
         config.server.log_level = self.log_level.clone();
@@ -134,7 +138,7 @@ impl HomeAssistantOptions {
         config.stream.startup_wait_ms = self.startup_wait_ms;
         config.stream.ffmpeg_path = PathBuf::from(HA_FFMPEG_PATH);
 
-        config.diagnostics.metrics_addr = HA_METRICS_ADDR.to_owned();
+        config.diagnostics.metrics_addr = self.diagnostics_addr.clone();
 
         config.sync.default_offset_ms = self.default_offset_ms;
         config.sync.multi_select_window_ms = self.multi_select_window_ms;
@@ -146,6 +150,7 @@ impl HomeAssistantOptions {
         config.sync.play_command_spread_warn_ms = self.play_command_spread_warn_ms;
         config.sync.zone_offsets_ms = zone_offsets_map(&self.zone_offsets)?;
 
+        config.validate()?;
         Ok(config)
     }
 }
@@ -240,6 +245,28 @@ mod tests {
         assert_eq!(config.stream.ffmpeg_path, PathBuf::from(HA_FFMPEG_PATH));
         assert_eq!(config.diagnostics.metrics_addr, HA_METRICS_ADDR);
         assert_eq!(config.sync, defaults.sync);
+    }
+
+    #[test]
+    fn custom_listener_addresses_round_trip_and_use_shared_validation() {
+        let options = HomeAssistantOptions {
+            http_bind: "192.0.2.10".parse().expect("IP"),
+            diagnostics_addr: "127.0.0.1:9201".to_owned(),
+            ..HomeAssistantOptions::default()
+        };
+        let config =
+            Config::from_toml_str(&render_config_toml(&options).expect("render")).expect("config");
+        assert_eq!(config.server.bind, options.http_bind);
+        assert_eq!(config.server.http_port, 7000); // Supervisor watchdog port.
+        assert_eq!(config.diagnostics.metrics_addr, options.diagnostics_addr);
+        assert!(
+            HomeAssistantOptions {
+                output_channels: 8,
+                ..options
+            }
+            .to_config()
+            .is_err()
+        );
     }
 
     #[test]
