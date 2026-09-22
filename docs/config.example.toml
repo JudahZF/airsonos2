@@ -9,7 +9,7 @@ name_template = "{room} AirSonos2"
 # AirPlay hardware model advertised to Apple clients. HomePod mini is AudioAccessory5,1.
 advertised_model = "AudioAccessory5,1"
 pin = "3939"
-# Optional legacy RTSP digest password. Leave unset for normal AirPlay 2 pairing.
+# Legacy AP1 is disabled unless this digest password is configured. AP2 uses pairing.
 # rtsp_password = "secret"
 base_rtsp_port = 5000
 output_sample_rate = 48000
@@ -32,7 +32,7 @@ codec = "mp3"
 mp3_bitrate_kbps = 320
 prebuffer_ms = 500
 # Optional Sonos startup wait override. Leave unset to use min(prebuffer_ms, 250).
-# Lower values reduce start delay; WAV streams still skip early PCM so playback starts near live time.
+# WAV publishes its header early and holds PCM until the cohort releases it.
 # startup_wait_ms = 250
 http_chunked = true
 icy_metadata = true
@@ -42,15 +42,18 @@ ffmpeg_path = "ffmpeg"
 metrics_addr = "0.0.0.0:9100"
 
 [sync]
+# Fallback measured latency for rooms without explicit entries, not an added delay.
 default_offset_ms = 0
 multi_select_window_ms = 750
 start_deadline_ms = 2500
-startup_compensation = true
+# Network timing is not acoustic latency; automatic compensation is disabled.
+startup_compensation = false
 startup_sample_limit = 20
 startup_min_samples = 3
 startup_max_compensation_ms = 1000
 play_command_spread_warn_ms = 80
 
 [sync.zone_offsets_ms]
+# Positive means measured late. WAV delays faster rooms; MP3 offsets are unsupported.
 # "Kitchen" = 120
 # "Office" = 80

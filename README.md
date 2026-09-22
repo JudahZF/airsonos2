@@ -104,14 +104,11 @@ RUST_LOG=airsonos2=debug,airsonos2_airplay=debug,shairplay=debug \
   nix develop -c cargo run -p airsonos2-cli -- serve --config config.toml
 ```
 
-Expected behavior after a fix:
+Pause stops the affected room. Resume prepares a new downstream generation. FLUSH keeps the AirPlay session but closes its old HTTP body and replaces the Sonos stream so queued old audio is discarded. A slow room's network requests run independently from other rooms' PCM.
 
-- `AP2 play pause` in shairplay logs is followed by `pausing Sonos playback` in airsonos2 logs.
-- `AP2 play start` is followed by `resuming Sonos playback`.
-- `AirPlay audio buffer flushed` should not be followed by `bridge session stopped`.
-- `live MP3 stream ready; starting Sonos playback` should appear before the first Sonos `Play` for a new session.
+WAV headers are available during preparation, but PCM waits for the cohort's release. The MP3 path remains the compatibility default. Network and HTTP timings do not measure acoustic latency, and automatic sync compensation is disabled.
 
-Tune `[stream].prebuffer_ms` if startup still feels slow. Lower values start Sonos sooner once MP3 data is available; higher values wait longer for the encoder buffer (default `500` ms).
+See [playback timing and offset migration](docs/playback-timing.md) before reusing existing room offsets. Positive offsets describe rooms measured late; `default_offset_ms` is only a fallback. WAV uses the normalized release delays; MP3 does not support this sample alignment mechanism. Missing source timing produces a visible best-effort fallback.
 
 ## License Notice
 
