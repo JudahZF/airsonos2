@@ -2,8 +2,8 @@
 
 This record separates automated validation from physical playback acceptance.
 The implementation baseline is documented in [reliability-baseline.md](reliability-baseline.md).
-The recorded source checks passed. Native arm64 CI and physical acceptance remain
-separate gates; their status is recorded below.
+The recorded automated source and packaging checks passed. Physical acceptance
+remains unverified; its limits are recorded below.
 
 ## Reproduce from tracked source
 
@@ -50,8 +50,8 @@ software invariants; they do not measure acoustic delivery.
 | Real daemon repeated SIGTERM and listener failures | Nine scenarios passed across three complete cycles |
 | Generic container, Linux amd64 | Build and binary version smoke test passed |
 | Home Assistant container, Linux amd64 | Build and binary version smoke test passed |
-| Generic container, Linux arm64 | Pending native CI |
-| Home Assistant container, Linux arm64 | Pending native CI |
+| Generic container, Linux arm64 | Native CI build and binary version smoke test passed |
+| Home Assistant container, Linux arm64 | Native CI build and binary version smoke test passed |
 | Release tag / Cargo / Home Assistant version consistency | Gate regression passed; no release tag created or published |
 
 Validation ran on x86_64 Linux on 2026-09-22 from a fresh local clone, using an
@@ -64,6 +64,19 @@ Both container smoke tests reported `airsonos2 0.1.0`.
 | --- | --- |
 | `airsonos2-reliability:generic` | `sha256:b66f9637a3dc8a7a2c05b5e4591b739163877494279aa8f4555a3a399fff825a` |
 | `airsonos2-reliability:home-assistant` | `sha256:cf522066074ac27cf937246b8674395933e83c8e10053637d269f729c4b01867` |
+
+Native arm64 validation ran on GitHub's `ubuntu-24.04-arm` runner in
+[CI run 35746777265](https://github.com/JudahZF/airsonos2/actions/runs/35746777265/job/106810338099)
+for the same source revision. Both smoke tests reported `airsonos2 0.1.0`.
+
+| Native CI image | Image ID (`linux/arm64`) |
+| --- | --- |
+| Generic | `sha256:702d6d1cfd164fbb1f9b1942ba779e22d1dfc3d63faafc0433a6904e670a71e5` |
+| Home Assistant | `sha256:17a09be7d82da244ad2c82ee4c425950618665a43dc48c476d6a85a7639afb7f` |
+
+After the full gate, the process fixture was adjusted to suppress expected peer-close
+errors from cancelled discovery probes. All nine process scenarios passed again.
+The remaining acceptance-record updates do not change production source.
 
 Container builds and smoke tests must identify architecture and image digest.
 A host-only build does not validate another architecture. Publication must use
