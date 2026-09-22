@@ -14,8 +14,8 @@ cargo test --workspace --all-features --locked
 for features in '' ap2,resample video,hls; do
   cargo test --manifest-path vendor/shairplay/Cargo.toml --features "$features" --locked
 done
-cargo deny check advisories bans licenses sources
-cargo deny --manifest-path vendor/shairplay/Cargo.toml check advisories bans licenses sources
+cargo deny --locked check advisories bans licenses sources
+cargo deny --manifest-path vendor/shairplay/Cargo.toml --locked check advisories bans licenses sources
 cargo build --bin airsonos2 --locked
 build_target_dir="$(cargo metadata --format-version 1 --no-deps --locked | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 python3 scripts/test-process-lifecycle.py --binary "$build_target_dir/debug/airsonos2"
