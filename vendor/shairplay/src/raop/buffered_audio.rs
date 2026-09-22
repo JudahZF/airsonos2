@@ -64,6 +64,7 @@ struct BufferedFrame {
 struct PlayoutState {
     buffer: BTreeMap<u32, BufferedFrame>, // source RTP timestamp → decoded packet
     epoch: u64,
+    in_flight_samples: usize,
     flush_range: Option<(u16, u16)>,
     anchor_rtp: u32,
     anchor_local: std::time::Instant,
@@ -139,6 +140,7 @@ impl BufferedAudioProcessor {
             Mutex::new(PlayoutState {
                 buffer: BTreeMap::new(),
                 epoch: 0,
+                in_flight_samples: 0,
                 flush_range: None,
                 anchor_rtp: 0,
                 anchor_local: std::time::Instant::now(),
@@ -280,7 +282,8 @@ async fn receive_loop(
                 if s.stopped {
                     return;
                 }
-                let queued: usize = s.buffer.values().map(|frame| frame.samples.len()).sum();
+                let queued: usize =
+                    s.buffer.values().map(|frame| frame.samples.len()).sum::<usize>() + s.in_flight_samples;
                 queued >= pcm_budget(s.sample_rate, s.channels) / 2
             };
             if !full {
@@ -436,7 +439,8 @@ async fn receive_loop(
                     if samples.len() > budget {
                         return;
                     }
-                    let queued: usize = s.buffer.values().map(|frame| frame.samples.len()).sum();
+                    let queued: usize =
+                        s.buffer.values().map(|frame| frame.samples.len()).sum::<usize>() + s.in_flight_samples;
                     if queued + samples.len() <= budget {
                         s.buffer.insert(
                             timestamp,
@@ -524,8 +528,7 @@ fn delivery_loop(
         let elapsed_frames = source_frames(s.anchor_local.elapsed(), s.source_sample_rate);
         let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
 
-        let ready = take_ready(&mut s.buffer, target_rtp);
-        if ready.is_empty() {
+        let Some((timestamp, frame)) = take_ready_frame(&mut s.buffer, target_rtp) else {
             let next_frames = s
                 .buffer
                 .keys()
@@ -538,30 +541,33 @@ fn delivery_loop(
             );
             let _ = cvar.wait_timeout(s, wait).unwrap();
             continue;
-        }
+        };
+        s.in_flight_samples = frame.samples.len();
         drop(s);
 
-        if let Some(ref mut sess) = session {
-            for (_, frame) in &ready {
-                // There is no validated PTP-to-Instant mapping in this receiver yet.
-                sess.audio_process_timed(&frame.samples, None);
-            }
+        // The adapter owns no samples on false. Call outside the queue mutex so
+        // RTSP FLUSH/Stop and receiver backpressure remain responsive.
+        let accepted = session
+            .as_mut()
+            .is_some_and(|session| session.audio_process_buffered(&frame.samples, None));
+        let mut s = lock.lock().unwrap();
+        s.in_flight_samples = 0;
+        if !accepted && !s.stopped && s.epoch == delivered_epoch {
+            s.buffer.entry(timestamp).or_insert(frame);
+            let _ = cvar.wait_timeout(s, std::time::Duration::from_millis(10)).unwrap();
         }
     }
     info!("Delivery loop ended");
 }
 
-/// Extract due packets in source-clock order without copying their PCM allocation.
-fn take_ready(buffer: &mut BTreeMap<u32, BufferedFrame>, target: u32) -> Vec<(u32, BufferedFrame)> {
-    let mut keys: Vec<u32> = buffer
+/// Move the earliest due packet without copying PCM or allocating a ready list.
+fn take_ready_frame(buffer: &mut BTreeMap<u32, BufferedFrame>, target: u32) -> Option<(u32, BufferedFrame)> {
+    let timestamp = buffer
         .keys()
         .copied()
         .filter(|ts| target.wrapping_sub(*ts) as i32 >= 0)
-        .collect();
-    keys.sort_unstable_by_key(|ts| ts.wrapping_sub(target) as i32);
-    keys.into_iter()
-        .filter_map(|ts| buffer.remove(&ts).map(|frame| (ts, frame)))
-        .collect()
+        .min_by_key(|ts| ts.wrapping_sub(target) as i32)?;
+    buffer.remove(&timestamp).map(|frame| (timestamp, frame))
 }
 
 fn source_frames(elapsed: std::time::Duration, sample_rate: u32) -> u32 {
@@ -634,10 +640,11 @@ mod ownership_tests {
 #[cfg(test)]
 mod flush_tests {
     use super::*;
-    fn state() -> PlayoutState {
+    pub(super) fn state() -> PlayoutState {
         PlayoutState {
             buffer: BTreeMap::new(),
             epoch: 0,
+            in_flight_samples: 0,
             flush_range: None,
             anchor_rtp: 0,
             anchor_local: std::time::Instant::now(),
@@ -755,12 +762,127 @@ mod allocation_tests {
                 samples: vec![1.0; 1024],
             },
         );
-        let ready = take_ready(&mut buffer, 10);
-        assert_eq!(
-            ready.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
-            vec![u32::MAX - 10, 5]
-        );
-        assert_eq!(ready[0].1.samples.as_ptr(), pointer);
+        let first = take_ready_frame(&mut buffer, 10).unwrap();
+        let second = take_ready_frame(&mut buffer, 10).unwrap();
+        assert_eq!([first.0, second.0], [u32::MAX - 10, 5]);
+        assert_eq!(first.1.samples.as_ptr(), pointer);
+        assert!(take_ready_frame(&mut buffer, 10).is_none());
         assert_eq!(buffer.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod downstream_backpressure_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    enum Event {
+        Rejected,
+        Flushed,
+        Accepted(f32),
+    }
+    struct Handler {
+        ready: Arc<AtomicBool>,
+        events: std::sync::mpsc::Sender<Event>,
+    }
+    struct Session {
+        ready: Arc<AtomicBool>,
+        events: std::sync::mpsc::Sender<Event>,
+    }
+    impl AudioHandler for Handler {
+        fn audio_init(&self, _: AudioFormat) -> Box<dyn crate::raop::AudioSession> {
+            Box::new(Session {
+                ready: self.ready.clone(),
+                events: self.events.clone(),
+            })
+        }
+    }
+    impl crate::raop::AudioSession for Session {
+        fn audio_process(&mut self, _: &[f32]) {
+            panic!("buffered delivery must use admission callback");
+        }
+        fn audio_process_buffered(&mut self, samples: &[f32], _: Option<std::time::Instant>) -> bool {
+            if !self.ready.load(Ordering::Acquire) {
+                self.events.send(Event::Rejected).unwrap();
+                return false;
+            }
+            self.events.send(Event::Accepted(samples[0])).unwrap();
+            true
+        }
+        fn audio_flush(&mut self) {
+            self.events.send(Event::Flushed).unwrap();
+        }
+    }
+    #[test]
+    fn stalled_downstream_keeps_frame_and_flush_cancels_retry() {
+        let mut state = super::flush_tests::state();
+        state.buffer.insert(
+            0,
+            BufferedFrame {
+                sequence: 1,
+                samples: vec![1.0; 16],
+            },
+        );
+        let state = Arc::new((Mutex::new(state), Condvar::new()));
+        let worker_state = state.clone();
+        let ready = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handler = Arc::new(Handler {
+            ready: ready.clone(),
+            events: tx,
+        });
+        let thread = std::thread::spawn(move || {
+            delivery_loop(
+                worker_state,
+                handler,
+                OutputConfig {
+                    sample_rate: None,
+                    max_channels: None,
+                },
+            )
+        });
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            Event::Rejected
+        ));
+        {
+            let mut s = state.0.lock().unwrap();
+            let queued: usize = s.buffer.values().map(|frame| frame.samples.len()).sum();
+            assert_eq!(
+                queued + s.in_flight_samples,
+                16,
+                "rejected PCM remains owned and counted"
+            );
+            s.flush(1, 1);
+            s.buffer.insert(
+                0,
+                BufferedFrame {
+                    sequence: 2,
+                    samples: vec![2.0; 16],
+                },
+            );
+            state.1.notify_all();
+        }
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
+                Event::Flushed => break,
+                Event::Rejected => {}
+                Event::Accepted(_) => panic!("stalled PCM must not be accepted"),
+            }
+        }
+        ready.store(true, Ordering::Release);
+        state.1.notify_all();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
+                Event::Accepted(sample) => {
+                    assert_eq!(sample, 2.0, "old epoch must never be retried after FLUSH");
+                    break;
+                }
+                Event::Rejected => {}
+                Event::Flushed => panic!("unexpected duplicate flush"),
+            }
+        }
+        state.0.lock().unwrap().stopped = true;
+        state.1.notify_all();
+        thread.join().unwrap();
     }
 }
