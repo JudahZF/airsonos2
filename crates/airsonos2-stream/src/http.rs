@@ -6,8 +6,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{HeaderValue, Response, StatusCode};
-use axum::response::IntoResponse;
+use axum::http::{Response, StatusCode};
 use axum::routing::get;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -36,7 +35,6 @@ pub fn build_stream_router(registry: StreamRegistry, ffmpeg_path: PathBuf) -> Ro
 
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/metrics", get(metrics))
         .route("/streams/{session_id}", get(stream_session))
         .route("/test-tone.mp3", get(test_tone))
         .with_state(state)
@@ -58,16 +56,6 @@ pub async fn serve_stream_http(
 
 async fn healthz() -> &'static str {
     "ok\n"
-}
-
-async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
-    (
-        [(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; version=0.0.4"),
-        )],
-        state.registry.metrics_text().await,
-    )
 }
 
 async fn stream_session(
