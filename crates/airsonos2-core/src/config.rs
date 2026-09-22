@@ -78,6 +78,17 @@ impl Config {
         if !(32..=320).contains(&self.stream.mp3_bitrate_kbps) {
             return Err(invalid("stream.mp3_bitrate_kbps must be in 32..=320"));
         }
+        if !(-10_000..=10_000).contains(&self.sync.default_offset_ms)
+            || self
+                .sync
+                .zone_offsets_ms
+                .values()
+                .any(|offset| !(-10_000..=10_000).contains(offset))
+        {
+            return Err(invalid(
+                "sync offsets must be in -10000..=10000 milliseconds",
+            ));
+        }
         if self.sync.startup_sample_limit == 0
             || self.sync.startup_min_samples == 0
             || self.sync.startup_min_samples > self.sync.startup_sample_limit
@@ -272,6 +283,25 @@ impl Default for SyncConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_offsets_that_can_overflow_runtime_deadlines() {
+        for value in [i64::MIN, -10_001, 10_001, i64::MAX] {
+            assert!(
+                Config::from_toml_str(&format!("[sync]\ndefault_offset_ms = {value}")).is_err()
+            );
+            assert!(
+                Config::from_toml_str(&format!("[sync.zone_offsets_ms]\nKitchen = {value}"))
+                    .is_err()
+            );
+        }
+        assert!(
+            Config::from_toml_str(
+                "[sync]\ndefault_offset_ms = -10000\n[sync.zone_offsets_ms]\nKitchen = 10000"
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn config_defaults_match_public_interface() {
