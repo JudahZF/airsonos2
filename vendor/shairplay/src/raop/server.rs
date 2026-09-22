@@ -373,3 +373,194 @@ impl RaopServer {
         )
     }
 }
+
+#[cfg(all(test, feature = "ap2"))]
+mod controller_acceptance {
+    use super::*;
+    use crate::crypto::tlv::{TlvType, TlvValues};
+    use crate::net::server::{ConnectionHandler, HttpdCallbacks};
+    use crate::proto::http::{HttpRequest, HttpResponse};
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[derive(Default)]
+    struct Handler(std::sync::Mutex<Vec<f32>>);
+    struct Session;
+    impl AudioSession for Session {
+        fn audio_process(&mut self, _: &[f32]) {}
+    }
+    impl AudioHandler for Handler {
+        fn audio_init(&self, _: AudioFormat) -> Box<dyn AudioSession> {
+            Box::new(Session)
+        }
+        fn on_volume(&self, volume: f32) {
+            self.0.lock().unwrap().push(volume);
+        }
+    }
+    fn request(
+        conn: &mut dyn ConnectionHandler,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> HttpResponse {
+        let mut request = HttpRequest::new();
+        request
+            .add_data(
+                format!(
+                    "{method} {path} RTSP/1.0\r\nCSeq: 1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        request.add_data(body).unwrap();
+        conn.conn_request(&request)
+    }
+    fn body(response: &HttpResponse) -> &[u8] {
+        let bytes = response.get_data();
+        &bytes[bytes.windows(4).position(|window| window == b"\r\n\r\n").unwrap() + 4..]
+    }
+    fn verify(conn: &mut dyn ConnectionHandler, identifier: &str, key: &SigningKey) {
+        let secret = x25519_dalek::StaticSecret::from([13; 32]);
+        let public = x25519_dalek::PublicKey::from(&secret);
+        let mut m1 = TlvValues::new();
+        m1.add(TlvType::State as u8, &[1]);
+        m1.add(TlvType::PublicKey as u8, public.as_bytes());
+        let response = request(conn, "POST", "/pair-verify", "application/octet-stream", &m1.encode());
+        assert_eq!(response.status_code(), 200);
+        let m2 = TlvValues::decode(body(&response)).unwrap();
+        let remote = <[u8; 32]>::try_from(m2.get_type(TlvType::PublicKey).unwrap()).unwrap();
+        let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(remote));
+        let signed = [public.as_bytes().as_slice(), identifier.as_bytes(), remote.as_slice()].concat();
+        let mut inner = TlvValues::new();
+        inner.add(TlvType::Identifier as u8, identifier.as_bytes());
+        inner.add(TlvType::Signature as u8, &key.sign(&signed).to_bytes());
+        let mut encryption_key = [0; 32];
+        hkdf::Hkdf::<sha2::Sha512>::new(Some(b"Pair-Verify-Encrypt-Salt"), shared.as_bytes())
+            .expand(b"Pair-Verify-Encrypt-Info", &mut encryption_key)
+            .unwrap();
+        let encrypted = ChaCha20Poly1305::new((&encryption_key).into())
+            .encrypt(b"\0\0\0\0PV-Msg03".into(), inner.encode().as_slice())
+            .unwrap();
+        let mut m3 = TlvValues::new();
+        m3.add(TlvType::State as u8, &[3]);
+        m3.add(TlvType::EncryptedData as u8, &encrypted);
+        let response = request(conn, "POST", "/pair-verify", "application/octet-stream", &m3.encode());
+        let m4 = TlvValues::decode(body(&response)).unwrap();
+        assert_eq!(m4.get_type(TlvType::State), Some(&[4][..]));
+    }
+    fn setup(conn: &mut dyn ConnectionHandler) {
+        let mut stream = plist::Dictionary::new();
+        stream.insert("type".into(), plist::Value::Integer(103.into()));
+        stream.insert("shk".into(), plist::Value::Data(vec![7; 32]));
+        let mut setup = plist::Dictionary::new();
+        setup.insert(
+            "streams".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+        );
+        let mut bytes = Vec::new();
+        plist::to_writer_binary(&mut bytes, &plist::Value::Dictionary(setup)).unwrap();
+        assert_eq!(
+            request(conn, "SETUP", "/stream", "application/x-apple-binary-plist", &bytes).status_code(),
+            200
+        );
+    }
+    #[tokio::test]
+    async fn verified_separate_controller_survives_replacement_and_rejects_other_clients() {
+        let handler = Arc::new(Handler::default());
+        let server = RaopServer::builder().pin("1234").build(handler.clone()).unwrap();
+        let key = SigningKey::from_bytes(&[17; 32]);
+        server.shared.pairing_store.put("owner", key.verifying_key().to_bytes());
+        server.shared.pairing_store.put("other", key.verifying_key().to_bytes());
+        let connect = || {
+            server
+                .shared
+                .conn_init("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:8000".parse().unwrap())
+                .unwrap()
+        };
+        let mut owner = connect();
+        verify(owner.as_mut(), "owner", &key);
+        setup(owner.as_mut());
+        let original = server
+            .shared
+            .controller_session
+            .lock()
+            .unwrap()
+            .playout
+            .clone()
+            .unwrap();
+        let mut control = connect();
+        assert_eq!(
+            request(
+                control.as_mut(),
+                "SET_PARAMETER",
+                "/stream",
+                "text/parameters",
+                b"volume: -20\r\n"
+            )
+            .status_code(),
+            401
+        );
+        verify(control.as_mut(), "owner", &key);
+        assert_eq!(
+            request(
+                control.as_mut(),
+                "SET_PARAMETER",
+                "/stream",
+                "text/parameters",
+                b"volume: -20\r\n"
+            )
+            .status_code(),
+            200
+        );
+        control.shutdown().await;
+        assert!(
+            !original.is_closed(),
+            "control disconnect must not stop the owner's stream"
+        );
+        let mut other = connect();
+        verify(other.as_mut(), "other", &key);
+        assert_eq!(
+            request(
+                other.as_mut(),
+                "SET_PARAMETER",
+                "/stream",
+                "text/parameters",
+                b"volume: -5\r\n"
+            )
+            .status_code(),
+            403
+        );
+        assert_eq!(handler.0.lock().unwrap().as_slice(), &[-20.0]);
+        setup(control.as_mut());
+        tokio::time::timeout(std::time::Duration::from_secs(1), original.closed())
+            .await
+            .unwrap();
+        let replacement = server
+            .shared
+            .controller_session
+            .lock()
+            .unwrap()
+            .playout
+            .clone()
+            .unwrap();
+        owner.shutdown().await;
+        drop(owner);
+        assert!(!replacement.is_closed(), "old owner shutdown must not stop replacement");
+        assert_eq!(
+            request(
+                control.as_mut(),
+                "SET_PARAMETER",
+                "/stream",
+                "text/parameters",
+                b"volume: -15\r\n"
+            )
+            .status_code(),
+            200
+        );
+        control.shutdown().await;
+        drop(control);
+        assert!(server.shared.controller_session.lock().unwrap().owner.is_none());
+    }
+}
