@@ -79,3 +79,8 @@ minifb = "0.28"
 [[example]]
 name = "player"
 required-features = []
+
+[[example]]
+name = "resample-benchmark"
+path = "examples/resample_benchmark.rs"
+required-features = ["resample"]

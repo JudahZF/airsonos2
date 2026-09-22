@@ -56,7 +56,6 @@ pub enum PlayoutCommand {
     Stop,
 }
 
-#[derive(Clone)]
 struct BufferedFrame {
     sequence: u16,
     samples: Vec<f32>,
@@ -208,7 +207,8 @@ impl BufferedAudioProcessor {
                         } else {
                             // Set anchor so the earliest buffered frame is deliverable
                             // with a small lead time for smooth playback
-                            if let Some(&first_ts) = s.buffer.keys().next() {
+                            if let Some(&first_ts) = s.buffer.keys().min_by_key(|ts| ts.wrapping_sub(anchor_rtp) as i32)
+                            {
                                 let lead_frames = s.source_sample_rate / 10; // 100ms lead
                                 s.anchor_rtp = first_ts.wrapping_sub(lead_frames);
                             }
@@ -524,15 +524,20 @@ fn delivery_loop(
         let elapsed_frames = source_frames(s.anchor_local.elapsed(), s.source_sample_rate);
         let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
 
-        let ready: Vec<(u32, BufferedFrame)> = s
-            .buffer
-            .iter()
-            .filter(|(ts, _)| (target_rtp.wrapping_sub(**ts) as i32) >= 0)
-            .map(|(&ts, data)| (ts, data.clone()))
-            .collect();
-
-        for (ts, _) in &ready {
-            s.buffer.remove(ts);
+        let ready = take_ready(&mut s.buffer, target_rtp);
+        if ready.is_empty() {
+            let next_frames = s
+                .buffer
+                .keys()
+                .map(|ts| ts.wrapping_sub(target_rtp))
+                .filter(|frames| *frames <= i32::MAX as u32)
+                .min()
+                .unwrap_or(s.source_sample_rate);
+            let wait = std::time::Duration::from_nanos(
+                (u64::from(next_frames) * 1_000_000_000).div_ceil(u64::from(s.source_sample_rate)),
+            );
+            let _ = cvar.wait_timeout(s, wait).unwrap();
+            continue;
         }
         drop(s);
 
@@ -542,12 +547,21 @@ fn delivery_loop(
                 sess.audio_process_timed(&frame.samples, None);
             }
         }
-
-        if ready.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
     }
     info!("Delivery loop ended");
+}
+
+/// Extract due packets in source-clock order without copying their PCM allocation.
+fn take_ready(buffer: &mut BTreeMap<u32, BufferedFrame>, target: u32) -> Vec<(u32, BufferedFrame)> {
+    let mut keys: Vec<u32> = buffer
+        .keys()
+        .copied()
+        .filter(|ts| target.wrapping_sub(*ts) as i32 >= 0)
+        .collect();
+    keys.sort_unstable_by_key(|ts| ts.wrapping_sub(target) as i32);
+    keys.into_iter()
+        .filter_map(|ts| buffer.remove(&ts).map(|frame| (ts, frame)))
+        .collect()
 }
 
 fn source_frames(elapsed: std::time::Duration, sample_rate: u32) -> u32 {
@@ -715,5 +729,38 @@ mod flush_tests {
         shared.0.lock().unwrap().stopped = true;
         shared.1.notify_all();
         thread.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    #[test]
+    fn delivery_moves_allocations_in_wrapped_timestamp_order() {
+        let mut buffer = BTreeMap::new();
+        let samples = vec![0.25; 1024];
+        let pointer = samples.as_ptr();
+        buffer.insert(u32::MAX - 10, BufferedFrame { sequence: 1, samples });
+        buffer.insert(
+            5,
+            BufferedFrame {
+                sequence: 2,
+                samples: vec![0.5; 1024],
+            },
+        );
+        buffer.insert(
+            50,
+            BufferedFrame {
+                sequence: 3,
+                samples: vec![1.0; 1024],
+            },
+        );
+        let ready = take_ready(&mut buffer, 10);
+        assert_eq!(
+            ready.iter().map(|(ts, _)| *ts).collect::<Vec<_>>(),
+            vec![u32::MAX - 10, 5]
+        );
+        assert_eq!(ready[0].1.samples.as_ptr(), pointer);
+        assert_eq!(buffer.len(), 1);
     }
 }
