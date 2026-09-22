@@ -14,19 +14,19 @@ use crate::error::NetworkError;
 /// Handle for sending commands through the event channel.
 #[derive(Clone)]
 pub struct EventSender {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl EventSender {
     /// Create from an existing channel sender.
-    pub fn from_tx(tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+    pub fn from_tx(tx: mpsc::Sender<Vec<u8>>) -> Self {
         Self { tx }
     }
 
     /// Send a plaintext message (will be encrypted before transmission).
     pub fn send(&self, data: Vec<u8>) -> Result<(), NetworkError> {
         self.tx
-            .send(data)
+            .try_send(data)
             .map_err(|_| NetworkError::Mdns("event channel closed".into()))
     }
 }
@@ -49,7 +49,7 @@ impl EventChannel {
 
     /// Run the event channel. Returns an EventSender for sending commands.
     pub async fn run(self, channel: EncryptedChannel) -> EventSender {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(16);
         let sender = EventSender { tx };
 
         let (stream, addr) = match self.listener.accept().await {
@@ -66,15 +66,11 @@ impl EventChannel {
     }
 
     /// Handle a connected event channel stream (public for use from handlers).
-    pub async fn handle_stream(stream: TcpStream, channel: EncryptedChannel, cmd_rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    pub async fn handle_stream(stream: TcpStream, channel: EncryptedChannel, cmd_rx: mpsc::Receiver<Vec<u8>>) {
         Self::handle(stream, channel, cmd_rx).await;
     }
 
-    async fn handle(
-        mut stream: TcpStream,
-        mut channel: EncryptedChannel,
-        mut cmd_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    ) {
+    async fn handle(mut stream: TcpStream, mut channel: EncryptedChannel, mut cmd_rx: mpsc::Receiver<Vec<u8>>) {
         let mut buf = vec![0u8; 4096];
         let mut encrypted_buf = Vec::new();
         loop {
@@ -99,7 +95,8 @@ impl EventChannel {
                         Err(e) => { warn!("Event channel read error: {e}"); break; }
                     }
                 }
-                Some(data) = cmd_rx.recv() => {
+                data = cmd_rx.recv() => {
+                    let Some(data) = data else { break; };
                     debug!(len = data.len(), "Sending on event channel");
                     let encrypted = match channel.encrypt_ctx.encrypt(&data) {
                         Ok(e) => e,
@@ -159,7 +156,7 @@ mod failure_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (stream, _) = listener.accept().await.unwrap();
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = mpsc::channel(16);
         let task = tokio::spawn(EventChannel::handle_stream(
             stream,
             EncryptedChannel::events(&[7; 32]).unwrap(),

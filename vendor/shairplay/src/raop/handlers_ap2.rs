@@ -30,10 +30,10 @@ impl RaopConnection {
         &mut self,
         event_listener: tokio::net::TcpListener,
         event_channel_cipher: crate::crypto::chacha_transport::EncryptedChannel,
-        rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) {
         let peer = self.remote_socket.ip();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             if let Ok((stream, addr)) = event_listener.accept().await {
                 if addr.ip() != peer {
                     return;
@@ -303,7 +303,7 @@ pub(crate) fn handle_setup(
                         max_channels: conn.output_max_channels,
                     };
 
-                    tokio::spawn(crate::raop::realtime_audio::run(
+                    conn.tasks.spawn(crate::raop::realtime_audio::run(
                         socket,
                         shk_arr,
                         handler,
@@ -381,7 +381,7 @@ pub(crate) fn handle_setup(
                     listener,
                     port: audio_port,
                 };
-                let cmd_tx = proc.start(shk_arr, output_config, handler);
+                let cmd_tx = proc.start(shk_arr, output_config, handler, &mut conn.tasks);
                 conn.controller_session.lock().unwrap().playout = Some(cmd_tx.clone());
                 conn.playout_cmd = Some(cmd_tx);
 
@@ -401,7 +401,7 @@ pub(crate) fn handle_setup(
                     tracing::debug!(data_port, "RC data channel opened");
 
                     // Spawn listener (just accept + log for now)
-                    tokio::spawn(async move {
+                    conn.tasks.spawn(async move {
                         if let Ok((_, addr)) = data_listener.accept().await {
                             tracing::info!(%addr, "RC data channel client connected");
                         }
@@ -507,7 +507,8 @@ pub(crate) fn handle_setup(
 
                 if let Some(vh) = &conn.video_handler {
                     let session = vh.video_init();
-                    tokio::spawn(crate::raop::video_stream::run(listener, cipher, session));
+                    conn.tasks
+                        .spawn(crate::raop::video_stream::run(listener, cipher, session));
                 }
 
                 stream_resp.insert("dataPort".into(), plist::Value::Integer(video_port.into()));
@@ -597,7 +598,7 @@ pub(crate) fn handle_setup(
                     crate::crypto::chacha_transport::EncryptedChannel::events(shared_secret)
                 {
                     let event_sender = {
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        let (tx, rx) = tokio::sync::mpsc::channel(16);
 
                         let mut update_info = plist::Dictionary::new();
                         update_info.insert("type".into(), plist::Value::String("updateInfo".into()));
@@ -628,7 +629,7 @@ pub(crate) fn handle_setup(
                             );
                             let mut msg = rtsp.into_bytes();
                             msg.extend_from_slice(&body);
-                            let _ = tx.send(msg);
+                            let _ = tx.try_send(msg);
                             tracing::debug!("updateInfo queued for RC event channel");
                         }
 
@@ -680,7 +681,7 @@ pub(crate) fn handle_setup(
         {
             // Spawn bidirectional event channel
             let event_sender = {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
 
                 // Queue updateInfo so it's sent immediately when client connects
                 let mut update_info = plist::Dictionary::new();
@@ -712,7 +713,7 @@ pub(crate) fn handle_setup(
                     );
                     let mut msg = rtsp.into_bytes();
                     msg.extend_from_slice(&body);
-                    let _ = tx.send(msg);
+                    let _ = tx.try_send(msg);
                     tracing::debug!("updateInfo queued for event channel");
                 }
 
@@ -745,7 +746,8 @@ pub(crate) fn handle_setup(
                     let local_port = tsock.local_addr().ok()?.port();
                     let mut remote_timing = conn.remote_socket;
                     remote_timing.set_port(timing_rport);
-                    crate::raop::ntp::spawn_ntp_responder(tsock, remote_timing);
+                    conn.tasks
+                        .spawn(crate::raop::ntp::run_ntp_responder(tsock, remote_timing));
                     Some(local_port)
                 })
                 .unwrap_or(0);
@@ -814,7 +816,7 @@ pub(crate) fn handle_set_rate_anchor_time(
     conn.handler.on_playback_rate(playing);
 
     if let Some(cmd) = &conn.playout_cmd {
-        let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::SetRate {
+        let _ = cmd.try_send(crate::raop::buffered_audio::PlayoutCommand::SetRate {
             anchor_rtp: rtp_time,
             anchor_time_ns,
             rate,
@@ -862,7 +864,7 @@ pub(crate) fn handle_flush_buffered(
             .unwrap_or(0) as u32;
         tracing::debug!(from_seq, until_seq, "FLUSHBUFFERED");
         if let Some(cmd) = &conn.playout_cmd {
-            let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Flush { from_seq, until_seq });
+            let _ = cmd.try_send(crate::raop::buffered_audio::PlayoutCommand::Flush { from_seq, until_seq });
         }
     }
     None

@@ -68,20 +68,6 @@ pub(crate) fn remote_addr_bytes(remote: &str) -> Vec<u8> {
     }
 }
 
-/// Mutable state shared between the RTP receive loop and the RTSP handler thread.
-/// Updated via async message passing (tokio Mutex), consumed in the receive loop.
-struct RtpState {
-    /// Current volume in dB (0.0 = max, -144.0 = mute).
-    /// Set to true when volume changes; cleared after delivery.
-    /// Pending DMAP track metadata (binary).
-    /// Pending album artwork (JPEG/PNG).
-    /// DACP ID for remote control discovery.
-    /// Active-Remote token for DACP authentication.
-    /// Pending playback progress (start, current, end in RTP timestamps).
-    /// Sequence number to flush to, or [`NO_FLUSH`] if no flush pending.
-    flush: i32,
-}
-
 /// Configuration for creating an AP1 RTP session, parsed from SDP.
 pub struct RtpConfig {
     /// SDP `c=` remote address string (e.g. "192.168.1.5").
@@ -111,6 +97,7 @@ pub struct RtpConfig {
 /// Dropped when the RTSP connection closes, which sends a shutdown signal
 /// to the receive task via the [`watch`] channel.
 pub struct RaopRtp {
+    tasks: tokio::task::JoinSet<()>,
     handler: Arc<dyn AudioHandler>,
     /// SDP `c=` remote address string (e.g. "192.168.1.5").
     remote: String,
@@ -123,7 +110,7 @@ pub struct RaopRtp {
     /// Shared packet buffer (decrypt + decode on queue, dequeue in order).
     buffer: Arc<Mutex<RaopBuffer>>,
     /// Shared mutable state for cross-task event delivery.
-    state: Arc<Mutex<RtpState>>,
+    state: Arc<std::sync::atomic::AtomicI32>,
     /// Send `true` to shut down the receive task.
     shutdown_tx: Option<watch::Sender<bool>>,
     /// iPhone's control port (0 = no retransmits).
@@ -145,6 +132,7 @@ impl RaopRtp {
         let buffer = RaopBuffer::new(&config.rtpmap, &config.fmtp, &config.aes_key, &config.aes_iv)?;
         let alac_config = buffer.config().clone();
         Some(Self {
+            tasks: tokio::task::JoinSet::new(),
             handler: callbacks,
             remote: config.remote,
             local_addr: config.local_addr,
@@ -152,7 +140,7 @@ impl RaopRtp {
             remote_socket: config.remote_socket,
             config: alac_config,
             buffer: Arc::new(Mutex::new(buffer)),
-            state: Arc::new(Mutex::new(RtpState { flush: NO_FLUSH })),
+            state: Arc::new(std::sync::atomic::AtomicI32::new(NO_FLUSH)),
             shutdown_tx: None,
             control_rport: 0,
             control_lport: 0,
@@ -196,7 +184,7 @@ impl RaopRtp {
             let remote_sockaddr = self.remote_socket;
             let mut timing_addr = remote_sockaddr;
             timing_addr.set_port(timing_rport);
-            super::ntp::spawn_ntp_responder(tsock, timing_addr);
+            self.tasks.spawn(super::ntp::run_ntp_responder(tsock, timing_addr));
 
             let config = self.config.clone();
             let mut session = self.handler.audio_init(AudioFormat {
@@ -227,18 +215,17 @@ impl RaopRtp {
             let no_resend = control_rport == 0;
             let _remote_for_task = self.remote.clone();
 
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 let mut shutdown_rx = shutdown_rx;
                 let mut data_packet = [0u8; RAOP_PACKET_LEN];
                 let mut ctrl_packet = [0u8; RAOP_PACKET_LEN];
                 loop {
                     // Drain flush events only — metadata goes through AudioHandler now.
                     {
-                        let mut st = state.lock().await;
-                        if st.flush != NO_FLUSH {
-                            buffer.lock().await.flush(st.flush);
+                        let flush = state.swap(NO_FLUSH, std::sync::atomic::Ordering::AcqRel);
+                        if flush != NO_FLUSH {
+                            buffer.lock().await.flush(flush);
                             session.audio_flush();
-                            st.flush = NO_FLUSH;
                         }
                     }
 
@@ -310,7 +297,7 @@ impl RaopRtp {
             let state = self.state.clone();
             let _remote_for_tcp = self.remote.clone();
 
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut shutdown_rx = shutdown_rx;
 
@@ -330,11 +317,10 @@ impl RaopRtp {
                 'tcp: loop {
                     // Drain flush events only — metadata goes through AudioHandler now.
                     {
-                        let mut st = state.lock().await;
-                        if st.flush != NO_FLUSH {
-                            buffer.lock().await.flush(st.flush);
+                        let flush = state.swap(NO_FLUSH, std::sync::atomic::Ordering::AcqRel);
+                        if flush != NO_FLUSH {
+                            buffer.lock().await.flush(flush);
                             session.audio_flush();
-                            st.flush = NO_FLUSH;
                         }
                     }
 
@@ -391,10 +377,13 @@ impl RaopRtp {
 
     /// Request a buffer flush up to the given sequence number.
     pub fn flush(&self, next_seq: i32) {
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            state.lock().await.flush = next_seq;
-        });
+        self.state.store(next_seq, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Stop and await owned receive and timing tasks.
+    pub async fn shutdown(&mut self) {
+        self.stop();
+        self.tasks.shutdown().await;
     }
 
     /// Stop the receive task and flush the buffer.
@@ -402,6 +391,6 @@ impl RaopRtp {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
-        self.flush(-1);
+        self.tasks.abort_all();
     }
 }

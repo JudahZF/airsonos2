@@ -18,7 +18,7 @@ use std::sync::Arc;
 pub(crate) struct ControllerSession {
     pub owner: Option<String>,
     pub owner_connection: Option<String>,
-    pub playout: Option<tokio::sync::mpsc::UnboundedSender<super::buffered_audio::PlayoutCommand>>,
+    pub playout: Option<tokio::sync::mpsc::Sender<super::buffered_audio::PlayoutCommand>>,
 }
 
 #[cfg(feature = "ap2")]
@@ -74,6 +74,7 @@ impl HttpdCallbacks for RaopShared {
         };
 
         let conn = handlers::RaopConnection {
+            tasks: tokio::task::JoinSet::new(),
             #[cfg(feature = "ap2")]
             controller_id: None,
             #[cfg(feature = "ap2")]
@@ -162,7 +163,7 @@ impl Drop for RaopConnectionHandler {
             let mut active = self.conn.controller_session.lock().unwrap();
             if active.owner_connection.as_ref() == Some(&self.conn.nonce) {
                 if let Some(cmd) = active.playout.take() {
-                    let _ = cmd.send(super::buffered_audio::PlayoutCommand::Stop);
+                    let _ = cmd.try_send(super::buffered_audio::PlayoutCommand::Stop);
                 }
                 active.owner = None;
                 active.owner_connection = None;
@@ -173,6 +174,15 @@ impl Drop for RaopConnectionHandler {
 }
 
 impl ConnectionHandler for RaopConnectionHandler {
+    fn shutdown(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(mut rtp) = self.conn.raop_rtp.take() {
+                rtp.shutdown().await;
+            }
+            self.conn.tasks.shutdown().await;
+        })
+    }
+
     fn conn_request(&mut self, request: &HttpRequest) -> HttpResponse {
         let resp = rtsp::dispatch(&mut self.conn, request);
 

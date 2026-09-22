@@ -860,3 +860,25 @@ async fn unauthenticated_second_connection_cannot_change_volume_or_pause() {
     assert_eq!(*state.volumes.lock().unwrap(), vec![-10.0]);
     server.stop().await;
 }
+
+#[tokio::test]
+#[serial]
+async fn stopping_server_closes_idle_connections_before_returning() {
+    let (mut server, port, _) = start_server().await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(
+        send_rtsp(&mut stream, "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .contains("200 OK")
+    );
+    server.stop().await;
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+}
