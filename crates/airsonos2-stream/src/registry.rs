@@ -1,22 +1,39 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use airsonos2_core::{SessionId, StreamSession};
+use airsonos2_core::{PcmQueue, SessionId, StreamSession};
 use bytes::Bytes;
 use tokio::sync::{RwLock, broadcast, watch};
 use tracing::{debug, info};
 
+#[derive(Debug, Default)]
+struct Totals([AtomicU64; 3]);
+
+#[derive(Debug, Default)]
+struct Accounting {
+    values: [u64; 3],
+    totals: Option<Arc<Totals>>,
+}
+
+const CONSUMED: usize = 0;
+const DROPPED: usize = 1;
+const SKIPPED: usize = 2;
+
 #[derive(Clone, Debug)]
 pub struct StreamRegistry {
     inner: Arc<RwLock<HashMap<SessionId, LiveStream>>>,
+    totals: Arc<Totals>,
+    completed_pcm_drops: Arc<AtomicU64>,
 }
 
 impl StreamRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
+            totals: Arc::new(Totals::default()),
+            completed_pcm_drops: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -27,14 +44,23 @@ impl StreamRegistry {
     }
 
     pub async fn insert(&self, stream: LiveStream) {
-        if let Some(previous) = self
-            .inner
-            .write()
-            .await
-            .insert(stream.session.session_id, stream)
-        {
-            previous.close();
+        stream.attach_totals(self.totals.clone());
+        let mut streams = self.inner.write().await;
+        if let Some(previous) = streams.insert(stream.session.session_id, stream) {
+            self.complete_queue(&previous);
         }
+    }
+
+    fn complete_queue(&self, stream: &LiveStream) {
+        stream.close();
+        if let Some(queue) = stream.input_queue.get() {
+            self.completed_pcm_drops
+                .fetch_add(queue.stats().dropped_frames, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_adapter_drops(&self, count: u64) {
+        self.completed_pcm_drops.fetch_add(count, Ordering::Relaxed);
     }
 
     pub async fn get(&self, session_id: &SessionId) -> Option<LiveStream> {
@@ -42,16 +68,17 @@ impl StreamRegistry {
     }
 
     pub async fn remove(&self, session_id: &SessionId) -> Option<LiveStream> {
-        let stream = self.inner.write().await.remove(session_id);
+        let mut streams = self.inner.write().await;
+        let stream = streams.remove(session_id);
         if let Some(stream) = &stream {
-            stream.close();
+            self.complete_queue(stream);
         }
         stream
     }
 
     pub async fn close_all(&self) {
         for (_, stream) in self.inner.write().await.drain() {
-            stream.close();
+            self.complete_queue(&stream);
         }
     }
 
@@ -66,26 +93,55 @@ impl StreamRegistry {
     pub async fn metrics_text(&self) -> String {
         let streams = self.inner.read().await;
         let active = streams.len();
-        let bytes_served: u64 = streams.values().map(LiveStream::bytes_served).sum();
-        let bytes_dropped: u64 = streams.values().map(LiveStream::bytes_dropped).sum();
-        let bytes_skipped: u64 = streams
+        let bytes_served = self.totals.0[CONSUMED].load(Ordering::Relaxed);
+        let bytes_dropped = self.totals.0[DROPPED].load(Ordering::Relaxed);
+        let bytes_skipped = self.totals.0[SKIPPED].load(Ordering::Relaxed);
+        let queues: Vec<_> = streams
             .values()
-            .map(|stream| stream.timing().bytes_skipped)
-            .sum();
+            .filter_map(|stream| stream.input_queue.get())
+            .map(PcmQueue::stats)
+            .collect();
+        let queue_bytes: usize = queues.iter().map(|queue| queue.bytes).sum();
+        let queue_retained_bytes: usize = queues.iter().map(|queue| queue.retained_bytes).sum();
+        let queue_byte_limit: usize = queues.iter().map(|queue| queue.byte_limit).sum();
+        let queue_drops = self.completed_pcm_drops.load(Ordering::Relaxed)
+            + queues.iter().map(|queue| queue.dropped_frames).sum::<u64>();
+        let queue_duration_ms: u128 = queues.iter().map(|queue| queue.duration.as_millis()).sum();
+        let queue_age_ms = queues
+            .iter()
+            .map(|queue| queue.oldest_age.as_millis())
+            .max()
+            .unwrap_or(0);
 
         format!(
             "# HELP airsonos2_stream_sessions Active live stream sessions.\n\
              # TYPE airsonos2_stream_sessions gauge\n\
              airsonos2_stream_sessions {active}\n\
-             # HELP airsonos2_http_bytes_served Bytes delivered to HTTP subscribers.\n\
-             # TYPE airsonos2_http_bytes_served counter\n\
-             airsonos2_http_bytes_served {bytes_served}\n\
+             # HELP airsonos2_http_body_bytes_consumed Bytes polled from HTTP bodies; not socket or acoustic delivery.\n\
+             # TYPE airsonos2_http_body_bytes_consumed counter\n\
+             airsonos2_http_body_bytes_consumed {bytes_served}\n\
              # HELP airsonos2_stream_bytes_dropped Bytes dropped before HTTP subscriber connected.\n\
              # TYPE airsonos2_stream_bytes_dropped counter\n\
              airsonos2_stream_bytes_dropped {bytes_dropped}\n\
              # HELP airsonos2_stream_bytes_skipped Bytes skipped to align playback with the live edge.\n\
              # TYPE airsonos2_stream_bytes_skipped counter\n\
-             airsonos2_stream_bytes_skipped {bytes_skipped}\n"
+             airsonos2_stream_bytes_skipped {bytes_skipped}\n\
+             # HELP airsonos2_pcm_queue_bytes PCM payload bytes currently held by encoder queues.\n\
+             # TYPE airsonos2_pcm_queue_bytes gauge\n\
+             airsonos2_pcm_queue_bytes {queue_bytes}\n\
+             # TYPE airsonos2_pcm_queue_retained_bytes gauge\n\
+             airsonos2_pcm_queue_retained_bytes {queue_retained_bytes}\n\
+             # TYPE airsonos2_pcm_queue_byte_limit gauge\n\
+             airsonos2_pcm_queue_byte_limit {queue_byte_limit}\n\
+             # HELP airsonos2_pcm_queue_dropped_frames PCM frames discarded by adapter or encoder queues, including cancellation.\n\
+             # TYPE airsonos2_pcm_queue_dropped_frames counter\n\
+             airsonos2_pcm_queue_dropped_frames {queue_drops}\n\
+             # HELP airsonos2_pcm_queue_duration_ms Sum of queued PCM duration in milliseconds.\n\
+             # TYPE airsonos2_pcm_queue_duration_ms gauge\n\
+             airsonos2_pcm_queue_duration_ms {queue_duration_ms}\n\
+             # HELP airsonos2_pcm_queue_oldest_age_ms Oldest encoder queue arrival age in milliseconds.\n\
+             # TYPE airsonos2_pcm_queue_oldest_age_ms gauge\n\
+             airsonos2_pcm_queue_oldest_age_ms {queue_age_ms}\n"
         )
     }
 }
@@ -94,6 +150,14 @@ impl Default for StreamRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Bounded output backlog: at most 64 chunks of 16 KiB, plus one shared input
+/// allocation (at most 1 MiB). Stalled HTTP consumers reconnect at the live edge.
+#[derive(Clone, Debug)]
+pub struct EncodedChunk {
+    pub bytes: Bytes,
+    pub queued_at: Instant,
 }
 
 /// Snapshot of stream timing for diagnostics.
@@ -122,12 +186,11 @@ enum PlaybackAnchorState {
 #[derive(Clone, Debug)]
 pub struct LiveStream {
     pub session: StreamSession,
-    sender: broadcast::Sender<Bytes>,
+    sender: broadcast::Sender<EncodedChunk>,
     prelude: Arc<std::sync::Mutex<Option<Bytes>>>,
     encoded_bytes: Arc<AtomicU64>,
-    bytes_served: Arc<AtomicU64>,
-    bytes_dropped: Arc<AtomicU64>,
-    bytes_skipped: Arc<AtomicU64>,
+    accounting: Arc<Mutex<Accounting>>,
+    input_queue: Arc<OnceLock<PcmQueue>>,
     chunks_dropped: Arc<AtomicU64>,
     subscriber_connected: Arc<AtomicBool>,
     ready: watch::Sender<bool>,
@@ -137,14 +200,14 @@ pub struct LiveStream {
     playback_epoch: Arc<AtomicU64>,
     subscriber_count: Arc<AtomicU64>,
     playback_anchor: Arc<std::sync::Mutex<PlaybackAnchorState>>,
-    first_encoded_at: Arc<std::sync::Mutex<Option<Instant>>>,
-    first_served_at: Arc<std::sync::Mutex<Option<Instant>>>,
-    subscriber_connected_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    first_encoded_at: Arc<OnceLock<Instant>>,
+    first_served_at: Arc<OnceLock<Instant>>,
+    subscriber_connected_at: Arc<OnceLock<Instant>>,
 }
 
 impl LiveStream {
     pub fn new(session: StreamSession) -> Self {
-        let (sender, _) = broadcast::channel(256);
+        let (sender, _) = broadcast::channel(64);
         let (ready, _) = watch::channel(false);
         let (subscriber, _) = watch::channel(false);
         let (closed, _) = watch::channel(false);
@@ -154,9 +217,8 @@ impl LiveStream {
             sender,
             prelude: Arc::new(std::sync::Mutex::new(None)),
             encoded_bytes: Arc::new(AtomicU64::new(0)),
-            bytes_served: Arc::new(AtomicU64::new(0)),
-            bytes_dropped: Arc::new(AtomicU64::new(0)),
-            bytes_skipped: Arc::new(AtomicU64::new(0)),
+            accounting: Arc::new(Mutex::new(Accounting::default())),
+            input_queue: Arc::new(OnceLock::new()),
             chunks_dropped: Arc::new(AtomicU64::new(0)),
             subscriber_connected: Arc::new(AtomicBool::new(false)),
             ready,
@@ -166,9 +228,9 @@ impl LiveStream {
             playback_epoch: Arc::new(AtomicU64::new(0)),
             subscriber_count: Arc::new(AtomicU64::new(0)),
             playback_anchor: Arc::new(std::sync::Mutex::new(PlaybackAnchorState::Unset)),
-            first_encoded_at: Arc::new(std::sync::Mutex::new(None)),
-            first_served_at: Arc::new(std::sync::Mutex::new(None)),
-            subscriber_connected_at: Arc::new(std::sync::Mutex::new(None)),
+            first_encoded_at: Arc::new(OnceLock::new()),
+            first_served_at: Arc::new(OnceLock::new()),
+            subscriber_connected_at: Arc::new(OnceLock::new()),
         }
     }
 
@@ -182,10 +244,14 @@ impl LiveStream {
         let len = bytes.len() as u64;
         self.encoded_bytes.fetch_add(len, Ordering::Relaxed);
         self.note_first_encoded(len);
-        self.ready.send_replace(true);
+        self.ready.send_if_modified(|ready| {
+            let changed = !*ready;
+            *ready = true;
+            changed
+        });
 
         if !self.subscriber_connected.load(Ordering::Acquire) {
-            self.bytes_dropped.fetch_add(len, Ordering::Relaxed);
+            self.add_counter(DROPPED, len);
             self.chunks_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -209,23 +275,27 @@ impl LiveStream {
         let len = bytes.len() as u64;
         self.encoded_bytes.fetch_add(len, Ordering::Relaxed);
         self.note_first_encoded(len);
-        self.ready.send_replace(true);
+        self.ready.send_if_modified(|ready| {
+            let changed = !*ready;
+            *ready = true;
+            changed
+        });
 
         if !self.subscriber_connected.load(Ordering::Acquire) {
-            self.bytes_dropped.fetch_add(len, Ordering::Relaxed);
+            self.add_counter(DROPPED, len);
             self.chunks_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
         let anchor = {
             let Some(mut anchor) = self.playback_anchor.lock().ok() else {
-                self.bytes_skipped.fetch_add(len, Ordering::Relaxed);
+                self.add_counter(SKIPPED, len);
                 self.chunks_dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             };
             match *anchor {
                 PlaybackAnchorState::Unset => {
-                    self.bytes_skipped.fetch_add(len, Ordering::Relaxed);
+                    self.add_counter(SKIPPED, len);
                     self.chunks_dropped.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -254,7 +324,7 @@ impl LiveStream {
         let frame_end = presentation_time + duration;
 
         if frame_end <= anchor {
-            self.bytes_skipped.fetch_add(len, Ordering::Relaxed);
+            self.add_counter(SKIPPED, len);
             self.chunks_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -265,8 +335,7 @@ impl LiveStream {
                 .min(frame_count);
             let skip_bytes = skip_frames * frame_bytes;
             if skip_bytes > 0 {
-                self.bytes_skipped
-                    .fetch_add(skip_bytes as u64, Ordering::Relaxed);
+                self.add_counter(SKIPPED, skip_bytes as u64);
             }
             if skip_bytes >= bytes.len() {
                 self.chunks_dropped.fetch_add(1, Ordering::Relaxed);
@@ -279,43 +348,63 @@ impl LiveStream {
         self.send_served(bytes);
     }
 
-    fn note_first_encoded(&self, len: u64) {
-        if self
-            .first_encoded_at
+    pub fn set_input_queue(&self, queue: PcmQueue) {
+        let _ = self.input_queue.set(queue);
+    }
+
+    fn attach_totals(&self, totals: Arc<Totals>) {
+        let mut accounting = self.accounting.lock().expect("stream accounting lock");
+        if accounting.totals.is_none() {
+            for (index, value) in accounting.values.iter().enumerate() {
+                totals.0[index].fetch_add(*value, Ordering::Relaxed);
+            }
+            accounting.totals = Some(totals);
+        }
+    }
+
+    fn add_counter(&self, index: usize, value: u64) {
+        let mut accounting = self.accounting.lock().expect("stream accounting lock");
+        accounting.values[index] += value;
+        if let Some(totals) = &accounting.totals {
+            totals.0[index].fetch_add(value, Ordering::Relaxed);
+        }
+    }
+
+    fn counter(&self, index: usize) -> u64 {
+        self.accounting
             .lock()
-            .ok()
-            .and_then(|mut t| {
-                if t.is_none() {
-                    *t = Some(Instant::now());
-                    Some(())
-                } else {
-                    None
-                }
-            })
-            .is_some()
-        {
-            debug!(
-                session_id = %self.session.session_id,
-                bytes = len,
-                "first encoded stream bytes produced"
-            );
+            .expect("stream accounting lock")
+            .values[index]
+    }
+
+    fn note_first_encoded(&self, len: u64) {
+        if self.first_encoded_at.set(Instant::now()).is_ok() {
+            debug!(session_id = %self.session.session_id, bytes = len, "first encoded stream bytes produced");
         }
     }
 
     fn send_served(&self, bytes: Bytes) {
-        let len = bytes.len() as u64;
-        self.bytes_served.fetch_add(len, Ordering::Relaxed);
-        if let Ok(mut at) = self.first_served_at.lock()
-            && at.is_none()
-        {
-            *at = Some(Instant::now());
-            debug!(
-                session_id = %self.session.session_id,
-                bytes = len,
-                "first stream bytes served"
-            );
+        if bytes.len() > 1024 * 1024 {
+            self.add_counter(DROPPED, bytes.len() as u64);
+            self.close();
+            return;
         }
-        let _ = self.sender.send(bytes);
+        let queued_at = Instant::now();
+        for start in (0..bytes.len()).step_by(16 * 1024) {
+            let end = (start + 16 * 1024).min(bytes.len());
+            let _ = self.sender.send(EncodedChunk {
+                bytes: bytes.slice(start..end),
+                queued_at,
+            });
+        }
+    }
+
+    /// Called only when an HTTP body is polled for this chunk.
+    pub fn record_body_consumed(&self, bytes: usize) {
+        self.add_counter(CONSUMED, bytes as u64);
+        if self.first_served_at.set(Instant::now()).is_ok() {
+            debug!(session_id = %self.session.session_id, bytes, "first HTTP body bytes consumed");
+        }
     }
 
     /// Publish bytes that must prefix every subscriber response, such as a WAV header.
@@ -344,9 +433,7 @@ impl LiveStream {
         }
 
         let now = Instant::now();
-        if let Ok(mut at) = self.subscriber_connected_at.lock() {
-            *at = Some(now);
-        }
+        let _ = self.subscriber_connected_at.set(now);
         self.subscriber.send_replace(true);
 
         let timing = self.timing();
@@ -363,7 +450,7 @@ impl LiveStream {
         );
     }
 
-    pub fn attach_subscriber(&self) -> (Option<Bytes>, broadcast::Receiver<Bytes>) {
+    pub fn attach_subscriber(&self) -> (Option<Bytes>, broadcast::Receiver<EncodedChunk>) {
         let prelude = self.prelude.lock().expect("prelude lock poisoned");
         let subscriber = self.sender.subscribe();
         self.subscriber_count.fetch_add(1, Ordering::Relaxed);
@@ -381,6 +468,10 @@ impl LiveStream {
 
     pub fn close(&self) {
         self.closed.send_replace(true);
+        if let Some(queue) = self.input_queue.get() {
+            queue.close();
+            queue.clear();
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -483,7 +574,7 @@ impl LiveStream {
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Bytes> {
+    pub fn subscribe(&self) -> broadcast::Receiver<EncodedChunk> {
         self.sender.subscribe()
     }
 
@@ -492,7 +583,7 @@ impl LiveStream {
     }
 
     pub fn bytes_served(&self) -> u64 {
-        self.bytes_served.load(Ordering::Relaxed)
+        self.counter(CONSUMED)
     }
 
     pub fn bytes_encoded(&self) -> u64 {
@@ -500,7 +591,7 @@ impl LiveStream {
     }
 
     pub fn bytes_dropped(&self) -> u64 {
-        self.bytes_dropped.load(Ordering::Relaxed)
+        self.counter(DROPPED)
     }
 
     pub fn timing(&self) -> StreamTiming {
@@ -508,16 +599,16 @@ impl LiveStream {
             encoded_bytes: self.bytes_encoded(),
             bytes_served: self.bytes_served(),
             bytes_dropped: self.bytes_dropped(),
-            bytes_skipped: self.bytes_skipped.load(Ordering::Relaxed),
+            bytes_skipped: self.counter(SKIPPED),
             chunks_dropped: self.chunks_dropped.load(Ordering::Relaxed),
             subscriber_connected: self.subscriber_connected.load(Ordering::Relaxed),
             playback_anchor_at: self.playback_anchor.lock().ok().and_then(|t| match *t {
                 PlaybackAnchorState::At(anchor) => Some(anchor),
                 PlaybackAnchorState::Unset | PlaybackAnchorState::NextTimedPcm => None,
             }),
-            first_encoded_at: self.first_encoded_at.lock().ok().and_then(|t| *t),
-            first_served_at: self.first_served_at.lock().ok().and_then(|t| *t),
-            subscriber_connected_at: self.subscriber_connected_at.lock().ok().and_then(|t| *t),
+            first_encoded_at: self.first_encoded_at.get().copied(),
+            first_served_at: self.first_served_at.get().copied(),
+            subscriber_connected_at: self.subscriber_connected_at.get().copied(),
         }
     }
 }
@@ -579,7 +670,7 @@ mod tests {
         stream.publish(Bytes::from_static(b"abc"));
 
         assert_eq!(registry.len().await, 1);
-        assert_eq!(stream.bytes_served(), 3);
+        assert_eq!(stream.bytes_served(), 0);
         assert_eq!(stream.bytes_dropped(), 0);
         assert!(registry.remove(&id).await.is_some());
         assert!(registry.is_empty().await);
@@ -617,7 +708,7 @@ mod tests {
         stream.on_subscriber_connected();
         stream.publish(Bytes::from_static(b"live"));
 
-        assert_eq!(stream.bytes_served(), 4);
+        assert_eq!(stream.bytes_served(), 0);
         assert_eq!(stream.bytes_dropped(), 3);
     }
 
@@ -631,7 +722,7 @@ mod tests {
         stream.publish(Bytes::from_static(b"live"));
 
         let chunk = rx.try_recv().expect("live chunk");
-        assert_eq!(&chunk[..], b"live");
+        assert_eq!(&chunk.bytes[..], b"live");
         assert!(rx.try_recv().is_err());
     }
 
@@ -654,7 +745,7 @@ mod tests {
         stream.publish(Bytes::from_static(b"live"));
 
         let chunk = rx.try_recv().expect("live chunk");
-        assert_eq!(&chunk[..], b"live");
+        assert_eq!(&chunk.bytes[..], b"live");
     }
 
     #[tokio::test]
@@ -666,7 +757,7 @@ mod tests {
         stream.publish_prelude(Bytes::from_static(b"header"));
 
         let chunk = rx.try_recv().expect("late prelude chunk");
-        assert_eq!(&chunk[..], b"header");
+        assert_eq!(&chunk.bytes[..], b"header");
     }
 
     #[tokio::test]
@@ -679,7 +770,7 @@ mod tests {
 
         assert_eq!(prelude.expect("prelude"), Bytes::from_static(b"header"));
         let chunk = rx.try_recv().expect("live chunk");
-        assert_eq!(&chunk[..], b"live");
+        assert_eq!(&chunk.bytes[..], b"live");
     }
 
     #[tokio::test]
@@ -698,7 +789,7 @@ mod tests {
         replacement.publish(Bytes::from_static(b"new"));
 
         let chunk = rx.try_recv().expect("replacement chunk");
-        assert_eq!(&chunk[..], b"new");
+        assert_eq!(&chunk.bytes[..], b"new");
         assert!(rx.try_recv().is_err());
     }
 
@@ -757,10 +848,10 @@ mod tests {
         stream.publish_timed_pcm(bytes, Some(frame_start), 1_000, 2);
 
         let chunk = rx.try_recv().expect("trimmed live chunk");
-        assert_eq!(chunk.len(), 20);
-        assert_eq!(&chunk[..4], &[20, 21, 22, 23]);
+        assert_eq!(chunk.bytes.len(), 20);
+        assert_eq!(&chunk.bytes[..4], &[20, 21, 22, 23]);
         assert_eq!(stream.timing().bytes_skipped, 20);
-        assert_eq!(stream.bytes_served(), 20);
+        assert_eq!(stream.bytes_served(), 0);
     }
 
     #[tokio::test]
@@ -779,7 +870,7 @@ mod tests {
         );
 
         let chunk = rx.try_recv().expect("live chunk");
-        assert_eq!(&chunk[..], b"live");
+        assert_eq!(&chunk.bytes[..], b"live");
         assert_eq!(stream.timing().bytes_skipped, 0);
     }
 
@@ -794,7 +885,7 @@ mod tests {
         stream.publish_timed_pcm(Bytes::from_static(b"live"), Some(frame_start), 1_000, 2);
 
         let chunk = rx.try_recv().expect("anchored chunk");
-        assert_eq!(&chunk[..], b"live");
+        assert_eq!(&chunk.bytes[..], b"live");
         assert_eq!(stream.timing().playback_anchor_at, Some(frame_start));
         assert_eq!(stream.timing().bytes_skipped, 0);
     }
@@ -817,7 +908,7 @@ mod tests {
         );
 
         let chunk = rx.try_recv().expect("live chunk");
-        assert_eq!(&chunk[..], b"live");
+        assert_eq!(&chunk.bytes[..], b"live");
         assert!(rx.try_recv().is_err());
         assert_eq!(stream.timing().playback_anchor_at, Some(live_frame_start));
         assert_eq!(stream.timing().bytes_skipped, 4);
@@ -847,9 +938,9 @@ mod tests {
         );
 
         let old = rx.try_recv().expect("old anchored chunk");
-        assert_eq!(&old[..], b"old1");
+        assert_eq!(&old.bytes[..], b"old1");
         let new = rx.try_recv().expect("new anchored chunk");
-        assert_eq!(&new[..], b"new1");
+        assert_eq!(&new.bytes[..], b"new1");
         assert_eq!(stream.timing().playback_anchor_at, Some(replacement_anchor));
     }
 

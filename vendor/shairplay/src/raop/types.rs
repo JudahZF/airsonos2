@@ -144,6 +144,13 @@ pub trait AudioSession: Send + Sync {
     fn audio_process_timed(&mut self, samples: &[f32], _presentation_time: Option<std::time::Instant>) {
         self.audio_process(samples);
     }
+    /// Offer buffered PCM without dropping source-timed audio when downstream is full.
+    /// Return false without consuming any samples to retry this frame later. The
+    /// receiver keeps it in its bounded queue and propagates TCP backpressure.
+    fn audio_process_buffered(&mut self, samples: &[f32], presentation_time: Option<std::time::Instant>) -> bool {
+        self.audio_process_timed(samples, presentation_time);
+        true
+    }
     /// Flush the audio buffer (e.g. on seek).
     fn audio_flush(&mut self) {}
     /// Called when the audio stream ends, before the session is dropped.

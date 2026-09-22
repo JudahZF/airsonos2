@@ -89,6 +89,13 @@ impl Config {
                 "sync offsets must be in -10000..=10000 milliseconds",
             ));
         }
+        if self.sync.start_deadline_ms > 60_000
+            || self.sync.multi_select_window_ms > self.sync.start_deadline_ms
+        {
+            return Err(invalid(
+                "sync.start_deadline_ms must be at most 60000 and multi_select_window_ms must not exceed it",
+            ));
+        }
         if self.sync.startup_sample_limit == 0
             || self.sync.startup_min_samples == 0
             || self.sync.startup_min_samples > self.sync.startup_sample_limit
@@ -280,9 +287,41 @@ impl Default for SyncConfig {
     }
 }
 
+impl SyncConfig {
+    /// Retain the common starting sample throughout the configured startup wait and
+    /// normalized room delay. Bounds also keep this safe for programmatic configs.
+    pub fn pcm_queue_duration(&self) -> std::time::Duration {
+        let fallback = self.default_offset_ms.clamp(-10_000, 10_000);
+        let (min, max) =
+            self.zone_offsets_ms
+                .values()
+                .fold((fallback, fallback), |(min, max), offset| {
+                    let offset = (*offset).clamp(-10_000, 10_000);
+                    (min.min(offset), max.max(offset))
+                });
+        std::time::Duration::from_millis(
+            self.start_deadline_ms.min(60_000) + (max - min) as u64 + 250,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_startup_budget_matches_validated_deadlines() {
+        assert!(Config::from_toml_str("[sync]\nstart_deadline_ms = 60001").is_err());
+        assert!(
+            Config::from_toml_str("[sync]\nstart_deadline_ms = 100\nmulti_select_window_ms = 101")
+                .is_err()
+        );
+        let config = Config::from_toml_str("[sync]\nstart_deadline_ms = 60000\ndefault_offset_ms = -10000\n[sync.zone_offsets_ms]\nKitchen = 10000").unwrap();
+        assert_eq!(
+            config.sync.pcm_queue_duration(),
+            std::time::Duration::from_millis(80250)
+        );
+    }
 
     #[test]
     fn rejects_offsets_that_can_overflow_runtime_deadlines() {

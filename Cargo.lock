@@ -74,6 +74,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tokio",
  "toml",
  "url",
  "uuid",

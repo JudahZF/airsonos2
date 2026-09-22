@@ -898,36 +898,41 @@ impl BridgeRuntime {
                 format,
             } => self.start_session(session_id, zone_id, format).await,
             AirPlayEvent::Pcm {
-                session_id, frame, ..
+                session_id, frames, ..
             } => {
-                if let Some(session) = self.sessions.get_mut(&session_id)
-                    && frame.playback_epoch == session.playback_epoch
-                    && let Some(encoder) = &session.encoder
-                {
-                    match encoder.try_write_frame(frame) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            debug!(%session_id, "encoder input full; dropping realtime frame")
-                        }
-                        Err(error) => {
-                            warn!(%session_id, "encoder input closed: {error}");
-                            session.prepared = None;
-                            session.reset_needed = true;
-                            let zone_id = session.zone_id.clone();
-                            let desired_playback = session.desired_playback;
-                            let encoder = session.encoder.take();
-                            let generation = self.next_downstream_generation(session_id);
-                            self.registry.remove(&session_id).await;
-                            self.retire_encoder(encoder);
-                            if let Some(worker) = self.worker(&zone_id) {
-                                worker.command(TransportCommand::Stop {
-                                    session_id,
-                                    zone_id: zone_id.clone(),
-                                    generation,
-                                });
+                let batch = frames.begin_batch();
+                self.registry.record_adapter_drops(frames.take_new_drops());
+                for _ in 0..batch {
+                    let Some(frame) = frames.pop() else { break };
+                    if let Some(session) = self.sessions.get_mut(&session_id)
+                        && frame.playback_epoch == session.playback_epoch
+                        && let Some(encoder) = &session.encoder
+                    {
+                        match encoder.try_write_frame(frame) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                debug!(%session_id, "encoder input full; dropping realtime frame")
                             }
-                            if desired_playback {
-                                self.schedule_downstream_retry(session_id, zone_id, generation);
+                            Err(error) => {
+                                warn!(%session_id, "encoder input closed: {error}");
+                                session.prepared = None;
+                                session.reset_needed = true;
+                                let zone_id = session.zone_id.clone();
+                                let desired_playback = session.desired_playback;
+                                let encoder = session.encoder.take();
+                                let generation = self.next_downstream_generation(session_id);
+                                self.registry.remove(&session_id).await;
+                                self.retire_encoder(encoder);
+                                if let Some(worker) = self.worker(&zone_id) {
+                                    worker.command(TransportCommand::Stop {
+                                        session_id,
+                                        zone_id: zone_id.clone(),
+                                        generation,
+                                    });
+                                }
+                                if desired_playback {
+                                    self.schedule_downstream_retry(session_id, zone_id, generation);
+                                }
                             }
                         }
                     }
@@ -1063,6 +1068,7 @@ impl BridgeRuntime {
                 channels: format.channels,
                 mp3_bitrate_kbps: self.config.stream.mp3_bitrate_kbps,
                 codec: stream_codec,
+                queue_duration: self.config.sync.pcm_queue_duration(),
             },
             live_stream.clone(),
         )?;
@@ -1582,7 +1588,7 @@ mod tests {
             .unwrap();
         let (header, mut output) = new.attach_subscriber();
         if header.is_none() {
-            assert_eq!(output.recv().await.unwrap().len(), 44);
+            assert_eq!(output.recv().await.unwrap().bytes.len(), 44);
         }
         new.arm_playback_anchor_on_next_timed_pcm();
         runtime.sessions.get_mut(&id).unwrap().encoder = Some(encoder);
@@ -1591,12 +1597,18 @@ mod tests {
                 .handle_event(AirPlayEvent::Pcm {
                     session_id: id,
                     zone_id: zone.clone(),
-                    frame: airsonos2_core::PcmFrame {
-                        playback_epoch: epoch,
-                        sample_rate: 44100,
-                        channels: 2,
-                        samples_f32_interleaved: vec![if epoch == 0 { -1.0 } else { 1.0 }; 2],
-                        presentation_time: None,
+                    frames: {
+                        let queue =
+                            airsonos2_core::PcmQueue::new(44_100, 2, Duration::from_millis(250));
+                        queue.push(airsonos2_core::PcmFrame {
+                            buffered_permit: None,
+                            playback_epoch: epoch,
+                            sample_rate: 44100,
+                            channels: 2,
+                            samples_f32_interleaved: vec![if epoch == 0 { -1.0 } else { 1.0 }; 2],
+                            presentation_time: None,
+                        });
+                        queue
                     },
                 })
                 .await
@@ -1606,7 +1618,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(pcm.as_ref(), &[255, 127, 255, 127]);
+        assert_eq!(pcm.bytes.as_ref(), &[255, 127, 255, 127]);
         assert!(output.try_recv().is_err());
         runtime.shutdown().await;
     }
@@ -1638,6 +1650,7 @@ mod tests {
                 channels: 2,
                 mp3_bitrate_kbps: 192,
                 codec: StreamCodec::Wav,
+                queue_duration: Duration::from_secs(3),
             },
             live,
         )
@@ -1663,7 +1676,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(bytes.len(), 16);
+                assert_eq!(bytes.bytes.len(), 16);
                 hold_stop.send(()).unwrap();
                 break;
             }
@@ -1675,12 +1688,12 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(&header[..4], b"RIFF");
+            assert_eq!(&header.bytes[..4], b"RIFF");
             let pcm = tokio::time::timeout(Duration::from_secs(1), audio.recv())
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(pcm.len(), 16);
+            assert_eq!(pcm.bytes.len(), 16);
         }
         runtime.shutdown().await;
     }
@@ -1691,12 +1704,18 @@ mod tests {
             runtime.handle_event(AirPlayEvent::Pcm {
                 session_id,
                 zone_id,
-                frame: airsonos2_core::PcmFrame {
-                    playback_epoch: 0,
-                    sample_rate: 44_100,
-                    channels: 2,
-                    samples_f32_interleaved: vec![0.25; 8],
-                    presentation_time: None,
+                frames: {
+                    let queue =
+                        airsonos2_core::PcmQueue::new(44_100, 2, Duration::from_millis(250));
+                    queue.push(airsonos2_core::PcmFrame {
+                        buffered_permit: None,
+                        playback_epoch: 0,
+                        sample_rate: 44_100,
+                        channels: 2,
+                        samples_f32_interleaved: vec![0.25; 8],
+                        presentation_time: None,
+                    });
+                    queue
                 },
             }),
         )

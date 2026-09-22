@@ -58,12 +58,14 @@
               pkgs.cargo-nextest
               pkgs.cargo-zigbuild
               pkgs.ffmpeg
+              pkgs.python3
               pkgs.pkg-config
               pkgs.openssl
               pkgs.rust-analyzer
               pkgs.zig
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.nasm
               pkgs.alsa-lib
               pkgs.wayland
               pkgs.libxkbcommon

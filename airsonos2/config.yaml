@@ -73,8 +73,8 @@ schema:
   prebuffer_ms: int(0,)
   startup_wait_ms: int(0,)?
   default_offset_ms: int(-10000,10000)
-  multi_select_window_ms: int(0,)
-  start_deadline_ms: int(0,)
+  multi_select_window_ms: int(0,60000)
+  start_deadline_ms: int(0,60000)
   startup_compensation: bool
   startup_sample_limit: int(1,)
   startup_min_samples: int(1,)

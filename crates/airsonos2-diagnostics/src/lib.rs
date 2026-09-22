@@ -293,8 +293,17 @@ async fn check_listener_ports(ports: PortPlan) -> Vec<DoctorCheck> {
     // Hold successful binds until every listener has been checked. This also catches
     // collisions between our own listeners, including wildcard/specific-IP conflicts.
     let mut listeners = Vec::new();
+    let mut addresses = std::collections::BTreeSet::new();
     let mut checks = Vec::new();
     for (name, addr) in ports {
+        if !addresses.insert(addr) {
+            checks.push(DoctorCheck {
+                name,
+                status: CheckStatus::Fail,
+                detail: format!("{addr} is already planned for another listener"),
+            });
+            continue;
+        }
         let result = TcpListener::bind(addr).await;
         let (status, detail) = match result {
             Ok(listener) => {
@@ -394,14 +403,14 @@ mod tests {
         let addr = occupied.local_addr().expect("address");
         let checks = check_listener_ports(vec![("diagnostics listener".to_owned(), addr)]).await;
         assert_eq!(checks[0].status, CheckStatus::Fail);
-        drop(occupied);
         let checks = check_listener_ports(vec![
             ("stream".to_owned(), addr),
             ("diagnostics".to_owned(), addr),
         ])
         .await;
-        assert_eq!(checks[0].status, CheckStatus::Pass);
+        assert_eq!(checks[0].status, CheckStatus::Fail);
         assert_eq!(checks[1].status, CheckStatus::Fail);
+        assert!(checks[1].detail.contains("already planned"));
     }
 
     #[test]

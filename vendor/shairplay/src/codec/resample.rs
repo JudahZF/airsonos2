@@ -1,6 +1,6 @@
 //! Sample rate conversion and channel mixdown for AirPlay audio.
 
-use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 /// Persistent F32 resampler for streaming audio.
@@ -11,8 +11,8 @@ pub struct StreamResampler {
     chunk_size: usize,
     /// Accumulated input samples (interleaved).
     pending: Vec<f32>,
-    /// Whether the initial delay has been flushed.
-    warmed_up: bool,
+    /// Reused interleaved output workspace; the returned buffer stays caller-owned.
+    scratch: Vec<f32>,
 }
 
 impl StreamResampler {
@@ -31,12 +31,13 @@ impl StreamResampler {
         let ratio = to_rate as f64 / from_rate as f64;
         let chunk_size = 128; // small for low latency
         let resampler = Async::<f32>::new_sinc(ratio, 1.0, &params, chunk_size, channels, FixedAsync::Input).ok()?;
+        let scratch = vec![0.0; resampler.output_frames_max() * channels];
         Some(Self {
             resampler,
             channels,
             chunk_size,
-            pending: Vec::new(),
-            warmed_up: false,
+            pending: Vec::with_capacity(chunk_size * channels * 4),
+            scratch,
         })
     }
 
@@ -45,37 +46,28 @@ impl StreamResampler {
         self.pending.extend_from_slice(interleaved);
 
         let samples_per_chunk = self.chunk_size * self.channels;
-        let mut output = Vec::new();
-
-        while self.pending.len() >= samples_per_chunk {
-            let chunk: Vec<f32> = self.pending.drain(..samples_per_chunk).collect();
-
-            // Deinterleave
-            let mut ch_vecs: Vec<Vec<f32>> = (0..self.channels)
-                .map(|_| Vec::with_capacity(self.chunk_size))
-                .collect();
-            for frame in chunk.chunks_exact(self.channels) {
-                for (ch, &s) in frame.iter().enumerate() {
-                    ch_vecs[ch].push(s);
-                }
+        let chunks = self.pending.len() / samples_per_chunk;
+        let mut output = Vec::with_capacity(chunks * self.scratch.len());
+        let mut consumed = 0;
+        while self.pending.len() - consumed >= samples_per_chunk {
+            let input = InterleavedSlice::new(
+                &self.pending[consumed..consumed + samples_per_chunk],
+                self.channels,
+                self.chunk_size,
+            )
+            .expect("resampler input dimensions");
+            let frames = self.scratch.len() / self.channels;
+            let mut destination = InterleavedSlice::new_mut(&mut self.scratch, self.channels, frames)
+                .expect("resampler output dimensions");
+            if let Ok((_, written)) = self.resampler.process_into_buffer(&input, &mut destination, None) {
+                output.extend_from_slice(&self.scratch[..written * self.channels]);
             }
-
-            let input = match SequentialSliceOfVecs::new(&ch_vecs, self.channels, self.chunk_size) {
-                Ok(i) => i,
-                Err(_) => continue,
-            };
-
-            if let Ok(result) = self.resampler.process(&input, 0, None) {
-                let data = result.take_data();
-                if !data.is_empty() {
-                    if !self.warmed_up {
-                        // Skip initial silence from sinc filter warmup
-                        self.warmed_up = true;
-                    }
-                    output.extend(data);
-                }
-            }
+            consumed += samples_per_chunk;
         }
+        // Move at most one partial chunk once per call, rather than front-draining
+        // and allocating/deinterleaving each complete chunk.
+        self.pending.copy_within(consumed.., 0);
+        self.pending.truncate(self.pending.len() - consumed);
 
         output
     }
@@ -164,5 +156,23 @@ mod channel_tests {
     #[test]
     fn stereo_downmix_has_one_sample_per_frame() {
         assert_eq!(super::mixdown(&[0.25, 0.75, -0.5, 0.5], 2, 1), vec![0.5, 0.0]);
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    #[test]
+    fn scratch_resampling_preserves_channels_across_input_chunk_boundaries() {
+        let input: Vec<f32> = (0..4096).flat_map(|frame| [(frame as f32 * 0.01).sin(), 0.0]).collect();
+        let expected = StreamResampler::new(44100, 48000, 2).unwrap().process(&input);
+        let mut resampler = StreamResampler::new(44100, 48000, 2).unwrap();
+        let mut actual = Vec::new();
+        for chunk in input.chunks(352 * 2) {
+            actual.extend(resampler.process(chunk));
+        }
+        assert_eq!(actual, expected);
+        assert!(actual.chunks_exact(2).all(|frame| frame[1] == 0.0));
+        assert!(actual.chunks_exact(2).any(|frame| frame[0].abs() > 0.1));
     }
 }

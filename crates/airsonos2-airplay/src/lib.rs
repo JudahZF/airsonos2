@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use airsonos2_core::{
-    AirPlayConfig, PcmFrame, SessionId, VirtualAirPlayEndpoint, ZoneId, airplay_db_to_sonos_volume,
+    AirPlayConfig, PcmCredits, PcmFrame, PcmPermit, PcmQueue, SessionId, VirtualAirPlayEndpoint,
+    ZoneId, airplay_db_to_sonos_volume,
 };
 use shairplay::{
     AirPlayMode, AudioFormat, AudioHandler, AudioSession, AudioStopReason, BindConfig,
@@ -29,7 +30,7 @@ pub enum AirPlayEvent {
     Pcm {
         session_id: SessionId,
         zone_id: ZoneId,
-        frame: PcmFrame,
+        frames: PcmQueue,
     },
     PlaybackState {
         session_id: SessionId,
@@ -379,6 +380,17 @@ impl AudioHandler for BridgeAudioHandler {
             stop_notified: false,
             playback_epoch: 0,
             warned_missing_timing: false,
+            buffered_credits: PcmCredits::new(
+                pcm_format.sample_rate,
+                pcm_format.channels,
+                Duration::from_millis(250),
+            ),
+            buffered_progress: 0,
+            pcm: PcmQueue::new(
+                pcm_format.sample_rate,
+                pcm_format.channels,
+                Duration::from_millis(250),
+            ),
         })
     }
 
@@ -446,6 +458,43 @@ struct BridgeAudioSession {
     stop_notified: bool,
     playback_epoch: u64,
     warned_missing_timing: bool,
+    pcm: PcmQueue,
+    buffered_credits: PcmCredits,
+    buffered_progress: usize,
+}
+
+impl BridgeAudioSession {
+    fn emit_pcm(
+        &mut self,
+        samples: &[f32],
+        presentation_time: Option<Instant>,
+        permit: Option<PcmPermit>,
+    ) -> bool {
+        if presentation_time.is_none() && !self.warned_missing_timing {
+            self.warned_missing_timing = true;
+            warn!(session_id = %self.session_id, "source presentation timing unavailable; group playback uses best-effort release without sample alignment");
+        }
+        if samples.len() > self.pcm.max_samples() || self.pcm.is_closed() {
+            return false;
+        }
+        let frame = PcmFrame {
+            buffered_permit: permit,
+            playback_epoch: self.playback_epoch,
+            sample_rate: self.format.sample_rate,
+            channels: self.format.channels,
+            samples_f32_interleaved: samples.to_vec(),
+            presentation_time,
+        };
+        let admission = self.pcm.push(frame);
+        if admission.notify {
+            let _ = self.events.send(AirPlayEvent::Pcm {
+                session_id: self.session_id,
+                zone_id: self.zone_id.clone(),
+                frames: self.pcm.clone(),
+            });
+        }
+        admission.accepted
+    }
 }
 
 impl AudioSession for BridgeAudioSession {
@@ -454,25 +503,51 @@ impl AudioSession for BridgeAudioSession {
     }
 
     fn audio_process_timed(&mut self, samples: &[f32], presentation_time: Option<Instant>) {
-        if presentation_time.is_none() && !self.warned_missing_timing {
-            self.warned_missing_timing = true;
-            warn!(session_id = %self.session_id, "source presentation timing unavailable; group playback uses best-effort release without sample alignment");
+        self.emit_pcm(samples, presentation_time, None);
+    }
+
+    fn audio_process_buffered(
+        &mut self,
+        samples: &[f32],
+        presentation_time: Option<Instant>,
+    ) -> bool {
+        // Partial admission permits unusually large decoded packets without copying
+        // their remainder or replaying an already-admitted prefix on retry.
+        while self.buffered_progress < samples.len() {
+            let end = (self.buffered_progress + self.pcm.max_samples()).min(samples.len());
+            let count = end - self.buffered_progress;
+            let Some(permit) = self.buffered_credits.try_reserve(count) else {
+                return false;
+            };
+            let time = presentation_time.map(|at| {
+                at + Duration::from_secs_f64(
+                    self.buffered_progress as f64
+                        / (f64::from(self.format.sample_rate) * f64::from(self.format.channels)),
+                )
+            });
+            if !self.emit_pcm(&samples[self.buffered_progress..end], time, Some(permit)) {
+                return false;
+            }
+            self.buffered_progress = end;
         }
-        let frame = PcmFrame {
-            playback_epoch: self.playback_epoch,
-            sample_rate: self.format.sample_rate,
-            channels: self.format.channels,
-            samples_f32_interleaved: samples.to_vec(),
-            presentation_time,
-        };
-        let _ = self.events.send(AirPlayEvent::Pcm {
-            session_id: self.session_id,
-            zone_id: self.zone_id.clone(),
-            frame,
-        });
+        self.buffered_progress = 0;
+        true
     }
 
     fn audio_flush(&mut self) {
+        self.buffered_progress = 0;
+        self.buffered_credits = PcmCredits::new(
+            self.format.sample_rate,
+            self.format.channels,
+            Duration::from_millis(250),
+        );
+        self.pcm.close();
+        self.pcm.clear();
+        self.pcm = PcmQueue::new(
+            self.format.sample_rate,
+            self.format.channels,
+            Duration::from_millis(250),
+        );
         self.playback_epoch = self.playback_epoch.saturating_add(1);
         debug!(
             zone_id = %self.zone_id,
@@ -505,6 +580,8 @@ impl AudioSession for BridgeAudioSession {
                 });
             }
             AudioStopReason::Teardown | AudioStopReason::StreamEnded => {
+                self.pcm.close();
+                self.pcm.clear();
                 if let Ok(mut active) = self.active_session.lock()
                     && *active == Some(self.session_id)
                 {
@@ -527,6 +604,8 @@ impl AudioSession for BridgeAudioSession {
 
 impl Drop for BridgeAudioSession {
     fn drop(&mut self) {
+        self.pcm.close();
+        self.pcm.clear();
         if self.stop_notified {
             return;
         }
@@ -601,6 +680,89 @@ mod tests {
     }
 
     #[test]
+    fn buffered_callback_retries_without_copying_when_encoder_holds_credit() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let session_id = SessionId::new();
+        let mut session = BridgeAudioSession {
+            session_id,
+            zone_id: ZoneId::new("test"),
+            format: PcmFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                bits: 32,
+            },
+            events,
+            active_session: Arc::new(Mutex::new(Some(session_id))),
+            stop_notified: false,
+            playback_epoch: 0,
+            warned_missing_timing: false,
+            pcm: PcmQueue::new(48_000, 2, Duration::from_millis(250)),
+            buffered_credits: PcmCredits::new(48_000, 2, Duration::from_millis(250)),
+            buffered_progress: 0,
+        };
+        assert!(session.audio_process_buffered(&[0.25; 24_000], None));
+        let AirPlayEvent::Pcm { frames, .. } = receiver.try_recv().unwrap() else {
+            panic!("PCM")
+        };
+        let in_encoder = frames.pop().unwrap();
+        assert!(frames.pop().is_none());
+        assert!(!session.audio_process_buffered(&[0.5; 960], None));
+        assert_eq!(session.pcm.stats().bytes, 0);
+        assert_eq!(receiver.len(), 0);
+        drop(in_encoder);
+        assert!(session.audio_process_buffered(&[0.5; 960], None));
+        assert_eq!(session.pcm.stats().dropped_frames, 0);
+        assert_eq!(receiver.len(), 1);
+    }
+
+    #[test]
+    fn pcm_notifications_are_bounded_and_flush_does_not_repopulate_old_events() {
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let session_id = SessionId::new();
+        let mut session = BridgeAudioSession {
+            session_id,
+            zone_id: ZoneId::new("test"),
+            format: PcmFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                bits: 32,
+            },
+            events,
+            active_session: Arc::new(Mutex::new(Some(session_id))),
+            stop_notified: false,
+            playback_epoch: 0,
+            warned_missing_timing: false,
+            buffered_credits: PcmCredits::new(48_000, 2, Duration::from_millis(250)),
+            buffered_progress: 0,
+            pcm: PcmQueue::new(48_000, 2, Duration::from_millis(250)),
+        };
+        for _ in 0..100 {
+            session.audio_process(&[0.25; 960]);
+        }
+        assert_eq!(receiver.len(), 1);
+        assert!(session.pcm.stats().duration <= Duration::from_millis(250));
+        session.audio_flush();
+        session.audio_process(&[0.5; 960]);
+        let AirPlayEvent::Pcm { frames: old, .. } = receiver.try_recv().unwrap() else {
+            panic!("old notification")
+        };
+        assert!(old.pop().is_none());
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AirPlayEvent::Flushed {
+                playback_epoch: 1,
+                ..
+            }
+        ));
+        let AirPlayEvent::Pcm { frames: new, .. } = receiver.try_recv().unwrap() else {
+            panic!("new notification")
+        };
+        let frame = new.pop().unwrap();
+        assert_eq!(frame.playback_epoch, 1);
+        assert_eq!(frame.samples_f32_interleaved[0], 0.5);
+    }
+
+    #[test]
     fn audio_stopped_while_paused_keeps_session_alive() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let active_session = Arc::new(Mutex::new(Some(SessionId::new())));
@@ -618,6 +780,9 @@ mod tests {
             stop_notified: false,
             playback_epoch: 0,
             warned_missing_timing: false,
+            buffered_credits: PcmCredits::new(48_000, 2, Duration::from_millis(250)),
+            buffered_progress: 0,
+            pcm: PcmQueue::new(48_000, 2, Duration::from_millis(250)),
         };
 
         session.audio_stopped(AudioStopReason::StreamEndedWhilePaused);
@@ -647,6 +812,9 @@ mod tests {
             stop_notified: false,
             playback_epoch: 0,
             warned_missing_timing: false,
+            buffered_credits: PcmCredits::new(48_000, 2, Duration::from_millis(250)),
+            buffered_progress: 0,
+            pcm: PcmQueue::new(48_000, 2, Duration::from_millis(250)),
         };
 
         session.audio_stopped(AudioStopReason::Teardown);
@@ -676,6 +844,9 @@ mod tests {
             stop_notified: false,
             playback_epoch: 0,
             warned_missing_timing: false,
+            buffered_credits: PcmCredits::new(48_000, 2, Duration::from_millis(250)),
+            buffered_progress: 0,
+            pcm: PcmQueue::new(48_000, 2, Duration::from_millis(250)),
         };
 
         session.audio_flush();
@@ -690,7 +861,8 @@ mod tests {
         ));
         session.audio_process(&[0.5, 0.5]);
         match rx.try_recv().unwrap() {
-            AirPlayEvent::Pcm { frame, .. } => {
+            AirPlayEvent::Pcm { frames, .. } => {
+                let frame = frames.pop().expect("new PCM");
                 assert_eq!(frame.playback_epoch, 1);
                 assert_eq!(frame.presentation_time, None);
             }

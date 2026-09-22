@@ -82,12 +82,14 @@ async fn stream_session(
     }
     let (prelude, subscriber) = stream.attach_subscriber();
     debug!(%session_id, "HTTP stream subscriber attached");
-    let live_stream = BroadcastStream::new(subscriber).filter_map(|message| async {
-        match message {
-            Ok(bytes) => Some(Ok::<Bytes, Infallible>(bytes)),
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => None,
-        }
-    });
+    let live_stream =
+        BroadcastStream::new(subscriber)
+            .take_while(|message| {
+                futures_util::future::ready(message.as_ref().is_ok_and(|chunk| {
+                    chunk.queued_at.elapsed() <= std::time::Duration::from_secs(2)
+                }))
+            })
+            .map(|message| Ok::<Bytes, Infallible>(message.expect("valid live chunk").bytes));
     let prelude_stream = stream::iter(prelude.map(Ok::<Bytes, Infallible>));
     let terminal = stream.clone();
     let guard = SubscriberGuard(stream.clone());
@@ -95,7 +97,9 @@ async fn stream_session(
         .chain(live_stream)
         .take_until(async move { terminal.closed().await })
         .map(move |chunk| {
-            let _ = &guard;
+            if let Ok(bytes) = &chunk {
+                guard.0.record_body_consumed(bytes.len());
+            }
             chunk
         });
 
@@ -239,6 +243,87 @@ mod tests {
             drop(body);
             assert!(!live.timing().subscriber_connected);
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_body_closes_when_bounded_output_queue_overflows() {
+        let registry = StreamRegistry::new();
+        let session_id = SessionId::new();
+        let stream = registry
+            .create(StreamSession {
+                session_id,
+                zone_id: ZoneId::new("test"),
+                codec: StreamCodec::Mp3,
+                generation: 1,
+                local_url: Url::parse("http://localhost/test.mp3").unwrap(),
+                encoder_state: EncoderState::Running,
+            })
+            .await;
+        let response = build_stream_router(registry, PathBuf::from("unused"))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/streams/{session_id}.mp3"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..65 {
+            stream.publish(Bytes::from(vec![1; 16 * 1024]));
+        }
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.is_none());
+        assert_eq!(stream.bytes_served(), 0);
+    }
+
+    #[tokio::test]
+    async fn body_accounting_counts_consumption_and_survives_removal_and_replacement() {
+        let registry = StreamRegistry::new();
+        let session_id = SessionId::new();
+        let session = StreamSession {
+            session_id,
+            zone_id: ZoneId::new("test"),
+            codec: StreamCodec::Mp3,
+            generation: 1,
+            local_url: Url::parse("http://localhost/test.mp3").unwrap(),
+            encoder_state: EncoderState::Running,
+        };
+        let stream = registry.create(session.clone()).await;
+        let response = build_stream_router(registry.clone(), PathBuf::from("unused"))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/streams/{session_id}.mp3"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        stream.publish(Bytes::from_static(b"abc"));
+        assert_eq!(stream.bytes_served(), 0);
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap().len(), 3);
+        assert_eq!(stream.bytes_served(), 3);
+        assert!(
+            registry
+                .metrics_text()
+                .await
+                .contains("airsonos2_http_body_bytes_consumed 3\n")
+        );
+        registry.create(session).await;
+        assert!(
+            registry
+                .metrics_text()
+                .await
+                .contains("airsonos2_http_body_bytes_consumed 3\n")
+        );
+        registry.remove(&session_id).await;
+        assert!(
+            registry
+                .metrics_text()
+                .await
+                .contains("airsonos2_http_body_bytes_consumed 3\n")
+        );
+        assert!(body.next().await.is_none());
     }
 
     #[tokio::test]
