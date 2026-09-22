@@ -50,7 +50,7 @@ stored outside that clone with `CARGO_TARGET_DIR`.
 | --- | --- |
 | Workspace formatting | Passed |
 | Workspace all-target Clippy | Passed |
-| Workspace tests | 116 passed |
+| Workspace tests | 89 passed |
 | Standalone receiver, default features | 73 tests and doctests passed |
 | Standalone receiver, AP2/resample | 151 tests and doctests passed |
 | Standalone receiver, video/HLS | 158 tests and doctests passed |
