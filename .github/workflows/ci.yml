@@ -28,21 +28,54 @@ jobs:
         run: nix develop -c cargo test --workspace --all-features --locked
       - name: Dependency policy
         run: nix develop -c cargo deny --locked check advisories bans licenses sources
+      - name: Process and release-version acceptance
+        run: |
+          nix develop -c cargo build --bin airsonos2 --locked
+          nix develop -c python3 scripts/test-process-lifecycle.py --binary target/debug/airsonos2
+          nix develop -c python3 scripts/test-release-version.py
+
+  images:
+    name: Images (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
       - name: Generic Docker build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: packaging/docker/Dockerfile
-          cache-from: type=gha,scope=generic-amd64
-          cache-to: type=gha,mode=max,scope=generic-amd64
+          tags: airsonos2-check:generic
+          load: true
+          cache-from: type=gha,scope=generic-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=generic-${{ matrix.arch }}
       - name: Home Assistant Docker build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: airsonos2/Dockerfile
-          cache-from: type=gha,scope=home-assistant-amd64
-          cache-to: type=gha,mode=max,scope=home-assistant-amd64
+          tags: airsonos2-check:home-assistant
+          load: true
+          cache-from: |
+            type=gha,scope=generic-${{ matrix.arch }}
+            type=gha,scope=home-assistant-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=home-assistant-${{ matrix.arch }}
+      - name: Smoke-test both native images
+        run: |
+          for image in airsonos2-check:generic airsonos2-check:home-assistant; do
+            docker run --rm --entrypoint /usr/local/bin/airsonos2 "$image" --version
+            docker image inspect --format '{{.Id}} {{.Architecture}}' "$image" >> "$GITHUB_STEP_SUMMARY"
+          done
 
   vendor:
     runs-on: ubuntu-latest
