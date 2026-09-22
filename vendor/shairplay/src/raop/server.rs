@@ -384,7 +384,7 @@ mod controller_acceptance {
     use ed25519_dalek::{Signer, SigningKey};
 
     #[derive(Default)]
-    struct Handler(std::sync::Mutex<Vec<f32>>);
+    struct Handler(std::sync::Mutex<Vec<f32>>, std::sync::Mutex<Vec<bool>>);
     struct Session;
     impl AudioSession for Session {
         fn audio_process(&mut self, _: &[f32]) {}
@@ -392,6 +392,9 @@ mod controller_acceptance {
     impl AudioHandler for Handler {
         fn audio_init(&self, _: AudioFormat) -> Box<dyn AudioSession> {
             Box::new(Session)
+        }
+        fn on_playback_rate(&self, playing: bool) {
+            self.1.lock().unwrap().push(playing);
         }
         fn on_volume(&self, volume: f32) {
             self.0.lock().unwrap().push(volume);
@@ -545,6 +548,16 @@ mod controller_acceptance {
             .playout
             .clone()
             .unwrap();
+        for method in ["TEARDOWN", "SET_PARAMETER", "SETRATEANCHORTIME"] {
+            assert_eq!(
+                request(owner.as_mut(), method, "/stream", "text/parameters", b"volume: -1\r\n").status_code(),
+                409
+            );
+        }
+        assert!(
+            !replacement.is_closed(),
+            "late old-owner commands must not control the replacement"
+        );
         owner.shutdown().await;
         drop(owner);
         assert!(!replacement.is_closed(), "old owner shutdown must not stop replacement");
@@ -561,6 +574,77 @@ mod controller_acceptance {
         );
         control.shutdown().await;
         drop(control);
+        assert!(server.shared.controller_session.lock().unwrap().owner.is_none());
+    }
+    #[tokio::test]
+    async fn saturated_control_queue_rejects_mutation_but_teardown_always_cancels() {
+        use crate::raop::buffered_audio::PlayoutCommand;
+        let handler = Arc::new(Handler::default());
+        let server = RaopServer::builder().pin("1234").build(handler.clone()).unwrap();
+        let key = SigningKey::from_bytes(&[17; 32]);
+        server.shared.pairing_store.put("owner", key.verifying_key().to_bytes());
+        let mut control = server
+            .shared
+            .conn_init("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:8000".parse().unwrap())
+            .unwrap();
+        verify(control.as_mut(), "owner", &key);
+        let (commands, pending) = tokio::sync::mpsc::channel(64);
+        for _ in 0..64 {
+            commands
+                .try_send(PlayoutCommand::SetRate {
+                    anchor_rtp: 0,
+                    anchor_time_ns: 0,
+                    rate: 0,
+                })
+                .unwrap();
+        }
+        let media = tokio::spawn(std::future::pending::<()>());
+        {
+            let mut active = server.shared.controller_session.lock().unwrap();
+            active.owner = Some("owner".into());
+            active.owner_connection = Some("different-media-connection".into());
+            active.playout = Some(commands);
+            active.media_abort = Some(media.abort_handle());
+        }
+        let mut plist = Vec::new();
+        plist::to_writer_binary(
+            &mut plist,
+            &plist::Value::Dictionary(plist::Dictionary::from_iter([
+                ("rate", plist::Value::Integer(1.into())),
+                ("flushFromSeq", plist::Value::Integer(1.into())),
+                ("flushUntilSeq", plist::Value::Integer(10.into())),
+            ])),
+        )
+        .unwrap();
+        for method in ["SETRATEANCHORTIME", "FLUSHBUFFERED"] {
+            assert_eq!(
+                request(
+                    control.as_mut(),
+                    method,
+                    "/stream",
+                    "application/x-apple-binary-plist",
+                    &plist
+                )
+                .status_code(),
+                503
+            );
+        }
+        assert_eq!(pending.len(), 64);
+        assert!(
+            handler.1.lock().unwrap().is_empty(),
+            "failed rate admission must not emit a playback callback"
+        );
+        assert_eq!(
+            request(control.as_mut(), "TEARDOWN", "/stream", "text/parameters", &[]).status_code(),
+            200
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), media)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
         assert!(server.shared.controller_session.lock().unwrap().owner.is_none());
     }
 }

@@ -18,6 +18,8 @@ pub(crate) struct RaopConnection {
     pub tasks: tokio::task::JoinSet<()>,
     pub audio_tasks: tokio::task::JoinSet<()>,
     #[cfg(feature = "ap2")]
+    pub has_owned_audio: bool,
+    #[cfg(feature = "ap2")]
     pub controller_id: Option<String>,
     #[cfg(feature = "ap2")]
     pub controller_session: Arc<std::sync::Mutex<super::connection::ControllerSession>>,
