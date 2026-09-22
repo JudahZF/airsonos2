@@ -271,13 +271,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let registry = StreamRegistry::new();
     let http_addr = SocketAddr::new(config.server.bind, config.server.http_port);
-    let http_task = tokio::spawn(serve_stream_http(
-        http_addr,
-        registry.clone(),
-        config.stream.ffmpeg_path.clone(),
-    ));
-    info!("stream HTTP server listening on {}", http_addr);
-
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
     let endpoints = build_endpoints(&zones, &config)?;
@@ -286,27 +279,66 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let volume_states = load_zone_volume_states(&clients).await;
     let mut runners =
         start_airplay_endpoints(&endpoints, &config, events_tx, &volume_states).await?;
-    let mut runtime =
-        BridgeRuntime::new(config.clone(), registry, clients, volume_states, cleanup_tx);
+    let mut runtime = BridgeRuntime::new(
+        config.clone(),
+        registry.clone(),
+        clients,
+        volume_states,
+        cleanup_tx,
+    );
 
-    tokio::select! {
-        result = runtime.run(events_rx, cleanup_rx) => result?,
-        signal = tokio::signal::ctrl_c() => {
-            signal?;
-            info!("shutdown signal received");
+    let mut http_task = tokio::spawn(serve_stream_http(
+        http_addr,
+        registry.clone(),
+        config.stream.ffmpeg_path.clone(),
+    ));
+    info!("stream HTTP server listening on {}", http_addr);
+
+    let result = tokio::select! {
+        result = runtime.run(events_rx, cleanup_rx) => result,
+        signal = shutdown_signal() => signal,
+        http_result = &mut http_task => {
+            match http_result {
+                Ok(result) => result.map_err(Into::into),
+                Err(error) => Err(error.into()),
+            }
         }
-        http_result = http_task => {
-            let result = http_result?;
-            result?;
-            warn!("stream HTTP server exited");
+    };
+
+    // Stop admission before draining sessions. Errors must pass through cleanup.
+    if !http_task.is_finished() {
+        http_task.abort();
+        let _ = http_task.await;
+    }
+    registry.close_all().await;
+    let cleanup = async {
+        for runner in &mut runners {
+            runner.stop().await;
+        }
+        runtime.shutdown().await;
+    };
+    if tokio::time::timeout(Duration::from_secs(10), cleanup)
+        .await
+        .is_err()
+    {
+        warn!("shutdown exceeded its 10 second deadline; cancelling remaining work");
+    }
+    result
+}
+
+async fn shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal?,
+            _ = terminate.recv() => {},
         }
     }
-
-    runtime.shutdown().await;
-    for runner in &mut runners {
-        runner.stop().await;
-    }
-
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await?;
+    info!("shutdown signal received");
     Ok(())
 }
 
@@ -363,21 +395,36 @@ async fn start_airplay_endpoints(
     events_tx: mpsc::UnboundedSender<AirPlayEvent>,
     volume_states: &HashMap<ZoneId, ZoneVolumeState>,
 ) -> anyhow::Result<Vec<AirPlayEndpointRunner>> {
-    let mut runners = Vec::new();
+    let mut runners: Vec<AirPlayEndpointRunner> = Vec::new();
 
     for endpoint in endpoints {
         let volume_state = volume_states
             .get(&endpoint.zone_id)
             .cloned()
             .unwrap_or_else(|| ZoneVolumeState::new(0.0));
-        let mut runner = AirPlayEndpointRunner::build(
+        let build = AirPlayEndpointRunner::build(
             endpoint,
             &config.airplay,
             config.server.bind,
             events_tx.clone(),
             volume_state,
-        )?;
-        runner.start().await?;
+        );
+        let mut runner = match build {
+            Ok(runner) => runner,
+            Err(error) => {
+                for runner in &mut runners {
+                    runner.stop().await;
+                }
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = runner.start().await {
+            runner.stop().await;
+            for runner in &mut runners {
+                runner.stop().await;
+            }
+            return Err(error.into());
+        }
         info!(
             zone = %endpoint.zone_id,
             name = %endpoint.display_name,
@@ -488,6 +535,7 @@ struct BridgeRuntime {
     cohort_wake_rx: mpsc::UnboundedReceiver<()>,
     sync_cohort: Option<SyncCohort>,
     startup_estimator: StartupDelayEstimator,
+    tasks: tokio::task::JoinSet<()>,
 }
 
 struct SonosStreamPrepare {
@@ -588,6 +636,7 @@ impl BridgeRuntime {
             cohort_wake_rx,
             sync_cohort: None,
             startup_estimator,
+            tasks: tokio::task::JoinSet::new(),
         }
     }
 
@@ -598,6 +647,7 @@ impl BridgeRuntime {
     ) -> anyhow::Result<()> {
         loop {
             tokio::select! {
+                _ = self.tasks.join_next(), if !self.tasks.is_empty() => {},
                 event = events_rx.recv() => {
                     let Some(event) = event else { break };
                     if let Err(error) = self.handle_event(event).await {
@@ -845,7 +895,7 @@ impl BridgeRuntime {
                     let client = client.clone();
                     let volume_state = volume_state.clone();
                     let zone_id = zone_id.clone();
-                    tokio::spawn(async move {
+                    self.tasks.spawn(async move {
                         refresh_zone_volume_state(&zone_id, &client, &volume_state).await;
                     });
                 }
@@ -882,7 +932,7 @@ impl BridgeRuntime {
             local_url: local_url.clone(),
             encoder_state: EncoderState::Starting,
         };
-        let live_stream = self.registry.create(stream_session).await;
+        let live_stream = LiveStream::new(stream_session);
         if stream_codec == StreamCodec::Wav {
             live_stream.arm_playback_anchor_on_next_timed_pcm();
         }
@@ -897,6 +947,7 @@ impl BridgeRuntime {
             live_stream.clone(),
         )?;
 
+        self.registry.insert(live_stream.clone()).await;
         Ok((live_stream, encoder, local_url))
     }
 
@@ -906,9 +957,9 @@ impl BridgeRuntime {
         *generation
     }
 
-    fn schedule_cohort_wake(&self, delay: Duration) {
+    fn schedule_cohort_wake(&mut self, delay: Duration) {
         let tx = self.cohort_wake_tx.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             tokio::time::sleep(delay).await;
             let _ = tx.send(());
         });
@@ -1046,10 +1097,10 @@ impl BridgeRuntime {
         self.apply_sync_anchors(&prepared);
 
         let play_started_at = Instant::now();
-        let mut tasks = Vec::with_capacity(prepared.len());
+        let mut tasks = tokio::task::JoinSet::new();
         for stream in prepared {
             let result_tx = self.downstream_result_tx.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.spawn(async move {
                 info!(session_id = %stream.session_id, zone_id = %stream.zone_id, "starting Sonos playback");
                 let play_start = Instant::now();
                 let mut startup_timing = stream.timing.clone();
@@ -1088,12 +1139,12 @@ impl BridgeRuntime {
                     outcome,
                     timing: Some(startup_timing),
                 });
-            }));
+            });
         }
 
         let mut last_completion = play_started_at;
-        for task in tasks {
-            if let Err(error) = task.await {
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
                 warn!("Sonos play task failed to join: {error}");
             }
             last_completion = Instant::now();
@@ -1325,12 +1376,12 @@ impl BridgeRuntime {
         if let Some(task) = self.playback_tasks.remove(&session_id) {
             task.abort();
         }
+        self.registry.remove(&session_id).await;
         if let Some(encoder) = self.encoders.remove(&session_id)
             && let Err(error) = encoder.shutdown().await
         {
             warn!(%session_id, "encoder shutdown failed during downstream reset: {error}");
         }
-        self.registry.remove(&session_id).await;
 
         let generation = self.next_downstream_generation(session_id);
         let (live_stream, encoder, local_url) = self
@@ -1413,12 +1464,12 @@ impl BridgeRuntime {
     ) -> anyhow::Result<()> {
         let zone_id = self.sessions.remove(&session_id).or(fallback_zone_id);
         self.clear_session_runtime_state(session_id);
+        self.registry.remove(&session_id).await;
         if let Some(encoder) = self.encoders.remove(&session_id)
             && let Err(error) = encoder.shutdown().await
         {
             warn!(%session_id, "encoder shutdown failed: {error}");
         }
-        self.registry.remove(&session_id).await;
 
         if self.config.sonos.stop_on_disconnect
             && let Some(zone_id) = zone_id
@@ -1432,11 +1483,25 @@ impl BridgeRuntime {
     }
 
     async fn shutdown(&mut self) {
-        let session_ids: Vec<_> = self.encoders.keys().copied().collect();
+        self.tasks.shutdown().await;
+        let session_ids: Vec<_> = self.sessions.keys().copied().collect();
         for session_id in session_ids {
             if let Err(error) = self.stop_session(session_id, None).await {
                 error!(%session_id, "failed to stop session during shutdown: {error}");
             }
+        }
+    }
+}
+
+impl Drop for BridgeRuntime {
+    fn drop(&mut self) {
+        for task in self
+            .playback_tasks
+            .values()
+            .chain(self.paused_cleanup_tasks.values())
+            .chain(self.downstream_retry_tasks.values())
+        {
+            task.abort();
         }
     }
 }
@@ -1568,6 +1633,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_encoder_start_does_not_publish_stream() {
+        let mut runtime = runtime();
+        runtime.config.stream.ffmpeg_path = PathBuf::from("/nonexistent/ffmpeg");
+        runtime.config.server.bind = "127.0.0.1".parse().unwrap();
+        let result = runtime
+            .create_downstream_stream(
+                SessionId::new(),
+                ZoneId::new("TEST"),
+                "127.0.0.1".parse().unwrap(),
+                format(),
+                1,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(runtime.registry.is_empty().await);
+    }
+
+    #[tokio::test]
     async fn pause_marks_session_as_needing_downstream_reset() {
         let mut runtime = runtime();
         let session_id = SessionId::new();
@@ -1603,7 +1686,7 @@ mod tests {
         runtime.add_session_to_sync_cohort(first);
         runtime.add_session_to_sync_cohort(second);
 
-        let cohort = runtime.sync_cohort.expect("cohort");
+        let cohort = runtime.sync_cohort.as_ref().expect("cohort");
         assert_eq!(cohort.sessions, vec![first, second]);
     }
 

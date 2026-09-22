@@ -101,12 +101,28 @@ async fn stream_session(
         }
     });
     let prelude_stream = stream::iter(prelude.map(Ok::<Bytes, Infallible>));
-    let body_stream = prelude_stream.chain(live_stream);
+    let terminal = stream.clone();
+    let guard = SubscriberGuard(stream.clone());
+    let body_stream = prelude_stream
+        .chain(live_stream)
+        .take_until(async move { terminal.closed().await })
+        .map(move |chunk| {
+            let _ = &guard;
+            chunk
+        });
 
     Ok(stream_response(
         stream.session.codec,
         Body::from_stream(body_stream),
     ))
+}
+
+struct SubscriberGuard(crate::registry::LiveStream);
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        self.0.detach_subscriber();
+    }
 }
 
 fn stream_generation(query: Option<&str>) -> Result<Option<u64>, StatusCode> {
@@ -145,15 +161,15 @@ async fn test_tone(State(state): State<HttpState>) -> Result<Response<Body>, Sta
         .arg("-b:a")
         .arg("128k")
         .arg("pipe:1")
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let stdout = child.stdout.take().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let stream = ReaderStream::new(stdout);
-
-    tokio::spawn(async move {
-        let _ = child.wait().await;
+    let stream = ReaderStream::new(stdout).map(move |chunk| {
+        let _ = &child;
+        chunk
     });
 
     Ok(stream_response(StreamCodec::Mp3, Body::from_stream(stream)))
@@ -189,6 +205,53 @@ mod tests {
     use http::{Request, StatusCode};
     use tower::ServiceExt;
     use url::Url;
+
+    #[tokio::test]
+    async fn removal_and_replacement_close_attached_bodies() {
+        for replace in [false, true] {
+            let registry = StreamRegistry::new();
+            let session = StreamSession {
+                session_id: SessionId::new(),
+                zone_id: ZoneId::new("TEST"),
+                codec: StreamCodec::Wav,
+                generation: 1,
+                local_url: Url::parse("http://localhost/stream.wav").unwrap(),
+                encoder_state: EncoderState::Running,
+            };
+            let id = session.session_id;
+            let live = registry.create(session.clone()).await;
+            let response = build_stream_router(registry.clone(), PathBuf::from("ffmpeg"))
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/streams/{id}.wav"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut body = response.into_body().into_data_stream();
+            live.publish(Bytes::from_static(b"queued-old-data"));
+            if replace {
+                registry
+                    .create(StreamSession {
+                        generation: 2,
+                        ..session
+                    })
+                    .await;
+            } else {
+                registry.remove(&id).await;
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+                    .await
+                    .expect("body must close")
+                    .is_none()
+            );
+            assert!(live.is_closed());
+            drop(body);
+            assert!(!live.timing().subscriber_connected);
+        }
+    }
 
     #[tokio::test]
     async fn streams_registered_mp3_chunks() {

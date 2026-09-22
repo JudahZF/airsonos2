@@ -30,7 +30,7 @@ pub struct FfmpegEncoderConfig {
 
 #[derive(Debug)]
 pub struct FfmpegEncoder {
-    input: mpsc::Sender<PcmFrame>,
+    input: Option<mpsc::Sender<PcmFrame>>,
     task: tokio::task::JoinHandle<Result<(), EncoderError>>,
 }
 
@@ -65,6 +65,7 @@ impl FfmpegEncoder {
             .arg("-write_xing")
             .arg("0")
             .arg("pipe:1")
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -90,7 +91,8 @@ impl FfmpegEncoder {
         let first_mp3_reader = first_mp3.clone();
 
         let task = tokio::spawn(async move {
-            let writer = tokio::spawn(async move {
+            let terminal = stream.clone();
+            let writer = async move {
                 let mut stdin = stdin;
                 while let Some(frame) = rx.recv().await {
                     if !first_pcm_reader.swap(true, Ordering::Relaxed) {
@@ -105,9 +107,8 @@ impl FfmpegEncoder {
                     stdin.write_all(&bytes).await?;
                 }
                 stdin.shutdown().await
-            });
-
-            let reader = tokio::spawn(async move {
+            };
+            let reader = async move {
                 let mut stdout = stdout;
                 let mut buf = vec![0_u8; 16 * 1024];
                 loop {
@@ -121,35 +122,34 @@ impl FfmpegEncoder {
                     stream.publish(Bytes::copy_from_slice(&buf[..read]));
                 }
                 Ok::<(), std::io::Error>(())
-            });
-
-            let stderr_reader = stderr.map(|mut stderr| {
-                tokio::spawn(async move {
-                    let mut stderr_text = String::new();
-                    let _ = stderr.read_to_string(&mut stderr_text).await;
-                    stderr_text
-                })
-            });
-
-            writer.await??;
-            reader.await??;
-            let status = child.wait().await?;
-
+            };
+            let stderr_reader = async move {
+                match stderr {
+                    Some(stderr) => read_stderr_tail(stderr).await,
+                    None => Ok(String::new()),
+                }
+            };
+            // These futures remain children of this task. Cancellation drops all pipes
+            // and the kill-on-drop process rather than detaching nested tasks.
+            let result = tokio::select! {
+                _ = terminal.closed() => return Ok(()),
+                result = async { tokio::try_join!(writer, reader, stderr_reader, child.wait()) } => result,
+            };
+            let (_, _, stderr, status) = result?;
             if status.success() {
                 Ok(())
             } else {
-                let stderr_text = match stderr_reader {
-                    Some(task) => task.await.unwrap_or_default(),
-                    None => String::new(),
-                };
                 Err(EncoderError::Exited {
                     status: status.code(),
-                    stderr: stderr_text,
+                    stderr,
                 })
             }
         });
 
-        Ok(Self { input, task })
+        Ok(Self {
+            input: Some(input),
+            task,
+        })
     }
 
     fn spawn_wav(config: FfmpegEncoderConfig, stream: LiveStream) -> Self {
@@ -158,7 +158,10 @@ impl FfmpegEncoder {
             let mut sent_header = false;
             let mut first_pcm = false;
 
-            while let Some(frame) = rx.recv().await {
+            while let Some(frame) = tokio::select! {
+                _ = stream.closed() => None,
+                frame = rx.recv() => frame,
+            } {
                 if !first_pcm {
                     first_pcm = true;
                     debug!(
@@ -189,23 +192,56 @@ impl FfmpegEncoder {
             Ok(())
         });
 
-        Self { input, task }
+        Self {
+            input: Some(input),
+            task,
+        }
     }
 
     pub async fn write_frame(&self, frame: PcmFrame) -> Result<(), EncoderError> {
         self.input
+            .as_ref()
+            .ok_or(EncoderError::InputClosed)?
             .send(frame)
             .await
             .map_err(|_| EncoderError::InputClosed)
     }
 
-    pub async fn shutdown(self) -> Result<(), EncoderError> {
-        drop(self.input);
-        let joined = time::timeout(Duration::from_secs(2), self.task)
-            .await
-            .map_err(|_| EncoderError::ShutdownTimeout)?;
-        joined?
+    pub async fn shutdown(mut self) -> Result<(), EncoderError> {
+        self.input.take();
+        match time::timeout(Duration::from_secs(2), &mut self.task).await {
+            Ok(joined) => joined?,
+            Err(_) => {
+                self.task.abort();
+                let _ = (&mut self.task).await;
+                Err(EncoderError::ShutdownTimeout)
+            }
+        }
     }
+}
+
+impl Drop for FfmpegEncoder {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn read_stderr_tail(
+    mut stderr: impl tokio::io::AsyncRead + Unpin,
+) -> std::io::Result<String> {
+    const LIMIT: usize = 16 * 1024;
+    let mut tail = Vec::with_capacity(LIMIT);
+    let mut buffer = [0; 4096];
+    loop {
+        let read = stderr.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let excess = (tail.len() + read).saturating_sub(LIMIT);
+        tail.drain(..excess);
+        tail.extend_from_slice(&buffer[..read]);
+    }
+    Ok(String::from_utf8_lossy(&tail).into_owned())
 }
 
 fn wav_stream_header(sample_rate: u32, channels: u8) -> Vec<u8> {
@@ -250,4 +286,18 @@ pub enum EncoderError {
     Io(#[from] std::io::Error),
     #[error("ffmpeg task failed: {0}")]
     Join(#[from] JoinError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stderr_retains_only_bounded_tail_and_drains_input() {
+        let mut bytes = vec![b'x'; 128 * 1024];
+        bytes.extend_from_slice(b"final error");
+        let tail = read_stderr_tail(bytes.as_slice()).await.unwrap();
+        assert_eq!(tail.len(), 16 * 1024);
+        assert!(tail.ends_with("final error"));
+    }
 }

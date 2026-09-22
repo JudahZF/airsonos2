@@ -15,6 +15,7 @@ use crate::crypto::pairing_homekit::{PairVerifyServer, SrpServer};
 
 /// Per-connection state for RTSP handler dispatch. Equivalent to raop_conn_t.
 pub(crate) struct RaopConnection {
+    pub tasks: tokio::task::JoinSet<()>,
     #[cfg(feature = "ap2")]
     pub controller_id: Option<String>,
     #[cfg(feature = "ap2")]
@@ -57,7 +58,7 @@ pub(crate) struct RaopConnection {
     #[allow(dead_code)] // read in AP2 pair-setup M5 handler
     pub pairing_store: Arc<dyn crate::raop::PairingStore>,
     #[cfg(feature = "ap2")]
-    pub playout_cmd: Option<tokio::sync::mpsc::UnboundedSender<crate::raop::buffered_audio::PlayoutCommand>>,
+    pub playout_cmd: Option<tokio::sync::mpsc::Sender<crate::raop::buffered_audio::PlayoutCommand>>,
     #[allow(dead_code)] // read when resample or ap2 feature enabled
     pub output_sample_rate: Option<u32>,
     #[allow(dead_code)] // read when ap2 feature enabled
