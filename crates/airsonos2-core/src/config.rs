@@ -280,6 +280,24 @@ impl Default for SyncConfig {
     }
 }
 
+impl SyncConfig {
+    /// Retain the common starting sample throughout the configured startup wait and
+    /// normalized room delay. Bounds also keep this safe for programmatic configs.
+    pub fn pcm_queue_duration(&self) -> std::time::Duration {
+        let fallback = self.default_offset_ms.clamp(-10_000, 10_000);
+        let (min, max) =
+            self.zone_offsets_ms
+                .values()
+                .fold((fallback, fallback), |(min, max), offset| {
+                    let offset = (*offset).clamp(-10_000, 10_000);
+                    (min.min(offset), max.max(offset))
+                });
+        std::time::Duration::from_millis(
+            self.start_deadline_ms.min(60_000) + (max - min) as u64 + 250,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

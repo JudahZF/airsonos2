@@ -1,22 +1,19 @@
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use airsonos2_core::PcmFrame;
+use airsonos2_core::{PcmFrame, PcmQueue};
 use bytes::Bytes;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::mpsc;
 use tokio::task::JoinError;
 use tokio::time;
 use tracing::debug;
 
 use airsonos2_core::StreamCodec;
 
-use crate::pcm::f32_pcm_to_s16le_bytes;
+use crate::pcm::{f32_pcm_to_s16le_bytes, write_f32_pcm_to_s16le};
 use crate::registry::LiveStream;
 
 #[derive(Clone, Debug)]
@@ -26,11 +23,12 @@ pub struct FfmpegEncoderConfig {
     pub channels: u8,
     pub mp3_bitrate_kbps: u16,
     pub codec: StreamCodec,
+    pub queue_duration: Duration,
 }
 
 #[derive(Debug)]
 pub struct FfmpegEncoder {
-    input: Option<mpsc::Sender<PcmFrame>>,
+    input: Option<PcmQueue>,
     task: tokio::task::JoinHandle<Result<(), EncoderError>>,
 }
 
@@ -84,22 +82,23 @@ impl FfmpegEncoder {
             .take()
             .ok_or(EncoderError::MissingPipe("stdout"))?;
         let stderr = child.stderr.take();
-        let (input, mut rx) = mpsc::channel::<PcmFrame>(512);
-        let first_pcm = Arc::new(AtomicBool::new(false));
-        let first_mp3 = Arc::new(AtomicBool::new(false));
-        let first_pcm_reader = first_pcm.clone();
-        let first_mp3_reader = first_mp3.clone();
+        let input = PcmQueue::new(config.sample_rate, config.channels, config.queue_duration);
+        stream.set_input_queue(input.clone());
+        let rx = input.clone();
 
         let task = tokio::spawn(async move {
             let terminal = stream.clone();
             let input_stream = stream.clone();
             let writer = async move {
                 let mut stdin = stdin;
+                let mut first_pcm = true;
+                let mut bytes = Vec::new();
                 while let Some(frame) = rx.recv().await {
                     if !input_stream.accepts_epoch(frame.playback_epoch) {
                         continue;
                     }
-                    if !first_pcm_reader.swap(true, Ordering::Relaxed) {
+                    if first_pcm {
+                        first_pcm = false;
                         debug!(
                             sample_rate = frame.sample_rate,
                             channels = frame.channels,
@@ -107,20 +106,22 @@ impl FfmpegEncoder {
                             "first PCM frame written to ffmpeg"
                         );
                     }
-                    let bytes = f32_pcm_to_s16le_bytes(&frame.samples_f32_interleaved);
+                    write_f32_pcm_to_s16le(&frame.samples_f32_interleaved, &mut bytes);
                     stdin.write_all(&bytes).await?;
                 }
                 stdin.shutdown().await
             };
             let reader = async move {
                 let mut stdout = stdout;
+                let mut first_mp3 = true;
                 let mut buf = vec![0_u8; 16 * 1024];
                 loop {
                     let read = stdout.read(&mut buf).await?;
                     if read == 0 {
                         break;
                     }
-                    if !first_mp3_reader.swap(true, Ordering::Relaxed) {
+                    if first_mp3 {
+                        first_mp3 = false;
                         debug!(bytes = read, "first encoded chunk read from ffmpeg");
                     }
                     stream.publish(Bytes::copy_from_slice(&buf[..read]));
@@ -157,7 +158,9 @@ impl FfmpegEncoder {
     }
 
     fn spawn_wav(config: FfmpegEncoderConfig, stream: LiveStream) -> Self {
-        let (input, mut rx) = mpsc::channel::<PcmFrame>(512);
+        let input = PcmQueue::new(config.sample_rate, config.channels, config.queue_duration);
+        stream.set_input_queue(input.clone());
+        let rx = input.clone();
         let task = tokio::spawn(async move {
             stream.publish_prelude(Bytes::from(wav_stream_header(
                 config.sample_rate,
@@ -202,32 +205,22 @@ impl FfmpegEncoder {
         }
     }
 
-    /// A stalled encoder must not suspend other rooms. False means the bounded
-    /// input queue was full and this realtime frame was dropped.
     pub fn try_write_frame(&self, frame: PcmFrame) -> Result<bool, EncoderError> {
-        match self
-            .input
-            .as_ref()
-            .ok_or(EncoderError::InputClosed)?
-            .try_send(frame)
-        {
-            Ok(()) => Ok(true),
-            Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(EncoderError::InputClosed),
+        let input = self.input.as_ref().ok_or(EncoderError::InputClosed)?;
+        if self.task.is_finished() || input.is_closed() {
+            return Err(EncoderError::InputClosed);
         }
+        Ok(input.push(frame).accepted)
     }
 
     pub async fn write_frame(&self, frame: PcmFrame) -> Result<(), EncoderError> {
-        self.input
-            .as_ref()
-            .ok_or(EncoderError::InputClosed)?
-            .send(frame)
-            .await
-            .map_err(|_| EncoderError::InputClosed)
+        self.try_write_frame(frame).map(|_| ())
     }
 
     pub async fn shutdown(mut self) -> Result<(), EncoderError> {
-        self.input.take();
+        if let Some(input) = self.input.take() {
+            input.close();
+        }
         match time::timeout(Duration::from_secs(2), &mut self.task).await {
             Ok(joined) => joined?,
             Err(_) => {
@@ -241,6 +234,10 @@ impl FfmpegEncoder {
 
 impl Drop for FfmpegEncoder {
     fn drop(&mut self) {
+        if let Some(input) = &self.input {
+            input.close();
+            input.clear();
+        }
         self.task.abort();
     }
 }
@@ -330,7 +327,40 @@ mod tests {
             channels: 1,
             mp3_bitrate_kbps: 128,
             codec: StreamCodec::Wav,
+            queue_duration: Duration::from_secs(3),
         }
+    }
+
+    #[tokio::test]
+    async fn configured_delay_preserves_starting_sample_beyond_adapter_budget() {
+        let stream = test_stream();
+        let encoder = FfmpegEncoder::spawn(wav_config(), stream.clone()).unwrap();
+        let (header, mut subscriber) = stream.attach_subscriber();
+        if header.is_none() {
+            assert_eq!(subscriber.recv().await.unwrap().bytes.len(), 44);
+        }
+        let start = std::time::Instant::now();
+        stream.set_playback_plan(start, start + Duration::from_millis(350));
+        for index in 0..10 {
+            encoder
+                .try_write_frame(PcmFrame {
+                    buffered_permit: None,
+                    playback_epoch: 0,
+                    sample_rate: 1000,
+                    channels: 1,
+                    samples_f32_interleaved: vec![if index == 0 { 0.25 } else { 0.5 }; 100],
+                    presentation_time: Some(start + Duration::from_millis(index * 100)),
+                })
+                .unwrap();
+        }
+        let bytes = tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(350));
+        assert_eq!(i16::from_le_bytes([bytes.bytes[0], bytes.bytes[1]]), 8192);
+        stream.close();
+        encoder.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -342,17 +372,18 @@ mod tests {
         let first_encoder = FfmpegEncoder::spawn(wav_config(), first.clone()).unwrap();
         let (header, mut first_rx) = first.attach_subscriber();
         if header.is_none() {
-            assert_eq!(first_rx.recv().await.unwrap().len(), 44);
+            assert_eq!(first_rx.recv().await.unwrap().bytes.len(), 44);
         }
         let second_encoder = FfmpegEncoder::spawn(wav_config(), second.clone()).unwrap();
         let (header, mut second_rx) = second.attach_subscriber();
         if header.is_none() {
-            assert_eq!(second_rx.recv().await.unwrap().len(), 44);
+            assert_eq!(second_rx.recv().await.unwrap().bytes.len(), 44);
         }
         let source_time = std::time::Instant::now();
         for encoder in [&first_encoder, &second_encoder] {
             encoder
                 .write_frame(PcmFrame {
+                    buffered_permit: None,
                     playback_epoch: 0,
                     sample_rate: 1000,
                     channels: 1,
@@ -363,6 +394,7 @@ mod tests {
                 .unwrap();
             encoder
                 .write_frame(PcmFrame {
+                    buffered_permit: None,
                     playback_epoch: 1,
                     sample_rate: 1000,
                     channels: 1,
@@ -388,8 +420,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a.as_ref(), f32_pcm_to_s16le_bytes(&[0.75, 1.0]));
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.bytes.as_ref(), f32_pcm_to_s16le_bytes(&[0.75, 1.0]));
         first_encoder.shutdown().await.unwrap();
         second_encoder.shutdown().await.unwrap();
     }

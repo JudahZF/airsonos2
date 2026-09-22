@@ -898,8 +898,9 @@ impl BridgeRuntime {
                 format,
             } => self.start_session(session_id, zone_id, format).await,
             AirPlayEvent::Pcm {
-                session_id, frame, ..
+                session_id, frames, ..
             } => {
+                while let Some(frame) = frames.pop() {
                 if let Some(session) = self.sessions.get_mut(&session_id)
                     && frame.playback_epoch == session.playback_epoch
                     && let Some(encoder) = &session.encoder
@@ -931,6 +932,7 @@ impl BridgeRuntime {
                             }
                         }
                     }
+                }
                 }
                 Ok(())
             }
@@ -1063,6 +1065,7 @@ impl BridgeRuntime {
                 channels: format.channels,
                 mp3_bitrate_kbps: self.config.stream.mp3_bitrate_kbps,
                 codec: stream_codec,
+                queue_duration: self.config.sync.pcm_queue_duration(),
             },
             live_stream.clone(),
         )?;

@@ -20,3 +20,6 @@ pub use types::{
 pub use volume::{
     airplay_db_to_sonos_volume, airplay_normalized_to_sonos_volume, sonos_volume_to_airplay_db,
 };
+
+pub mod pcm_queue;
+pub use pcm_queue::{PcmCredits, PcmPermit, PcmQueue, PcmQueueStats};
