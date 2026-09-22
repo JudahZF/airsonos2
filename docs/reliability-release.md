@@ -2,7 +2,8 @@
 
 This record separates automated validation from physical playback acceptance.
 The implementation baseline is documented in [reliability-baseline.md](reliability-baseline.md).
-The final integrated source checks below must run before release publication.
+The recorded source checks passed. Native arm64 CI and physical acceptance remain
+separate gates; their status is recorded below.
 
 ## Reproduce from tracked source
 
@@ -41,17 +42,28 @@ software invariants; they do not measure acoustic delivery.
 
 | Item | Result |
 | --- | --- |
-| Tested source revision | Pending final integration |
-| Clean tracked-source checkout | Pending |
-| Workspace format, Clippy, tests | Pending |
-| Receiver default / AP2-resample / video-HLS | Pending |
-| Workspace and receiver dependency policy | Pending |
-| Real daemon repeated SIGTERM and listener failures | Pending |
-| Generic container, Linux amd64 | Pending |
-| Home Assistant container, Linux amd64 | Pending |
+| Tested source revision | `fe135a7a3e9efbdd4763684f9005b062dfc30500` |
+| Clean tracked-source checkout | Passed; no tracked changes or ignored files before or after the gate |
+| Workspace format, Clippy, tests | Passed with the pinned Rust 1.88 Nix shell |
+| Receiver default / AP2-resample / video-HLS | All three passed with `--locked` |
+| Workspace and receiver dependency policy | Advisories, bans, licenses, and sources passed for both manifests |
+| Real daemon repeated SIGTERM and listener failures | Nine scenarios passed across three complete cycles |
+| Generic container, Linux amd64 | Build and binary version smoke test passed |
+| Home Assistant container, Linux amd64 | Build and binary version smoke test passed |
 | Generic container, Linux arm64 | Pending native CI |
 | Home Assistant container, Linux arm64 | Pending native CI |
-| Release tag / Cargo / Home Assistant version consistency | Pending |
+| Release tag / Cargo / Home Assistant version consistency | Gate regression passed; no release tag created or published |
+
+Validation ran on x86_64 Linux on 2026-09-22 from a fresh local clone, using an
+external Cargo build cache. `scripts/check-reliability.sh --packages` exited zero.
+All three idle-session SIGTERM measurements were approximately 1.1 ms to process
+exit; these are local fixture observations, not active-playback or hardware latency.
+Both container smoke tests reported `airsonos2 0.1.0`.
+
+| Local image | Image ID (`linux/amd64`) |
+| --- | --- |
+| `airsonos2-reliability:generic` | `sha256:b66f9637a3dc8a7a2c05b5e4591b739163877494279aa8f4555a3a399fff825a` |
+| `airsonos2-reliability:home-assistant` | `sha256:cf522066074ac27cf937246b8674395933e83c8e10053637d269f729c4b01867` |
 
 Container builds and smoke tests must identify architecture and image digest.
 A host-only build does not validate another architecture. Publication must use

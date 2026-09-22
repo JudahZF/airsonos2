@@ -45,8 +45,11 @@ class FakeSonos(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/xml")
         self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        # Discovery cancels surplus probes and shutdown can close an in-flight
+        # request. A peer closing before our reply is expected in this fixture.
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.end_headers()
+            self.wfile.write(encoded)
 
     def do_GET(self):
         self.reply("<root><device><roomName>Test &amp; Room</roomName>"
