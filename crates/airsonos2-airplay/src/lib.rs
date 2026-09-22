@@ -861,7 +861,8 @@ mod tests {
         ));
         session.audio_process(&[0.5, 0.5]);
         match rx.try_recv().unwrap() {
-            AirPlayEvent::Pcm { frame, .. } => {
+            AirPlayEvent::Pcm { frames, .. } => {
+                let frame = frames.pop().expect("new PCM");
                 assert_eq!(frame.playback_epoch, 1);
                 assert_eq!(frame.presentation_time, None);
             }

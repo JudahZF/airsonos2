@@ -59,6 +59,10 @@ impl StreamRegistry {
         }
     }
 
+    pub fn record_adapter_drops(&self, count: u64) {
+        self.completed_pcm_drops.fetch_add(count, Ordering::Relaxed);
+    }
+
     pub async fn get(&self, session_id: &SessionId) -> Option<LiveStream> {
         self.inner.read().await.get(session_id).cloned()
     }
@@ -129,6 +133,7 @@ impl StreamRegistry {
              airsonos2_pcm_queue_retained_bytes {queue_retained_bytes}\n\
              # TYPE airsonos2_pcm_queue_byte_limit gauge\n\
              airsonos2_pcm_queue_byte_limit {queue_byte_limit}\n\
+             # HELP airsonos2_pcm_queue_dropped_frames PCM frames discarded by adapter or encoder queues, including cancellation.\n\
              # TYPE airsonos2_pcm_queue_dropped_frames counter\n\
              airsonos2_pcm_queue_dropped_frames {queue_drops}\n\
              # HELP airsonos2_pcm_queue_duration_ms Sum of queued PCM duration in milliseconds.\n\

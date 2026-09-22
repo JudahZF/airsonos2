@@ -89,6 +89,13 @@ impl Config {
                 "sync offsets must be in -10000..=10000 milliseconds",
             ));
         }
+        if self.sync.start_deadline_ms > 60_000
+            || self.sync.multi_select_window_ms > self.sync.start_deadline_ms
+        {
+            return Err(invalid(
+                "sync.start_deadline_ms must be at most 60000 and multi_select_window_ms must not exceed it",
+            ));
+        }
         if self.sync.startup_sample_limit == 0
             || self.sync.startup_min_samples == 0
             || self.sync.startup_min_samples > self.sync.startup_sample_limit
@@ -301,6 +308,20 @@ impl SyncConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_startup_budget_matches_validated_deadlines() {
+        assert!(Config::from_toml_str("[sync]\nstart_deadline_ms = 60001").is_err());
+        assert!(
+            Config::from_toml_str("[sync]\nstart_deadline_ms = 100\nmulti_select_window_ms = 101")
+                .is_err()
+        );
+        let config = Config::from_toml_str("[sync]\nstart_deadline_ms = 60000\ndefault_offset_ms = -10000\n[sync.zone_offsets_ms]\nKitchen = 10000").unwrap();
+        assert_eq!(
+            config.sync.pcm_queue_duration(),
+            std::time::Duration::from_millis(80250)
+        );
+    }
 
     #[test]
     fn rejects_offsets_that_can_overflow_runtime_deadlines() {

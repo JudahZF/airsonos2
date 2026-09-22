@@ -24,6 +24,7 @@ struct State {
     samples: usize,
     allocated_bytes: usize,
     dropped: u64,
+    reported_dropped: u64,
     notified: bool,
     closed: bool,
 }
@@ -143,6 +144,15 @@ impl PcmQueue {
         }
     }
 
+    /// Snapshot one control-loop batch and rearm notification before consuming it.
+    /// New arrivals get another event instead of extending this batch indefinitely.
+    pub fn begin_batch(&self) -> usize {
+        let mut state = self.inner.lock().expect("PCM queue lock");
+        self.expire(&mut state, Instant::now());
+        state.notified = false;
+        state.frames.len()
+    }
+
     pub fn pop(&self) -> Option<PcmFrame> {
         self.pop_at(Instant::now())
     }
@@ -193,6 +203,14 @@ impl PcmQueue {
 
     pub fn is_closed(&self) -> bool {
         self.inner.lock().expect("PCM queue lock").closed
+    }
+
+    /// Transfer new adapter discard counts once per coalesced notification.
+    pub fn take_new_drops(&self) -> u64 {
+        let mut state = self.inner.lock().expect("PCM queue lock");
+        let dropped = state.dropped - state.reported_dropped;
+        state.reported_dropped = state.dropped;
+        dropped
     }
 
     pub fn stats(&self) -> PcmQueueStats {
