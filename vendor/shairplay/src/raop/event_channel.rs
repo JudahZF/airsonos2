@@ -83,6 +83,7 @@ impl EventChannel {
                     match result {
                         Ok(0) => { debug!("Event channel closed by client"); break; }
                         Ok(n) => {
+                            if encrypted_buf.len() + n > 8192 { break; }
                             encrypted_buf.extend_from_slice(&buf[..n]);
                             debug!(n, "Event channel data received");
                             match channel.decrypt_ctx.decrypt(&encrypted_buf) {
@@ -92,7 +93,7 @@ impl EventChannel {
                                         debug!(len = plain.len(), "Event channel message received");
                                     }
                                 }
-                                Err(e) => { warn!("Event channel decrypt error: {e}"); }
+                                Err(e) => { warn!("Event channel decrypt error: {e}"); break; }
                             }
                         }
                         Err(e) => { warn!("Event channel read error: {e}"); break; }
@@ -147,5 +148,35 @@ mod tests {
         // Close triggers server exit
         drop(client);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    #[tokio::test]
+    async fn invalid_ciphertext_closes_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(EventChannel::handle_stream(
+            stream,
+            EncryptedChannel::events(&[7; 32]).unwrap(),
+            rx,
+        ));
+        client
+            .write_all(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        task.await.unwrap();
     }
 }

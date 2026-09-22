@@ -77,6 +77,9 @@ impl CipherContext {
 
         while pos + 2 <= ciphertext.len() {
             let block_len = u16::from_le_bytes([ciphertext[pos], ciphertext[pos + 1]]) as usize;
+            if block_len == 0 || block_len > MAX_BLOCK_LEN {
+                return Err(CryptoError::Aes("invalid encrypted block length".into()));
+            }
             let frame_len = 2 + block_len + TAG_LEN;
             if pos + frame_len > ciphertext.len() {
                 break; // Incomplete block

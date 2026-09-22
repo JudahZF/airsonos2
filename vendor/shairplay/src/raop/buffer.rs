@@ -51,30 +51,45 @@ fn seqnum_cmp(s1: u16, s2: u16) -> i16 {
 
 /// Parse the SDP `fmtp` attribute into an ALAC configuration.
 /// Format: `96 <frame_length> <compat_version> <bit_depth> <pb> <mb> <kb> <channels> <max_run> <max_frame_bytes> <avg_bitrate> <sample_rate>`.
-fn parse_fmtp(fmtp: &str) -> Option<AlacConfig> {
-    let vals: Vec<&str> = fmtp.split(' ').collect();
-    if vals.len() < 12 {
+pub(crate) fn parse_fmtp(fmtp: &str) -> Option<AlacConfig> {
+    let vals: Vec<u32> = fmtp
+        .split_ascii_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if vals.len() != 12 {
         return None;
     }
-    let p = |i: usize| vals[i].parse::<u32>().unwrap_or(0);
-    Some(AlacConfig {
-        frame_length: p(1),
-        compatible_version: p(2) as u8,
-        bit_depth: p(3) as u8,
-        pb: p(4) as u8,
-        mb: p(5) as u8,
-        kb: p(6) as u8,
-        num_channels: p(7) as u8,
-        max_run: p(8) as u16,
-        max_frame_bytes: p(9),
-        avg_bit_rate: p(10),
-        sample_rate: p(11),
-    })
+    let config = AlacConfig {
+        frame_length: vals[1],
+        compatible_version: vals[2].try_into().ok()?,
+        bit_depth: vals[3].try_into().ok()?,
+        pb: vals[4].try_into().ok()?,
+        mb: vals[5].try_into().ok()?,
+        kb: vals[6].try_into().ok()?,
+        num_channels: vals[7].try_into().ok()?,
+        max_run: vals[8].try_into().ok()?,
+        max_frame_bytes: vals[9],
+        avg_bit_rate: vals[10],
+        sample_rate: vals[11],
+    };
+    // This decoder supports mono/stereo S16. Reject unsupported precision instead of mislabeling it.
+    if !(1..=4096).contains(&config.frame_length)
+        || config.bit_depth != 16
+        || !(1..=2).contains(&config.num_channels)
+        || !(8000..=192000).contains(&config.sample_rate)
+        || config.compatible_version != 0
+        || config.kb > 31
+        || config.max_frame_bytes > 65536
+    {
+        return None;
+    }
+    Some(config)
 }
 
 /// Build the 48-byte decoder info block expected by `AlacDecoder::set_info`.
 /// Layout matches the ALACSpecificConfig in the Apple ALAC reference decoder.
-fn build_decoder_info(config: &AlacConfig) -> [u8; 48] {
+pub(crate) fn build_decoder_info(config: &AlacConfig) -> [u8; 48] {
     let mut info = [0u8; 48];
     info[24..28].copy_from_slice(&config.frame_length.to_be_bytes());
     info[28] = config.compatible_version;
@@ -121,11 +136,17 @@ impl RaopBuffer {
     ///
     /// `fmtp` is parsed to determine ALAC frame size, channel count, and sample rate.
     /// The ALAC decoder is initialized immediately.
-    pub fn new(_rtpmap: &str, fmtp: &str, aes_key: &[u8; RAOP_AESKEY_LEN], aes_iv: &[u8; RAOP_AESIV_LEN]) -> Self {
-        let config = parse_fmtp(fmtp).expect("invalid fmtp");
+    pub fn new(
+        _rtpmap: &str,
+        fmtp: &str,
+        aes_key: &[u8; RAOP_AESKEY_LEN],
+        aes_iv: &[u8; RAOP_AESIV_LEN],
+    ) -> Option<Self> {
+        let config = parse_fmtp(fmtp)?;
         // ALAC outputs S16LE; we convert to F32 (one f32 per sample).
-        let s16_buffer_size =
-            config.frame_length as usize * config.num_channels as usize * config.bit_depth as usize / 8;
+        let s16_buffer_size = (config.frame_length as usize)
+            .checked_mul(config.num_channels as usize)?
+            .checked_mul(2)?;
         let audio_buffer_size = s16_buffer_size / 2; // num samples
 
         let mut alac = AlacDecoder::new(config.bit_depth as i32, config.num_channels as i32);
@@ -145,7 +166,7 @@ impl RaopBuffer {
             })
             .collect();
 
-        Self {
+        Some(Self {
             aeskey: *aes_key,
             aesiv: *aes_iv,
             alac_config: config,
@@ -155,7 +176,7 @@ impl RaopBuffer {
             last_seqnum: 0,
             entries,
             audio_buffer_size,
-        }
+        })
     }
 
     /// Returns the ALAC configuration parsed from the SDP fmtp attribute.
@@ -320,5 +341,55 @@ impl RaopBuffer {
             self.first_seqnum = next_seq as u16;
             self.last_seqnum = (next_seq as u16).wrapping_sub(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+    #[test]
+    fn malformed_formats_fail_before_allocation() {
+        for fmtp in [
+            "96",
+            "96 4294967295 0 16 40 10 14 2 255 0 0 44100",
+            "96 352 0 16 40 10 14 258 255 0 0 44100",
+            "96 352 0 24 40 10 14 2 255 0 0 44100",
+            "96 352 0 16 40 10 14 2 255 0 0 nope",
+            "96 352 0 16 40 10 14 2 255 0 0 0",
+        ] {
+            assert!(RaopBuffer::new("96 AppleLossless", fmtp, &[0; 16], &[0; 16]).is_none());
+        }
+    }
+    #[test]
+    fn negotiated_alac_decodes_exact_stereo_samples() {
+        let config = parse_fmtp("96 352 0 16 40 10 14 2 255 0 0 44100").unwrap();
+        let mut decoder = AlacDecoder::new(16, 2);
+        decoder.set_info(&build_decoder_info(&config));
+        // ALAC stereo element, explicit 2-frame length, uncompressed samples.
+        let mut bits = Vec::new();
+        let mut write = |value: u32, count: usize| {
+            for bit in (0..count).rev() {
+                bits.push(((value >> bit) & 1) as u8);
+            }
+        };
+        write(1, 3);
+        write(0, 4);
+        write(0, 12);
+        write(1, 1);
+        write(0, 2);
+        write(1, 1);
+        write(2, 32);
+        for value in [1000u16, 2000, 3000, 4000] {
+            write(value as u32, 16);
+        }
+        let mut packet = vec![0u8; bits.len().div_ceil(8)];
+        for (index, bit) in bits.into_iter().enumerate() {
+            packet[index / 8] |= bit << (7 - index % 8);
+        }
+        let samples = decoder.decode_frame_f32(&packet).unwrap();
+        assert_eq!(
+            samples,
+            vec![1000.0 / 32768.0, 2000.0 / 32768.0, 3000.0 / 32768.0, 4000.0 / 32768.0]
+        );
     }
 }

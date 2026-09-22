@@ -244,3 +244,19 @@ LGPL-3.0-or-later
 ## Disclaimer
 
 All resources in this repository are written using only freely available information from the internet. The code and related resources are meant for educational purposes only. It is the responsibility of the user to make sure all local laws are adhered to. Parts of this project are generated with the help of AI and the expert-in-the-loop approach.
+
+
+### Receiver authentication and format limits (AirSonos2 patch)
+
+AP2 control requires completed pairing or pair verification. Separate control
+connections must verify the same persistent controller identity as the active
+stream. Transient pairing authorizes only that connection. Legacy AP1 access is
+disabled unless `.password(...)` configures HTTP Digest credentials. A configured
+AP2 PIN never enables an unauthenticated legacy fallback. Legacy clients must
+support the configured Digest password; AP1-only clients without it will receive
+401. Pairing and capability handshakes remain public.
+
+ALAC is limited to validated S16 mono/stereo, 8–192 kHz, and at most 4096 samples
+per packet. Unsupported precision and AP1 channel conversion are rejected.
+Buffered decoded PCM is limited to two seconds or 8 MiB, whichever is smaller,
+plus one bounded packet being decoded. Paused playback applies TCP backpressure.

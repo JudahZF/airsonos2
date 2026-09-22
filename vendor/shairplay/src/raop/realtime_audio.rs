@@ -23,20 +23,24 @@ pub struct OutputConfig {
     pub sample_rate: Option<u32>,
     /// Maximum output channels, or None to pass through.
     pub max_channels: Option<u8>,
+    /// Validated negotiated ALAC format.
+    pub alac: crate::codec::alac::AlacConfig,
 }
 
 /// Run the realtime audio receiver loop.
 pub async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn AudioHandler>, output_config: OutputConfig) {
     let cipher = ChaCha20Poly1305::new((&shk).into());
     let mut buf = vec![0u8; 4096];
-    let mut decoder: Option<crate::codec::alac::AlacDecoder> = None;
+    let config = &output_config.alac;
+    let mut decoder = crate::codec::alac::AlacDecoder::new(config.bit_depth as i32, config.num_channels as i32);
+    decoder.set_info(&super::buffer::build_decoder_info(config));
+    let src_sr = config.sample_rate;
+    let src_ch = config.num_channels;
+    let out_ch = output_config.max_channels.map(|m| src_ch.min(m)).unwrap_or(src_ch);
+    let target_sr = output_config.sample_rate.unwrap_or(src_sr);
     #[cfg(feature = "resample")]
-    let mut resampler: Option<StreamResampler> = None;
+    let mut resampler = StreamResampler::new(src_sr, target_sr, out_ch as usize);
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
-    #[allow(unused_assignments)]
-    let mut src_sr: u32 = 44100;
-    let mut src_ch: u8 = 2;
-    let mut out_ch: u8 = 2;
 
     info!("Realtime ALAC receiver started");
 
@@ -55,29 +59,6 @@ pub async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn AudioHandler
             continue;
         }
 
-        // Lazy init decoder + session on first packet
-        if session.is_none() {
-            src_sr = 44100;
-            src_ch = 2;
-            let target_sr = output_config.sample_rate.unwrap_or(src_sr);
-            out_ch = output_config.max_channels.map(|m| src_ch.min(m)).unwrap_or(src_ch);
-
-            decoder = Some(crate::codec::alac::AlacDecoder::new(16, src_ch as i32));
-            #[cfg(feature = "resample")]
-            if target_sr != src_sr {
-                resampler = StreamResampler::new(src_sr, target_sr, out_ch as usize);
-            }
-
-            let format = AudioFormat {
-                codec: AudioCodec::Pcm,
-                bits: 32,
-                channels: out_ch,
-                sample_rate: output_config.sample_rate.unwrap_or(src_sr),
-            };
-            info!(?format, "Realtime audio session initialized");
-            session = Some(handler.audio_init(format));
-        }
-
         // Decrypt: nonce from trailing 8 bytes, AAD from RTP header bytes 4..12
         let pkt_len = packet.len();
         let mut nonce = [0u8; 12];
@@ -94,7 +75,7 @@ pub async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn AudioHandler
         };
 
         // Decode ALAC → f32 PCM
-        let Some(mut samples) = decoder.as_mut().and_then(|d| d.decode_frame_f32(&alac_data)) else {
+        let Some(mut samples) = decoder.decode_frame_f32(&alac_data) else {
             continue;
         };
 
@@ -110,6 +91,14 @@ pub async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn AudioHandler
             samples = rs.process(&samples);
         }
 
+        if session.is_none() {
+            session = Some(handler.audio_init(AudioFormat {
+                codec: AudioCodec::Pcm,
+                bits: 32,
+                channels: out_ch,
+                sample_rate: target_sr,
+            }));
+        }
         // Deliver immediately (realtime = no playout buffer)
         if let Some(ref mut sess) = session {
             sess.audio_process(&samples);

@@ -478,7 +478,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if !bind_addrs.is_empty() {
-        eprintln!("🔗 Binding to {:?}", bind_addrs);
+        eprintln!("🔗 Binding to {bind_addrs:?}");
         builder = builder.bind(BindConfig::new().addrs(bind_addrs));
     }
 

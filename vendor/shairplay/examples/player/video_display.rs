@@ -229,7 +229,7 @@ pub fn run_window(frame: Arc<Mutex<FrameBuffer>>) {
             .ok();
             win_w = w;
             win_h = h;
-            eprintln!("📺 Video window: {}x{}", w, h);
+            eprintln!("📺 Video window: {w}x{h}");
         }
 
         if let Some(ref mut win) = window {

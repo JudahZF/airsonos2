@@ -32,8 +32,12 @@ impl RaopConnection {
         event_channel_cipher: crate::crypto::chacha_transport::EncryptedChannel,
         rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     ) {
+        let peer = self.remote_socket.ip();
         tokio::spawn(async move {
             if let Ok((stream, addr)) = event_listener.accept().await {
+                if addr.ip() != peer {
+                    return;
+                }
                 tracing::info!(%addr, "RC event channel client connected");
                 crate::raop::event_channel::EventChannel::handle_stream(stream, event_channel_cipher, rx).await;
             }
@@ -74,6 +78,7 @@ pub(crate) fn handle_pair_setup(
             if ok && srp.is_transient() {
                 conn.ap2_shared_secret = srp.shared_secret().map(|s| s.to_vec());
                 conn.is_ap2 = true;
+                conn.controller_id = Some(format!("transient:{}", conn.nonce));
                 tracing::info!("AP2 transient pair-setup complete");
             }
             Some(m4)
@@ -84,6 +89,7 @@ pub(crate) fn handle_pair_setup(
                 Ok((client_id, client_pk)) => {
                     let m6 = srp.build_m6(&conn.device_id).ok()?;
                     conn.pairing_store.put(&client_id, client_pk);
+                    conn.controller_id = Some(client_id.clone());
                     tracing::info!(client_id, "AP2 normal pair-setup complete, client key stored");
                     conn.ap2_shared_secret = srp.session_key().map(|s| s.to_vec());
                     conn.is_ap2 = true;
@@ -148,6 +154,7 @@ pub(crate) fn handle_pair_verify(
             let store = conn.pairing_store.clone();
             match pv.process_m3_build_m4(data, Some(&|id| store.get(id))) {
                 Ok(m4) => {
+                    conn.controller_id = pv.controller_id.clone();
                     conn.pair_verify_secret = pv.shared_secret().copied();
                     conn.ap2_shared_secret = pv.shared_secret().map(|s| s.to_vec());
                     conn.is_ap2 = true;
@@ -262,10 +269,14 @@ pub(crate) fn handle_setup(
         let mut stream_resp = plist::Dictionary::new();
         stream_resp.insert("type".into(), plist::Value::Integer(stream_type.into()));
 
+        if matches!(stream_type, 96 | 103) {
+            let mut active = conn.controller_session.lock().unwrap();
+            active.owner = conn.controller_id.clone();
+            active.owner_connection = Some(conn.nonce.clone());
+        }
         match stream_type {
             96 => {
                 let sr = stream0.get("sr").and_then(|v| v.as_unsigned_integer()).unwrap_or(44100);
-                #[cfg(feature = "video")]
                 let spf = stream0.get("spf").and_then(|v| v.as_unsigned_integer()).unwrap_or(352);
                 let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
 
@@ -279,7 +290,15 @@ pub(crate) fn handle_setup(
                     let audio_port = socket.local_addr().ok()?.port();
 
                     let handler = conn.handler.clone();
+                    let channels = stream0.get("ch").and_then(|v| v.as_unsigned_integer()).unwrap_or(2);
+                    let bits = stream0.get("ss").and_then(|v| v.as_unsigned_integer()).unwrap_or(16);
+                    let fmtp = format!("96 {spf} 0 {bits} 40 10 14 {channels} 255 0 0 {sr}");
+                    let Some(alac) = super::buffer::parse_fmtp(&fmtp) else {
+                        *response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
+                        return None;
+                    };
                     let output_config = crate::raop::realtime_audio::OutputConfig {
+                        alac,
                         sample_rate: conn.output_sample_rate,
                         max_channels: conn.output_max_channels,
                     };
@@ -301,7 +320,7 @@ pub(crate) fn handle_setup(
                         let aes_key = conn.ekey.unwrap_or([0u8; 16]);
                         let aes_iv = conn.eiv.unwrap_or([0u8; 16]);
                         let fmtp = format!("96 {spf} 0 16 40 10 14 2 255 0 0 {sr}");
-                        conn.raop_rtp = Some(RaopRtp::new(
+                        conn.raop_rtp = RaopRtp::new(
                             conn.handler.clone(),
                             crate::raop::rtp::RtpConfig {
                                 remote: conn.remote_socket.ip().to_string(),
@@ -313,7 +332,7 @@ pub(crate) fn handle_setup(
                                 output_sample_rate: conn.output_sample_rate,
                                 remote_socket: conn.remote_socket,
                             },
-                        ));
+                        );
                         if let Some(rtp) = &mut conn.raop_rtp {
                             let control_port = stream0
                                 .get("controlPort")
@@ -363,6 +382,7 @@ pub(crate) fn handle_setup(
                     port: audio_port,
                 };
                 let cmd_tx = proc.start(shk_arr, output_config, handler);
+                conn.controller_session.lock().unwrap().playout = Some(cmd_tx.clone());
                 conn.playout_cmd = Some(cmd_tx);
 
                 stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
@@ -697,12 +717,7 @@ pub(crate) fn handle_setup(
                 }
 
                 let sender = crate::raop::event_channel::EventSender::from_tx(tx);
-                tokio::spawn(async move {
-                    if let Ok((stream, addr)) = event_listener.accept().await {
-                        tracing::info!(%addr, "Event channel client connected");
-                        crate::raop::event_channel::EventChannel::handle_stream(stream, event_channel_cipher, rx).await;
-                    }
-                });
+                conn.spawn_event_channel(event_listener, event_channel_cipher, rx);
                 sender
             };
             conn.event_sender = Some(event_sender);
