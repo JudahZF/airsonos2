@@ -101,7 +101,7 @@ pub async fn run(socket: UdpSocket, shk: [u8; 32], handler: Arc<dyn AudioHandler
         }
         // Deliver immediately (realtime = no playout buffer)
         if let Some(ref mut sess) = session {
-            sess.audio_process(&samples);
+            sess.audio_process_timed(&samples, None);
         }
     }
 

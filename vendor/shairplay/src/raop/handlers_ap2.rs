@@ -805,7 +805,7 @@ pub(crate) fn handle_set_rate_anchor_time(
 
     // Convert network time to nanoseconds
     let frac_ns = ((net_frac >> 32) * 1_000_000_000) >> 32;
-    let anchor_time_ns = net_secs * 1_000_000_000 + frac_ns;
+    let anchor_time_ns = net_secs.checked_mul(1_000_000_000)?.checked_add(frac_ns)?;
 
     let playing = rate & 1 != 0;
     if playing {

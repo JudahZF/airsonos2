@@ -329,7 +329,7 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
 /// FLUSH: parse RTP-Info header and flush the buffer inline.
 fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
     if let Some(rtp_info) = request.header("RTP-Info")
-        && let Some(seq_str) = rtp_info.strip_prefix("seq=")
+        && let Some(seq_str) = rtp_info.split(';').find_map(|field| field.trim().strip_prefix("seq="))
         && let Ok(next_seq) = seq_str.parse::<i32>()
         && let Some(rtp) = &conn.raop_rtp
     {

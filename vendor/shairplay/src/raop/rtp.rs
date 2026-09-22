@@ -98,6 +98,7 @@ pub struct RtpConfig {
 /// to the receive task via the [`watch`] channel.
 pub struct RaopRtp {
     tasks: tokio::task::JoinSet<()>,
+    flush_wake: Arc<tokio::sync::Notify>,
     handler: Arc<dyn AudioHandler>,
     /// SDP `c=` remote address string (e.g. "192.168.1.5").
     remote: String,
@@ -133,6 +134,7 @@ impl RaopRtp {
         let alac_config = buffer.config().clone();
         Some(Self {
             tasks: tokio::task::JoinSet::new(),
+            flush_wake: Arc::new(tokio::sync::Notify::new()),
             handler: callbacks,
             remote: config.remote,
             local_addr: config.local_addr,
@@ -211,6 +213,7 @@ impl RaopRtp {
 
             let buffer = self.buffer.clone();
             let state = self.state.clone();
+            let flush_wake = self.flush_wake.clone();
             // If control_rport is 0, the iPhone doesn't support retransmits.
             let no_resend = control_rport == 0;
             let _remote_for_task = self.remote.clone();
@@ -241,12 +244,12 @@ impl RaopRtp {
                                             #[cfg(feature = "resample")]
                                             if let Some(ref mut rs) = resampler {
                                                 let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
+                                                session.audio_process_timed(&resampled, None);
                                             } else {
-                                                session.audio_process(samples);
+                                                session.audio_process_timed(samples, None);
                                             }
                                             #[cfg(not(feature = "resample"))]
-                                            session.audio_process(samples);
+                                            session.audio_process_timed(samples, None);
                                         }
                                     }
                                 }
@@ -260,6 +263,7 @@ impl RaopRtp {
                                     if len > 4 { buf.queue(&ctrl_packet[4..len], true); }
                                 }
                         }
+                        _ = flush_wake.notified() => {},
                         _ = shutdown_rx.changed() => break,
                     }
                 }
@@ -295,6 +299,7 @@ impl RaopRtp {
 
             let buffer = self.buffer.clone();
             let state = self.state.clone();
+            let flush_wake = self.flush_wake.clone();
             let _remote_for_tcp = self.remote.clone();
 
             self.tasks.spawn(async move {
@@ -354,18 +359,19 @@ impl RaopRtp {
                                             #[cfg(feature = "resample")]
                                             if let Some(ref mut rs) = resampler {
                                                 let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
+                                                session.audio_process_timed(&resampled, None);
                                             } else {
-                                                session.audio_process(samples);
+                                                session.audio_process_timed(samples, None);
                                             }
                                             #[cfg(not(feature = "resample"))]
-                                            session.audio_process(samples);
+                                            session.audio_process_timed(samples, None);
                                         }
                                 }
                                 drop(buf);
                                 packet_buf.drain(..4 + rtp_len);
                             }
                         }
+                        _ = flush_wake.notified() => {},
                         _ = shutdown_rx.changed() => break,
                     }
                 }
@@ -378,6 +384,7 @@ impl RaopRtp {
     /// Request a buffer flush up to the given sequence number.
     pub fn flush(&self, next_seq: i32) {
         self.state.store(next_seq, std::sync::atomic::Ordering::Release);
+        self.flush_wake.notify_one();
     }
 
     /// Stop and await owned receive and timing tasks.
