@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   pull_request:
   push:
     branches: [main]
@@ -12,14 +13,28 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v16
       - name: Format
-        run: nix develop -c cargo fmt --check
+        run: nix develop -c cargo fmt --all -- --check
       - name: Clippy
-        run: nix develop -c cargo clippy --workspace --all-features -- -D warnings
+        run: nix develop -c cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
       - name: Test
-        run: nix develop -c cargo test --workspace --all-features
+        run: nix develop -c cargo test --workspace --all-features --locked
       - name: Dependency policy
-        run: nix develop -c cargo deny check advisories bans sources
+        run: nix develop -c cargo deny check advisories bans licenses sources
       - name: Docker build
         run: docker build -f packaging/docker/Dockerfile .
       - name: Home Assistant Docker build
         run: docker build -f airsonos2/Dockerfile .
+
+  vendor:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "ap2,resample", "video,hls"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v16
+      - name: Test standalone receiver
+        env:
+          VENDOR_FEATURES: ${{ matrix.features }}
+        run: nix develop -c cargo test --manifest-path vendor/shairplay/Cargo.toml --features "$VENDOR_FEATURES" --locked

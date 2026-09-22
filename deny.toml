@@ -12,3 +12,15 @@ multiple-versions = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "LGPL-3.0-or-later", # Vendored shairplay; retain its source and license notices.
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+]
