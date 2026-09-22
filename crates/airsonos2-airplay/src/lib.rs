@@ -681,7 +681,21 @@ mod tests {
         session.audio_flush();
 
         let event = rx.try_recv().expect("flush event");
-        assert!(matches!(event, AirPlayEvent::Flushed { .. }));
+        assert!(matches!(
+            event,
+            AirPlayEvent::Flushed {
+                playback_epoch: 1,
+                ..
+            }
+        ));
+        session.audio_process(&[0.5, 0.5]);
+        match rx.try_recv().unwrap() {
+            AirPlayEvent::Pcm { frame, .. } => {
+                assert_eq!(frame.playback_epoch, 1);
+                assert_eq!(frame.presentation_time, None);
+            }
+            other => panic!("expected new epoch PCM, got {other:?}"),
+        }
         assert!(rx.try_recv().is_err());
     }
 
