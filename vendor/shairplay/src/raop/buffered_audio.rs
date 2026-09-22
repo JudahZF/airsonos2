@@ -909,6 +909,7 @@ mod buffered_acceptance {
         let half_budget = pcm_budget(48000, 2) / 2;
         let state = Arc::new((
             Mutex::new(PlayoutState {
+                in_flight_samples: 0,
                 buffer: BTreeMap::from([(
                     0,
                     BufferedFrame {
