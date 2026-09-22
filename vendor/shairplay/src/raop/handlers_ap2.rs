@@ -832,19 +832,16 @@ pub(crate) fn handle_set_rate_anchor_time(
         tracing::info!("AP2 play pause");
     }
 
-    if let Some(cmd) = &conn.playout_cmd {
-        if cmd
-            .try_send(crate::raop::buffered_audio::PlayoutCommand::SetRate {
-                anchor_rtp: rtp_time,
-                anchor_time_ns,
-                rate,
-            })
-            .is_err()
-        {
-            *response = HttpResponse::new("RTSP/1.0", 503, "Control Queue Full");
-            response.add_header("Retry-After", "1");
-            return None;
-        }
+    if !super::rtsp::send_playout_command(
+        conn,
+        crate::raop::buffered_audio::PlayoutCommand::SetRate {
+            anchor_rtp: rtp_time,
+            anchor_time_ns,
+            rate,
+        },
+        response,
+    ) {
+        return None;
     }
 
     conn.handler.on_playback_rate(playing);
@@ -888,15 +885,11 @@ pub(crate) fn handle_flush_buffered(
             .and_then(|v| v.as_unsigned_integer())
             .unwrap_or(0) as u32;
         tracing::debug!(from_seq, until_seq, "FLUSHBUFFERED");
-        if let Some(cmd) = &conn.playout_cmd {
-            if cmd
-                .try_send(crate::raop::buffered_audio::PlayoutCommand::Flush { from_seq, until_seq })
-                .is_err()
-            {
-                *response = HttpResponse::new("RTSP/1.0", 503, "Control Queue Full");
-                response.add_header("Retry-After", "1");
-            }
-        }
+        super::rtsp::send_playout_command(
+            conn,
+            crate::raop::buffered_audio::PlayoutCommand::Flush { from_seq, until_seq },
+            response,
+        );
     }
     None
 }

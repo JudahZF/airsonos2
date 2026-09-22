@@ -630,6 +630,16 @@ mod controller_acceptance {
             );
         }
         assert_eq!(pending.len(), 64);
+        drop(pending);
+        let closed = request(
+            control.as_mut(),
+            "FLUSHBUFFERED",
+            "/stream",
+            "application/x-apple-binary-plist",
+            &plist,
+        );
+        assert_eq!(closed.status_code(), 454);
+        assert!(String::from_utf8_lossy(closed.get_data()).contains("CSeq: 1"));
         assert!(
             handler.1.lock().unwrap().is_empty(),
             "failed rate admission must not emit a playback callback"

@@ -272,6 +272,9 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
             return response;
         }
     };
+    if response.status_code() != 200 {
+        response.add_header("CSeq", cseq);
+    }
     response.finish(response_data.as_deref());
     response
 }
@@ -328,6 +331,26 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
     None
 }
 
+#[cfg(feature = "ap2")]
+pub(crate) fn send_playout_command(
+    conn: &RaopConnection,
+    command: super::buffered_audio::PlayoutCommand,
+    response: &mut HttpResponse,
+) -> bool {
+    match conn.playout_cmd.as_ref().map(|sender| sender.try_send(command)) {
+        Some(Ok(())) => true,
+        Some(Err(tokio::sync::mpsc::error::TrySendError::Full(_))) => {
+            *response = HttpResponse::new("RTSP/1.0", 503, "Control Queue Full");
+            response.add_header("Retry-After", "1");
+            false
+        }
+        None | Some(Err(tokio::sync::mpsc::error::TrySendError::Closed(_))) => {
+            *response = HttpResponse::new("RTSP/1.0", 454, "Session Not Found");
+            false
+        }
+    }
+}
+
 /// FLUSH: parse RTP-Info header and flush the buffer inline.
 fn handle_flush_inline(
     conn: &mut RaopConnection,
@@ -343,17 +366,15 @@ fn handle_flush_inline(
             rtp.flush(i32::from(next_seq));
         }
         #[cfg(feature = "ap2")]
-        if let Some(commands) = &conn.playout_cmd {
-            if commands
-                .try_send(super::buffered_audio::PlayoutCommand::Flush {
+        if conn.raop_rtp.is_none() {
+            send_playout_command(
+                conn,
+                super::buffered_audio::PlayoutCommand::Flush {
                     from_seq: 0,
                     until_seq: u32::from(next_seq),
-                })
-                .is_err()
-            {
-                *_response = HttpResponse::new("RTSP/1.0", 503, "Control Queue Full");
-                _response.add_header("Retry-After", "1");
-            }
+                },
+                _response,
+            );
         }
     }
     None
