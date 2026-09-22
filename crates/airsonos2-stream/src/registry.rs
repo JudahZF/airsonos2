@@ -22,18 +22,19 @@ impl StreamRegistry {
 
     pub async fn create(&self, session: StreamSession) -> LiveStream {
         let stream = LiveStream::new(session);
-        self.inner
-            .write()
-            .await
-            .insert(stream.session.session_id, stream.clone());
+        self.insert(stream.clone()).await;
         stream
     }
 
     pub async fn insert(&self, stream: LiveStream) {
-        self.inner
+        if let Some(previous) = self
+            .inner
             .write()
             .await
-            .insert(stream.session.session_id, stream);
+            .insert(stream.session.session_id, stream)
+        {
+            previous.close();
+        }
     }
 
     pub async fn get(&self, session_id: &SessionId) -> Option<LiveStream> {
@@ -41,7 +42,17 @@ impl StreamRegistry {
     }
 
     pub async fn remove(&self, session_id: &SessionId) -> Option<LiveStream> {
-        self.inner.write().await.remove(session_id)
+        let stream = self.inner.write().await.remove(session_id);
+        if let Some(stream) = &stream {
+            stream.close();
+        }
+        stream
+    }
+
+    pub async fn close_all(&self) {
+        for (_, stream) in self.inner.write().await.drain() {
+            stream.close();
+        }
     }
 
     pub async fn len(&self) -> usize {
@@ -121,6 +132,8 @@ pub struct LiveStream {
     subscriber_connected: Arc<AtomicBool>,
     ready: watch::Sender<bool>,
     subscriber: watch::Sender<bool>,
+    closed: watch::Sender<bool>,
+    subscriber_count: Arc<AtomicU64>,
     playback_anchor: Arc<std::sync::Mutex<PlaybackAnchorState>>,
     first_encoded_at: Arc<std::sync::Mutex<Option<Instant>>>,
     first_served_at: Arc<std::sync::Mutex<Option<Instant>>>,
@@ -132,6 +145,7 @@ impl LiveStream {
         let (sender, _) = broadcast::channel(256);
         let (ready, _) = watch::channel(false);
         let (subscriber, _) = watch::channel(false);
+        let (closed, _) = watch::channel(false);
         Self {
             session,
             sender,
@@ -144,6 +158,8 @@ impl LiveStream {
             subscriber_connected: Arc::new(AtomicBool::new(false)),
             ready,
             subscriber,
+            closed,
+            subscriber_count: Arc::new(AtomicU64::new(0)),
             playback_anchor: Arc::new(std::sync::Mutex::new(PlaybackAnchorState::Unset)),
             first_encoded_at: Arc::new(std::sync::Mutex::new(None)),
             first_served_at: Arc::new(std::sync::Mutex::new(None)),
@@ -154,14 +170,14 @@ impl LiveStream {
     /// Publish encoded stream bytes. Before an HTTP subscriber connects, chunks are
     /// dropped so Sonos starts at the live edge instead of replaying startup audio.
     pub fn publish(&self, bytes: Bytes) {
-        if bytes.is_empty() {
+        if bytes.is_empty() || self.is_closed() {
             return;
         }
 
         let len = bytes.len() as u64;
         self.encoded_bytes.fetch_add(len, Ordering::Relaxed);
         self.note_first_encoded(len);
-        let _ = self.ready.send(true);
+        self.ready.send_replace(true);
 
         if !self.subscriber_connected.load(Ordering::Acquire) {
             self.bytes_dropped.fetch_add(len, Ordering::Relaxed);
@@ -181,14 +197,14 @@ impl LiveStream {
         sample_rate: u32,
         channels: u8,
     ) {
-        if bytes.is_empty() {
+        if bytes.is_empty() || self.is_closed() {
             return;
         }
 
         let len = bytes.len() as u64;
         self.encoded_bytes.fetch_add(len, Ordering::Relaxed);
         self.note_first_encoded(len);
-        let _ = self.ready.send(true);
+        self.ready.send_replace(true);
 
         if !self.subscriber_connected.load(Ordering::Acquire) {
             self.bytes_dropped.fetch_add(len, Ordering::Relaxed);
@@ -299,15 +315,17 @@ impl LiveStream {
 
     /// Publish bytes that must prefix every subscriber response, such as a WAV header.
     pub fn publish_prelude(&self, bytes: Bytes) {
-        if bytes.is_empty() {
+        if bytes.is_empty() || self.is_closed() {
             return;
         }
 
         if let Ok(mut prelude) = self.prelude.lock() {
-            *prelude = Some(bytes.clone());
+            if prelude.is_none() {
+                *prelude = Some(bytes.clone());
+                // Attachment holds this same lock across subscribing and reading the header.
+                self.publish(bytes);
+            }
         }
-
-        self.publish(bytes);
     }
 
     /// Called when Sonos (or another client) connects to the HTTP stream.
@@ -324,7 +342,7 @@ impl LiveStream {
         if let Ok(mut at) = self.subscriber_connected_at.lock() {
             *at = Some(now);
         }
-        let _ = self.subscriber.send(true);
+        self.subscriber.send_replace(true);
 
         let timing = self.timing();
         let startup_ms = timing
@@ -341,16 +359,32 @@ impl LiveStream {
     }
 
     pub fn attach_subscriber(&self) -> (Option<Bytes>, broadcast::Receiver<Bytes>) {
+        let prelude = self.prelude.lock().expect("prelude lock poisoned");
         let subscriber = self.sender.subscribe();
-        let prelude = if let Ok(prelude) = self.prelude.lock() {
-            let bytes = prelude.clone();
-            self.on_subscriber_connected();
-            bytes
-        } else {
-            self.on_subscriber_connected();
-            None
-        };
-        (prelude, subscriber)
+        self.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        self.on_subscriber_connected();
+        (prelude.clone(), subscriber)
+    }
+
+    pub(crate) fn detach_subscriber(&self) {
+        let _attachment = self.prelude.lock().expect("prelude lock poisoned");
+        if self.subscriber_count.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.subscriber_connected.store(false, Ordering::Release);
+            self.subscriber.send_replace(false);
+        }
+    }
+
+    pub fn close(&self) {
+        self.closed.send_replace(true);
+    }
+
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
+    pub async fn closed(&self) {
+        let mut closed = self.closed.subscribe();
+        let _ = closed.wait_for(|closed| *closed).await;
     }
 
     pub fn set_playback_anchor(&self, anchor: Instant) {
@@ -389,27 +423,21 @@ impl LiveStream {
 
     /// Waits until the encoder has produced stream data or the timeout elapses.
     pub async fn wait_until_ready(&self, timeout: Duration) -> bool {
-        if *self.ready.borrow() {
-            return true;
-        }
-
-        let mut ready_rx = self.ready.subscribe();
+        let mut ready = self.ready.subscribe();
         tokio::select! {
-            changed = ready_rx.changed() => changed.is_ok() && *ready_rx.borrow(),
-            _ = tokio::time::sleep(timeout) => *self.ready.borrow(),
+            result = ready.wait_for(|ready| *ready) => result.is_ok(),
+            _ = self.closed() => false,
+            _ = tokio::time::sleep(timeout) => false,
         }
     }
 
     /// Waits until an HTTP subscriber connects or the timeout elapses.
     pub async fn wait_for_subscriber(&self, timeout: Duration) -> bool {
-        if *self.subscriber.borrow() {
-            return true;
-        }
-
-        let mut subscriber_rx = self.subscriber.subscribe();
+        let mut subscriber = self.subscriber.subscribe();
         tokio::select! {
-            changed = subscriber_rx.changed() => changed.is_ok() && *subscriber_rx.borrow(),
-            _ = tokio::time::sleep(timeout) => *self.subscriber.borrow(),
+            result = subscriber.wait_for(|connected| *connected) => result.is_ok(),
+            _ = self.closed() => false,
+            _ = tokio::time::sleep(timeout) => false,
         }
     }
 
@@ -467,6 +495,35 @@ mod tests {
             local_url: Url::parse("http://127.0.0.1:7000/streams/test.mp3").expect("url"),
             encoder_state: EncoderState::Starting,
         }
+    }
+
+    #[test]
+    fn concurrent_header_publication_and_attachment_deliver_one_header() {
+        for _ in 0..32 {
+            let stream = LiveStream::new(session());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let publisher = stream.clone();
+            let ready = barrier.clone();
+            let thread = std::thread::spawn(move || {
+                ready.wait();
+                publisher.publish_prelude(Bytes::from_static(b"header"));
+            });
+            barrier.wait();
+            let (prelude, mut receiver) = stream.attach_subscriber();
+            thread.join().unwrap();
+            let headers = usize::from(prelude.is_some()) + usize::from(receiver.try_recv().is_ok());
+            assert_eq!(headers, 1);
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_is_retained_without_watch_receivers() {
+        let stream = LiveStream::new(session());
+        stream.publish(Bytes::from_static(b"ready"));
+        assert!(stream.wait_until_ready(Duration::ZERO).await);
+        let _subscriber = stream.attach_subscriber();
+        assert!(stream.wait_for_subscriber(Duration::ZERO).await);
     }
 
     #[tokio::test]
