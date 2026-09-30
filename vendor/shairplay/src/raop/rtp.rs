@@ -22,7 +22,7 @@ use tracing::info;
 use crate::codec::alac::AlacConfig;
 use crate::error::{NetworkError, ShairplayError};
 use crate::raop::buffer::{RAOP_PACKET_LEN, RaopBuffer};
-use crate::raop::{AudioCodec, AudioFormat, AudioHandler};
+use crate::raop::{AudioCodec, AudioFormat, AudioHandler, AudioSession};
 
 /// Sentinel value for [`RtpState::flush`] indicating no flush is pending.
 const NO_FLUSH: i32 = -42;
@@ -223,21 +223,13 @@ impl RaopRtp {
                 let mut data_packet = [0u8; RAOP_PACKET_LEN];
                 let mut ctrl_packet = [0u8; RAOP_PACKET_LEN];
                 loop {
-                    // Drain flush events only — metadata goes through AudioHandler now.
-                    {
-                        let flush = state.swap(NO_FLUSH, std::sync::atomic::Ordering::AcqRel);
-                        if flush != NO_FLUSH {
-                            buffer.lock().await.flush(flush);
-                            session.audio_flush();
-                        }
-                    }
-
                     tokio::select! {
                         // Data channel: audio RTP packets.
                         result = dsock.recv_from(&mut data_packet) => {
                             if let Ok((len, _)) = result
                                 && len >= 12 {
                                     let mut buf = buffer.lock().await;
+                                    apply_pending_flush(&state, &mut buf, session.as_mut());
                                     buf.queue(&data_packet[..len], true);
                                     while let Some(samples) = buf.dequeue(no_resend) {
                                         {
@@ -263,7 +255,9 @@ impl RaopRtp {
                                     if len > 4 { buf.queue(&ctrl_packet[4..len], true); }
                                 }
                         }
-                        _ = flush_wake.notified() => {},
+                        _ = flush_wake.notified() => {
+                            apply_pending_flush(&state, &mut *buffer.lock().await, session.as_mut());
+                        }
                         _ = shutdown_rx.changed() => break,
                     }
                 }
@@ -320,15 +314,6 @@ impl RaopRtp {
                 let mut read_buf = [0u8; 4096];
 
                 'tcp: loop {
-                    // Drain flush events only — metadata goes through AudioHandler now.
-                    {
-                        let flush = state.swap(NO_FLUSH, std::sync::atomic::Ordering::AcqRel);
-                        if flush != NO_FLUSH {
-                            buffer.lock().await.flush(flush);
-                            session.audio_flush();
-                        }
-                    }
-
                     tokio::select! {
                         result = reader.read(&mut read_buf) => {
                             match result {
@@ -353,6 +338,7 @@ impl RaopRtp {
                                 }
                                 if packet_buf.len() < 4 + rtp_len { break; }
                                 let mut buf = buffer.lock().await;
+                                apply_pending_flush(&state, &mut buf, session.as_mut());
                                 buf.queue(&packet_buf[4..4 + rtp_len], false);
                                 if let Some(samples) = buf.dequeue(true) {
                                     {
@@ -371,7 +357,9 @@ impl RaopRtp {
                                 packet_buf.drain(..4 + rtp_len);
                             }
                         }
-                        _ = flush_wake.notified() => {},
+                        _ = flush_wake.notified() => {
+                            apply_pending_flush(&state, &mut *buffer.lock().await, session.as_mut());
+                        }
                         _ = shutdown_rx.changed() => break,
                     }
                 }
@@ -393,11 +381,24 @@ impl RaopRtp {
         self.tasks.shutdown().await;
     }
 
-    /// Stop the receive task and flush the buffer.
+    /// Stop the receive task and flush the buffer. The flush is applied by the
+    /// next [`start`](Self::start), so a restarted stream never replays old packets.
     pub fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
         self.tasks.abort_all();
+        self.flush(-1);
+    }
+}
+
+/// Apply a FLUSH stored by the RTSP thread. Receive paths call this while
+/// holding the buffer lock before they queue or dequeue, so no PCM released
+/// after a FLUSH is stored can precede its `audio_flush` callback.
+fn apply_pending_flush(state: &std::sync::atomic::AtomicI32, buffer: &mut RaopBuffer, session: &mut dyn AudioSession) {
+    let flush = state.swap(NO_FLUSH, std::sync::atomic::Ordering::AcqRel);
+    if flush != NO_FLUSH {
+        buffer.flush(flush);
+        session.audio_flush();
     }
 }
