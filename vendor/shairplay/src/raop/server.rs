@@ -576,6 +576,69 @@ mod controller_acceptance {
         drop(control);
         assert!(server.shared.controller_session.lock().unwrap().owner.is_none());
     }
+    #[cfg(feature = "video")]
+    #[tokio::test]
+    async fn legacy_rtp_claims_only_after_start_and_is_cancelled_by_replacement() {
+        fn legacy_setup(conn: &mut dyn ConnectionHandler, sample_rate: u64) -> u16 {
+            let stream = plist::Dictionary::from_iter([
+                ("type", plist::Value::Integer(96.into())),
+                ("sr", plist::Value::Integer(sample_rate.into())),
+            ]);
+            let setup = plist::Dictionary::from_iter([(
+                "streams",
+                plist::Value::Array(vec![plist::Value::Dictionary(stream)]),
+            )]);
+            let mut bytes = Vec::new();
+            plist::to_writer_binary(&mut bytes, &plist::Value::Dictionary(setup)).unwrap();
+            request(conn, "SETUP", "/stream", "application/x-apple-binary-plist", &bytes).status_code()
+        }
+        let server = RaopServer::builder()
+            .pin("1234")
+            .build(Arc::new(Handler::default()))
+            .unwrap();
+        let key = SigningKey::from_bytes(&[17; 32]);
+        server.shared.pairing_store.put("owner", key.verifying_key().to_bytes());
+        let connect = || {
+            let mut conn = server
+                .shared
+                .conn_init("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:8000".parse().unwrap())
+                .unwrap();
+            verify(conn.as_mut(), "owner", &key);
+            conn
+        };
+        let active_playout = || {
+            server
+                .shared
+                .controller_session
+                .lock()
+                .unwrap()
+                .playout
+                .clone()
+                .unwrap()
+        };
+        let mut buffered = connect();
+        setup(buffered.as_mut());
+        let original = active_playout();
+
+        let mut legacy = connect();
+        assert_eq!(legacy_setup(legacy.as_mut(), 0), 400);
+        assert!(
+            active_playout().same_channel(&original),
+            "a rejected legacy SETUP must not replace the active stream"
+        );
+
+        assert_eq!(legacy_setup(legacy.as_mut(), 44100), 200);
+        tokio::time::timeout(std::time::Duration::from_secs(1), original.closed())
+            .await
+            .unwrap();
+        let legacy_stream = active_playout();
+
+        let mut replacement = connect();
+        setup(replacement.as_mut());
+        tokio::time::timeout(std::time::Duration::from_secs(1), legacy_stream.closed())
+            .await
+            .unwrap();
+    }
     #[tokio::test]
     async fn inline_flush_keeps_announced_sequence_across_wraparound() {
         use crate::raop::buffered_audio::PlayoutCommand;

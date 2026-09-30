@@ -28,17 +28,16 @@ impl RaopConnection {
     /// Claim the shared session for a new audio stream. Revalidation, cancelling
     /// the previous media, and registering the stream from `start` share one
     /// lock, so concurrent SETUPs cannot both claim a vacant session or leave an
-    /// unregistered pipeline feeding the handler. `start` returns `None` for
-    /// streams without a shared command channel (legacy RTP).
+    /// unregistered pipeline feeding the handler.
     fn claim_audio(
         &mut self,
         response: &mut HttpResponse,
         start: impl FnOnce(
             &mut tokio::task::JoinSet<()>,
-        ) -> Option<(
+        ) -> (
             tokio::sync::mpsc::Sender<crate::raop::buffered_audio::PlayoutCommand>,
             tokio::task::AbortHandle,
-        )>,
+        ),
     ) -> bool {
         let mut active = self.controller_session.lock().unwrap();
         if let Some((code, reason)) = super::rtsp::session_rejection(self, &active) {
@@ -51,12 +50,12 @@ impl RaopConnection {
         if let Some(task) = active.media_abort.take() {
             task.abort();
         }
-        let (playout, media_abort) = start(&mut self.audio_tasks).unzip();
+        let (playout, media_abort) = start(&mut self.audio_tasks);
         active.owner = self.controller_id.clone();
         active.owner_connection = Some(self.nonce.clone());
-        active.media_abort = media_abort;
-        active.playout = playout;
-        self.playout_cmd = active.playout.clone();
+        active.media_abort = Some(media_abort);
+        active.playout = Some(playout.clone());
+        self.playout_cmd = Some(playout);
         true
     }
 
@@ -78,6 +77,26 @@ impl RaopConnection {
             }
         });
     }
+}
+
+/// Drive a legacy RTP stream as registered session media, so replacement and
+/// FLUSH or TEARDOWN from any authorized connection reach it like an AP2
+/// stream. Aborting this task drops `rtp`, which aborts its receive tasks.
+#[cfg(feature = "video")]
+async fn run_legacy_rtp(
+    mut rtp: RaopRtp,
+    mut commands: tokio::sync::mpsc::Receiver<crate::raop::buffered_audio::PlayoutCommand>,
+) {
+    use crate::raop::buffered_audio::PlayoutCommand;
+    while let Some(command) = commands.recv().await {
+        match command {
+            // `until_seq` is the last flushed packet; RTP flush takes the next one to keep.
+            PlayoutCommand::Flush { until_seq, .. } => rtp.flush(i32::from((until_seq as u16).wrapping_add(1))),
+            PlayoutCommand::SetRate { .. } => {}
+            PlayoutCommand::Stop => break,
+        }
+    }
+    rtp.shutdown().await;
 }
 
 #[cfg(feature = "ap2")]
@@ -342,7 +361,7 @@ pub(crate) fn handle_setup(
                             output_config,
                             receiver,
                         ));
-                        Some((commands, task))
+                        (commands, task)
                     });
                     if !claimed {
                         return None;
@@ -358,7 +377,7 @@ pub(crate) fn handle_setup(
                         let aes_key = conn.ekey.unwrap_or([0u8; 16]);
                         let aes_iv = conn.eiv.unwrap_or([0u8; 16]);
                         let fmtp = format!("96 {spf} 0 16 40 10 14 2 255 0 0 {sr}");
-                        let rtp = RaopRtp::new(
+                        let Some(mut rtp) = RaopRtp::new(
                             conn.handler.clone(),
                             crate::raop::rtp::RtpConfig {
                                 remote: conn.remote_socket.ip().to_string(),
@@ -370,20 +389,28 @@ pub(crate) fn handle_setup(
                                 output_sample_rate: conn.output_sample_rate,
                                 remote_socket: conn.remote_socket,
                             },
-                        );
-                        if !conn.claim_audio(response, |_| None) {
+                        ) else {
+                            *response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
+                            return None;
+                        };
+                        let control_port = stream0
+                            .get("controlPort")
+                            .and_then(|v| v.as_unsigned_integer())
+                            .unwrap_or(0) as u16;
+                        // Start before claiming, so a failed SETUP leaves the active stream alone.
+                        let Ok((cport, _tport, dport)) = rtp.start(true, control_port, 0) else {
+                            *response = HttpResponse::new("RTSP/1.0", 500, "Internal Server Error");
+                            return None;
+                        };
+                        let claimed = conn.claim_audio(response, |tasks| {
+                            let (commands, receiver) = tokio::sync::mpsc::channel(64);
+                            (commands, tasks.spawn(run_legacy_rtp(rtp, receiver)))
+                        });
+                        if !claimed {
                             return None;
                         }
-                        conn.raop_rtp = rtp;
-                        if let Some(rtp) = &mut conn.raop_rtp {
-                            let control_port = stream0
-                                .get("controlPort")
-                                .and_then(|v| v.as_unsigned_integer())
-                                .unwrap_or(0) as u16;
-                            let (cport, _tport, dport) = rtp.start(true, control_port, 0).ok()?;
-                            stream_resp.insert("dataPort".into(), plist::Value::Integer(dport.into()));
-                            stream_resp.insert("controlPort".into(), plist::Value::Integer(cport.into()));
-                        }
+                        stream_resp.insert("dataPort".into(), plist::Value::Integer(dport.into()));
+                        stream_resp.insert("controlPort".into(), plist::Value::Integer(cport.into()));
                     } // cfg(feature = "video")
                     #[cfg(not(feature = "video"))]
                     {
@@ -423,9 +450,7 @@ pub(crate) fn handle_setup(
                     listener,
                     port: audio_port,
                 };
-                if !conn.claim_audio(response, |tasks| {
-                    Some(proc.start(shk_arr, output_config, handler, tasks))
-                }) {
+                if !conn.claim_audio(response, |tasks| proc.start(shk_arr, output_config, handler, tasks)) {
                     return None;
                 }
 
