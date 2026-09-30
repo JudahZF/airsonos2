@@ -1421,9 +1421,7 @@ async fn stream_url_for_zone(
     } else {
         None
     };
-    let host = resolve_stream_host(&config.server, inferred_local_ip).map_err(|error| {
-        anyhow::anyhow!("cannot advertise stream to Sonos zone at {zone_ip}: {error}")
-    })?;
+    let host = resolve_stream_host(&config.server, zone_ip, inferred_local_ip)?;
     let extension = match codec {
         StreamCodec::Mp3 => "mp3",
         StreamCodec::Aac => "aac",
@@ -1468,15 +1466,14 @@ fn stream_codec(codec: &str) -> anyhow::Result<StreamCodec> {
     }
 }
 
+/// Picks the stream URL host. `Config::validate` has already rejected advertise
+/// addresses the stream listener cannot accept.
 fn resolve_stream_host(
     server: &ServerConfig,
+    zone_ip: IpAddr,
     inferred_local_ip: Option<IpAddr>,
 ) -> anyhow::Result<IpAddr> {
     if let Some(advertise_addr) = server.advertise_addr {
-        anyhow::ensure!(
-            !advertise_addr.is_unspecified(),
-            "server.advertise_addr must be a specific address reachable by Sonos, got {advertise_addr}"
-        );
         return Ok(advertise_addr);
     }
     if !server.bind.is_unspecified() {
@@ -1484,8 +1481,8 @@ fn resolve_stream_host(
     }
     inferred_local_ip.ok_or_else(|| {
         anyhow::anyhow!(
-            "cannot determine stream URL host: server.bind is unspecified and inferring a local \
-             address for the Sonos zone failed; set server.advertise_addr to this host's LAN IP"
+            "cannot advertise stream to Sonos zone at {zone_ip}: server.bind is unspecified and \
+             no local address routes to the zone; set server.advertise_addr to this host's LAN IP"
         )
     })
 }
@@ -1907,6 +1904,7 @@ mod tests {
     #[tokio::test]
     async fn stream_url_brackets_ipv6_advertise_addr() {
         let mut config = Config::default();
+        config.server.bind = ip("::");
         config.server.advertise_addr = Some(ip("2001:db8::5"));
 
         let url = stream_url_for_zone(
@@ -1928,24 +1926,6 @@ mod tests {
         assert_eq!(url.query(), Some("gen=11"));
     }
 
-    #[tokio::test]
-    async fn stream_url_error_identifies_sonos_zone() {
-        let mut config = Config::default();
-        config.server.advertise_addr = Some(ip("0.0.0.0"));
-
-        let error = stream_url_for_zone(
-            &config,
-            ip("192.0.2.50"),
-            SessionId::new(),
-            StreamCodec::Mp3,
-            1,
-        )
-        .await
-        .expect_err("unspecified advertise address must fail");
-
-        assert!(error.to_string().contains("Sonos zone at 192.0.2.50"));
-    }
-
     #[test]
     fn resolve_stream_host_prefers_explicit_advertise_addr() {
         let server = ServerConfig {
@@ -1954,19 +1934,10 @@ mod tests {
             ..ServerConfig::default()
         };
 
-        let host = resolve_stream_host(&server, Some(ip("192.0.2.1"))).expect("host");
+        let host =
+            resolve_stream_host(&server, ip("192.0.2.50"), Some(ip("192.0.2.1"))).expect("host");
 
         assert_eq!(host, ip("192.0.2.5"));
-    }
-
-    #[test]
-    fn resolve_stream_host_rejects_unspecified_advertise_addr() {
-        let server = ServerConfig {
-            advertise_addr: Some(ip("0.0.0.0")),
-            ..ServerConfig::default()
-        };
-
-        assert!(resolve_stream_host(&server, None).is_err());
     }
 
     #[test]
@@ -1976,7 +1947,7 @@ mod tests {
             ..ServerConfig::default()
         };
 
-        let host = resolve_stream_host(&server, None).expect("host");
+        let host = resolve_stream_host(&server, ip("192.0.2.50"), None).expect("host");
 
         assert_eq!(host, ip("192.0.2.7"));
     }
@@ -1985,7 +1956,8 @@ mod tests {
     fn resolve_stream_host_uses_inferred_local_ip_when_bind_is_unspecified() {
         let server = ServerConfig::default();
 
-        let host = resolve_stream_host(&server, Some(ip("192.0.2.1"))).expect("host");
+        let host =
+            resolve_stream_host(&server, ip("192.0.2.50"), Some(ip("192.0.2.1"))).expect("host");
 
         assert_eq!(host, ip("192.0.2.1"));
     }
@@ -1994,9 +1966,11 @@ mod tests {
     fn resolve_stream_host_fails_when_bind_is_unspecified_and_inference_fails() {
         let server = ServerConfig::default();
 
-        let error = resolve_stream_host(&server, None).expect_err("must fail");
+        let error = resolve_stream_host(&server, ip("192.0.2.50"), None).expect_err("must fail");
 
-        assert!(error.to_string().contains("server.advertise_addr"));
+        let message = error.to_string();
+        assert!(message.contains("Sonos zone at 192.0.2.50"));
+        assert!(message.contains("server.advertise_addr"));
     }
 
     #[test]

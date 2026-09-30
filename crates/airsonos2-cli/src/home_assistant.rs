@@ -283,27 +283,43 @@ mod tests {
 
     #[test]
     fn advertise_addr_is_preserved_in_generated_toml() {
-        let options = HomeAssistantOptions::from_json_str(r#"{"advertise_addr":"2001:db8::20"}"#)
+        let options = HomeAssistantOptions::from_json_str(r#"{"advertise_addr":"192.0.2.20"}"#)
             .expect("options");
 
         let toml = render_config_toml(&options).expect("render");
         let config = Config::from_toml_str(&toml).expect("generated config");
 
-        assert!(toml.contains("advertise_addr = \"2001:db8::20\""));
+        assert!(toml.contains("advertise_addr = \"192.0.2.20\""));
         assert_eq!(
             config.server.advertise_addr,
-            Some("2001:db8::20".parse::<IpAddr>().expect("ipv6"))
+            Some("192.0.2.20".parse::<IpAddr>().expect("ipv4"))
         );
     }
 
     #[test]
-    fn advertise_addr_rejects_invalid_values() {
-        let options = HomeAssistantOptions {
-            advertise_addr: Some("not an ip".to_owned()),
+    fn advertise_addr_must_be_an_ip_the_http_bind_accepts() {
+        for value in ["not an ip", "2001:db8::20"] {
+            let options = HomeAssistantOptions {
+                advertise_addr: Some(value.to_owned()),
+                ..HomeAssistantOptions::default()
+            };
+
+            assert!(options.to_config().is_err(), "{value} must be rejected");
+        }
+
+        let dual_stack = HomeAssistantOptions {
+            http_bind: "::".parse().expect("IP"),
+            advertise_addr: Some("2001:db8::20".to_owned()),
             ..HomeAssistantOptions::default()
         };
-
-        assert!(options.to_config().is_err());
+        assert_eq!(
+            dual_stack
+                .to_config()
+                .expect("config")
+                .server
+                .advertise_addr,
+            Some("2001:db8::20".parse::<IpAddr>().expect("ipv6"))
+        );
     }
 
     #[test]

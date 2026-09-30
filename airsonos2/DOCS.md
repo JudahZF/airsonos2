@@ -21,7 +21,7 @@ ffmpeg_path = "/usr/bin/ffmpeg"
 metrics_addr = "0.0.0.0:9100"
 ```
 
-Set `advertise_addr` to the Home Assistant host address that Sonos should use when pulling audio streams if automatic route-based address detection is unavailable or chooses the wrong interface. Both IPv4 and IPv6 addresses are supported; IPv6 stream URLs are rendered with the required brackets.
+Set `advertise_addr` to the Home Assistant host address that Sonos should use when pulling audio streams if automatic route-based address detection is unavailable or chooses the wrong interface. The stream listener binds `http_bind`, so the address must use the same family: the default `0.0.0.0` needs an IPv4 address, and an IPv6 address needs `http_bind: "::"`.
 
 ```yaml
 advertise_addr: 192.168.1.10

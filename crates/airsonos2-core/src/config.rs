@@ -1,5 +1,5 @@
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,22 @@ impl Config {
             return Err(invalid(
                 "diagnostics.metrics_addr port must be in 1..=65535",
             ));
+        }
+        if let Some(advertise_addr) = self.server.advertise_addr {
+            if advertise_addr.is_unspecified() {
+                return Err(invalid(
+                    "server.advertise_addr must be a specific address reachable by Sonos",
+                ));
+            }
+            // The stream listener binds `server.bind`; only `::` accepts both families.
+            let bind = self.server.bind;
+            if advertise_addr.is_ipv4() != bind.is_ipv4() && bind != Ipv6Addr::UNSPECIFIED {
+                return Err(ConfigError::Invalid(format!(
+                    "server.advertise_addr {advertise_addr} is unreachable because the stream \
+                     listener binds {bind}; set server.bind to an address of the same family \
+                     (\"::\" for IPv6)"
+                )));
+            }
         }
         if self.server.state_dir.as_os_str().is_empty() {
             return Err(invalid("server.state_dir must not be empty"));
@@ -115,6 +131,7 @@ pub struct ServerConfig {
     pub bind: IpAddr,
     /// Explicit IP address advertised to Sonos in stream URLs. Required when
     /// `bind` is unspecified (0.0.0.0/[::]) and the local address cannot be inferred.
+    /// Must match the address family of `bind` unless `bind` is `::`.
     pub advertise_addr: Option<IpAddr>,
     pub http_port: u16,
     pub state_dir: PathBuf,
@@ -385,6 +402,17 @@ mod tests {
             config.server.advertise_addr,
             Some("192.0.2.20".parse::<IpAddr>().expect("ipv4"))
         );
+    }
+
+    #[test]
+    fn server_advertise_addr_must_be_reachable_through_the_stream_listener() {
+        let config = |toml: &str| Config::from_toml_str(&format!("[server]\n{toml}"));
+
+        assert!(config(r#"advertise_addr = "0.0.0.0""#).is_err());
+        let error = config(r#"advertise_addr = "2001:db8::5""#).expect_err("IPv4-only listener");
+        assert!(error.to_string().contains("binds 0.0.0.0"));
+        assert!(config("bind = \"::\"\nadvertise_addr = \"192.0.2.5\"").is_ok());
+        assert!(config("bind = \"::\"\nadvertise_addr = \"2001:db8::5\"").is_ok());
     }
 
     #[test]
