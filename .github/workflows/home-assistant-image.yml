@@ -24,25 +24,17 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Test release version gate
+        run: python3 scripts/test-release-version.py
       - name: Resolve version
         id: version
         shell: bash
         env:
           RAW_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.event.release.tag_name }}
         run: |
-          version="${RAW_VERSION#v}"
-          config_version="$(sed -n 's/^version: "\(.*\)"$/\1/p' airsonos2/config.yaml)"
-
-          if [[ -z "${version}" ]]; then
-            echo "::error::Version is empty"
-            exit 1
-          fi
-
-          if [[ "${version}" != "${config_version}" ]]; then
-            echo "::error::Version ${version} does not match airsonos2/config.yaml ${config_version}"
-            exit 1
-          fi
-
+          version="$(python3 scripts/check-release-version.py "${RAW_VERSION}")"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
       - name: Get build matrix
         id: matrix
@@ -52,9 +44,14 @@ jobs:
           image-name: ${{ env.IMAGE_NAME }}
           registry-prefix: ${{ env.REGISTRY_PREFIX }}
 
+  checks:
+    name: Validate release commit
+    needs: init
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build ${{ matrix.arch }} image
-    needs: init
+    needs: [init, checks]
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read

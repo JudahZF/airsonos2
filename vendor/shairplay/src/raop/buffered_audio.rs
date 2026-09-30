@@ -45,27 +45,68 @@ pub enum PlayoutCommand {
         /// Playback rate (1 = playing, 0 = paused).
         rate: u32,
     },
-    /// Flush buffered frames in the given RTP timestamp range.
+    /// Flush buffered packets in the inclusive RTP sequence range.
     Flush {
-        /// First timestamp to flush.
+        /// First 16-bit sequence to flush.
         from_seq: u32,
-        /// Last timestamp to flush.
+        /// Last 16-bit sequence to flush.
         until_seq: u32,
     },
     /// Stop playback and tear down.
     Stop,
 }
 
+struct BufferedFrame {
+    sequence: u16,
+    samples: Vec<f32>,
+}
+
 struct PlayoutState {
-    buffer: BTreeMap<u32, Vec<f32>>, // rtp_timestamp → F32 PCM samples
+    buffer: BTreeMap<u32, BufferedFrame>, // source RTP timestamp → decoded packet
+    epoch: u64,
+    in_flight_samples: usize,
+    flush_range: Option<(u16, u16)>,
     anchor_rtp: u32,
-    anchor_local_ns: u64,
+    anchor_local: std::time::Instant,
     rate: u32,
     sample_rate: u32,
+    source_sample_rate: u32,
     channels: u8,
     stopped: bool,
     stop_reason: Option<AudioStopReason>,
     format_changed: bool,
+}
+
+fn sequence_in_range(sequence: u16, from: u16, until: u16) -> bool {
+    sequence.wrapping_sub(from) <= until.wrapping_sub(from)
+}
+
+impl PlayoutState {
+    fn flush(&mut self, from: u16, until: u16) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.flush_range = Some((from, until));
+        self.buffer
+            .retain(|_, frame| !sequence_in_range(frame.sequence, from, until));
+    }
+}
+
+struct StopOnDrop {
+    state: Arc<(Mutex<PlayoutState>, Condvar)>,
+    delivery: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        state.stopped = true;
+        state.buffer.clear();
+        state.stop_reason.get_or_insert(AudioStopReason::Teardown);
+        wake.notify_all();
+        drop(state);
+        if let Some(delivery) = self.delivery.take() {
+            let _ = delivery.join();
+        }
+    }
 }
 
 /// TCP listener for buffered audio. Binds a port and spawns the processing pipeline.
@@ -90,17 +131,22 @@ impl BufferedAudioProcessor {
         shk: [u8; 32],
         output_config: OutputConfig,
         handler: Arc<dyn AudioHandler>,
-    ) -> tokio::sync::mpsc::UnboundedSender<PlayoutCommand> {
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        tasks: &mut tokio::task::JoinSet<()>,
+    ) -> (tokio::sync::mpsc::Sender<PlayoutCommand>, tokio::task::AbortHandle) {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
         let default_sr = output_config.sample_rate.unwrap_or(44100);
 
         let state = Arc::new((
             Mutex::new(PlayoutState {
                 buffer: BTreeMap::new(),
+                epoch: 0,
+                in_flight_samples: 0,
+                flush_range: None,
                 anchor_rtp: 0,
-                anchor_local_ns: 0,
+                anchor_local: std::time::Instant::now(),
                 rate: 0,
                 sample_rate: default_sr,
+                source_sample_rate: 44100,
                 channels: 2,
                 stopped: false,
                 stop_reason: None,
@@ -113,15 +159,40 @@ impl BufferedAudioProcessor {
         let state2 = state.clone();
         let handler2 = handler.clone();
         let output_config2 = output_config.clone();
-        std::thread::spawn(move || {
+        let delivery = std::thread::spawn(move || {
             delivery_loop(state2, handler2, output_config2);
+        });
+
+        // Receiver task
+        let state4 = state.clone();
+
+        let mut children = tokio::task::JoinSet::new();
+        children.spawn(async move {
+            let (stream, addr) = match self.listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Buffered audio accept failed: {e}");
+                    return;
+                }
+            };
+            info!(%addr, "Buffered audio client connected");
+            receive_loop(stream, &shk, output_config, state4).await;
         });
 
         // Command handler
         let state3 = state.clone();
         let mut cmd_rx = cmd_rx;
-        tokio::spawn(async move {
-            while let Some(cmd) = cmd_rx.recv().await {
+        let cleanup = StopOnDrop {
+            state: state.clone(),
+            delivery: Some(delivery),
+        };
+        let task = tasks.spawn(async move {
+            let cleanup = cleanup;
+            loop {
+                let cmd = tokio::select! {
+                    cmd = cmd_rx.recv() => match cmd { Some(cmd) => cmd, None => break },
+                    _ = children.join_next() => break,
+                };
                 let (lock, cvar) = &*state3;
                 let mut s = lock.lock().unwrap();
                 match cmd {
@@ -138,11 +209,12 @@ impl BufferedAudioProcessor {
                         } else {
                             // Set anchor so the earliest buffered frame is deliverable
                             // with a small lead time for smooth playback
-                            if let Some(&first_ts) = s.buffer.keys().next() {
-                                let lead_frames = s.sample_rate / 10; // 100ms lead
+                            if let Some(&first_ts) = s.buffer.keys().min_by_key(|ts| ts.wrapping_sub(anchor_rtp) as i32)
+                            {
+                                let lead_frames = s.source_sample_rate / 10; // 100ms lead
                                 s.anchor_rtp = first_ts.wrapping_sub(lead_frames);
                             }
-                            s.anchor_local_ns = now_ns();
+                            s.anchor_local = std::time::Instant::now();
                             let stale: Vec<u32> = s
                                 .buffer
                                 .keys()
@@ -162,16 +234,8 @@ impl BufferedAudioProcessor {
                         cvar.notify_all();
                     }
                     PlayoutCommand::Flush { from_seq, until_seq } => {
-                        let keys: Vec<u32> = s
-                            .buffer
-                            .keys()
-                            .filter(|&&ts| ts >= from_seq && ts <= until_seq)
-                            .copied()
-                            .collect();
-                        for k in &keys {
-                            s.buffer.remove(k);
-                        }
-                        debug!(flushed = keys.len(), "Flushed");
+                        s.flush(from_seq as u16, until_seq as u16);
+                        cvar.notify_all();
                     }
                     PlayoutCommand::Stop => {
                         s.stop_reason = Some(AudioStopReason::Teardown);
@@ -182,24 +246,12 @@ impl BufferedAudioProcessor {
                     }
                 }
             }
+            drop(cleanup);
+            children.abort_all();
+            while children.join_next().await.is_some() {}
         });
 
-        // Receiver task
-        let state4 = state.clone();
-
-        tokio::spawn(async move {
-            let (stream, addr) = match self.listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Buffered audio accept failed: {e}");
-                    return;
-                }
-            };
-            info!(%addr, "Buffered audio client connected");
-            receive_loop(stream, &shk, output_config, state4).await;
-        });
-
-        cmd_tx
+        (cmd_tx, task)
     }
 }
 
@@ -219,8 +271,28 @@ async fn receive_loop(
     let mut stream_resampler: Option<crate::codec::resample::StreamResampler> = None;
     let mut source_channels: u8 = 2;
     let mut output_channels: u8 = 2;
+    let mut decode_epoch = 0;
 
-    loop {
+    'receive: loop {
+        // Stop reading TCP at two seconds or 8 MiB of decoded PCM, whichever is
+        // smaller. One bounded decoded packet may wait outside the queue.
+        loop {
+            let full = {
+                let s = state.0.lock().unwrap();
+                if s.stopped {
+                    return;
+                }
+                let queued: usize =
+                    s.buffer.values().map(|frame| frame.samples.len()).sum::<usize>() + s.in_flight_samples;
+                queued >= pcm_budget(s.sample_rate, s.channels) / 2
+            };
+            if !full {
+                break;
+            }
+            if peer_closed_while_waiting(&stream).await {
+                break 'receive;
+            }
+        }
         if stream.read_exact(&mut len_buf).await.is_err() {
             break;
         }
@@ -237,12 +309,67 @@ async fn receive_loop(
             continue;
         }
 
+        let sequence = u16::from_be_bytes([packet[2], packet[3]]);
         let timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
         let ssrc_val = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
         let ssrc = AudioSsrc::from_u32(ssrc_val);
 
+        // Decrypt
+        let pkt_len = packet.len();
+        let mut nonce = [0u8; 12];
+        nonce[4..12].copy_from_slice(&packet[pkt_len - NONCE_TRAIL_LEN..]);
+        let aad = packet[4..12].to_vec();
+        let ciphertext = &packet[RTP_HEADER_LEN..pkt_len - NONCE_TRAIL_LEN];
+
+        let plaintext = match cipher.decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        ) {
+            Ok(p) => p,
+            Err(_) => {
+                debug!("Audio decrypt failed");
+                continue;
+            }
+        };
+
+        let packet_epoch = {
+            let mut s = state.0.lock().unwrap();
+            if s.stopped {
+                return;
+            }
+            if s.flush_range
+                .is_some_and(|(from, until)| sequence_in_range(sequence, from, until))
+            {
+                continue;
+            }
+            // The old interval is no longer relevant once the sender advances;
+            // retaining a 16-bit sequence filter forever would drop audio each wrap.
+            if s.flush_range
+                .is_some_and(|(_, until)| sequence.wrapping_sub(until) as i16 > 0)
+            {
+                s.flush_range = None;
+            }
+            s.epoch
+        };
+        if packet_epoch != decode_epoch {
+            decode_epoch = packet_epoch;
+            if current_ssrc != AudioSsrc::None {
+                let source_rate = current_ssrc.sample_rate();
+                decoder = AacDecoder::new(source_rate, source_channels).ok();
+                stream_resampler = crate::codec::resample::StreamResampler::new(
+                    source_rate,
+                    output_config.sample_rate.unwrap_or(source_rate),
+                    output_channels as usize,
+                );
+            }
+        }
+
         // Detect format change
         if ssrc != AudioSsrc::None && ssrc != current_ssrc {
+            let switched = current_ssrc != AudioSsrc::None;
             current_ssrc = ssrc;
             let src_sr = ssrc.sample_rate();
             let src_ch = ssrc.channels();
@@ -267,32 +394,21 @@ async fn receive_loop(
             // Signal format change to delivery thread
             let (lock, cvar) = &*state;
             let mut s = lock.lock().unwrap();
+            // On a switch during playback, advance the playout clock at the old
+            // rate first, so the new rate only applies to time after the switch.
+            // The first detection has no old rate, and SetRate re-anchors on resume.
+            if switched && s.rate != 0 {
+                let now = std::time::Instant::now();
+                let elapsed = source_frames(now.saturating_duration_since(s.anchor_local), s.source_sample_rate);
+                s.anchor_rtp = s.anchor_rtp.wrapping_add(elapsed);
+                s.anchor_local = now;
+            }
             s.sample_rate = target_sr;
+            s.source_sample_rate = src_sr;
             s.channels = target_ch;
             s.format_changed = true;
             cvar.notify_all();
         }
-
-        // Decrypt
-        let pkt_len = packet.len();
-        let mut nonce = [0u8; 12];
-        nonce[4..12].copy_from_slice(&packet[pkt_len - NONCE_TRAIL_LEN..]);
-        let aad = packet[4..12].to_vec();
-        let ciphertext = &packet[RTP_HEADER_LEN..pkt_len - NONCE_TRAIL_LEN];
-
-        let plaintext = match cipher.decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        ) {
-            Ok(p) => p,
-            Err(_) => {
-                debug!("Audio decrypt failed");
-                continue;
-            }
-        };
 
         // Decode
         let pcm = if let Some(dec) = &mut decoder {
@@ -318,10 +434,46 @@ async fn receive_loop(
                 samples = rs.process(&samples);
             }
 
-            let (lock, cvar) = &*state;
-            let mut s = lock.lock().unwrap();
-            s.buffer.insert(timestamp, samples);
-            cvar.notify_all();
+            if samples.is_empty() {
+                continue;
+            }
+            loop {
+                let admitted = {
+                    let (lock, cvar) = &*state;
+                    let mut s = lock.lock().unwrap();
+                    if s.stopped {
+                        return;
+                    }
+                    if s.epoch != packet_epoch {
+                        break;
+                    }
+                    let budget = pcm_budget(s.sample_rate, s.channels);
+                    if samples.len() > budget {
+                        return;
+                    }
+                    let queued: usize =
+                        s.buffer.values().map(|frame| frame.samples.len()).sum::<usize>() + s.in_flight_samples;
+                    if queued + samples.len() <= budget {
+                        s.buffer.insert(
+                            timestamp,
+                            BufferedFrame {
+                                sequence,
+                                samples: std::mem::take(&mut samples),
+                            },
+                        );
+                        cvar.notify_all();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if admitted {
+                    break;
+                }
+                if peer_closed_while_waiting(&stream).await {
+                    break 'receive;
+                }
+            }
         }
     }
     debug!("Buffered audio receive loop ended");
@@ -340,6 +492,24 @@ async fn receive_loop(
     }
 }
 
+/// Wait out one backpressure interval. Returns true once the peer has closed
+/// the stream. A close queued behind unread packets stays invisible until
+/// playout drains the queue and reading resumes.
+async fn peer_closed_while_waiting(stream: &TcpStream) -> bool {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+    let mut probe = [0u8; 1];
+    tokio::select! {
+        _ = tokio::time::sleep(INTERVAL) => false,
+        peeked = stream.peek(&mut probe) => match peeked {
+            Ok(0) | Err(_) => true,
+            Ok(_) => {
+                tokio::time::sleep(INTERVAL).await;
+                false
+            }
+        },
+    }
+}
+
 /// Timed playout delivery thread. Wakes on condvar, delivers due frames to AudioSession.
 fn delivery_loop(
     state: Arc<(Mutex<PlayoutState>, Condvar)>,
@@ -348,11 +518,12 @@ fn delivery_loop(
 ) {
     let (lock, cvar) = &*state;
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
+    let mut delivered_epoch = 0;
 
     loop {
         let mut s = lock.lock().unwrap();
 
-        while !s.stopped && (s.rate == 0 || s.buffer.is_empty()) {
+        while !s.stopped && s.epoch == delivered_epoch && (s.rate == 0 || s.buffer.is_empty()) {
             s = cvar.wait(s).unwrap();
         }
         if s.stopped {
@@ -362,6 +533,15 @@ fn delivery_loop(
                 sess.audio_stopped(reason);
             }
             break;
+        }
+
+        if delivered_epoch != s.epoch {
+            delivered_epoch = s.epoch;
+            drop(s);
+            if let Some(sess) = &mut session {
+                sess.audio_flush();
+            }
+            continue;
         }
 
         // Lazy init or reinit session on format change
@@ -377,40 +557,521 @@ fn delivery_loop(
             session = Some(handler.audio_init(format));
         }
 
-        let now = now_ns();
-        let elapsed_ns = now.saturating_sub(s.anchor_local_ns);
-        let elapsed_frames = (elapsed_ns as u128 * s.sample_rate as u128 / 1_000_000_000) as u32;
+        let elapsed_frames = source_frames(s.anchor_local.elapsed(), s.source_sample_rate);
         let target_rtp = s.anchor_rtp.wrapping_add(elapsed_frames);
 
-        let ready: Vec<(u32, Vec<f32>)> = s
-            .buffer
-            .iter()
-            .filter(|(ts, _)| (target_rtp.wrapping_sub(**ts) as i32) >= 0)
-            .map(|(&ts, data)| (ts, data.clone()))
-            .collect();
-
-        for (ts, _) in &ready {
-            s.buffer.remove(ts);
-        }
+        let Some((timestamp, frame)) = take_ready_frame(&mut s.buffer, target_rtp) else {
+            let next_frames = s
+                .buffer
+                .keys()
+                .map(|ts| ts.wrapping_sub(target_rtp))
+                .filter(|frames| *frames <= i32::MAX as u32)
+                .min()
+                .unwrap_or(s.source_sample_rate);
+            let wait = std::time::Duration::from_nanos(
+                (u64::from(next_frames) * 1_000_000_000).div_ceil(u64::from(s.source_sample_rate)),
+            );
+            let _ = cvar.wait_timeout(s, wait).unwrap();
+            continue;
+        };
+        s.in_flight_samples = frame.samples.len();
         drop(s);
 
-        if let Some(ref mut sess) = session {
-            for (_, frame) in &ready {
-                sess.audio_process(frame);
-            }
-        }
-
-        if ready.is_empty() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        // The adapter owns no samples on false. Call outside the queue mutex so
+        // RTSP FLUSH/Stop and receiver backpressure remain responsive.
+        let accepted = session
+            .as_mut()
+            .is_some_and(|session| session.audio_process_buffered(&frame.samples, None));
+        let mut s = lock.lock().unwrap();
+        s.in_flight_samples = 0;
+        if !accepted && !s.stopped && s.epoch == delivered_epoch {
+            s.buffer.entry(timestamp).or_insert(frame);
+            let _ = cvar.wait_timeout(s, std::time::Duration::from_millis(10)).unwrap();
         }
     }
     info!("Delivery loop ended");
 }
 
-/// Current wall-clock time in nanoseconds since UNIX epoch.
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+/// Move the earliest due packet without copying PCM or allocating a ready list.
+fn take_ready_frame(buffer: &mut BTreeMap<u32, BufferedFrame>, target: u32) -> Option<(u32, BufferedFrame)> {
+    let timestamp = buffer
+        .keys()
+        .copied()
+        .filter(|ts| target.wrapping_sub(*ts) as i32 >= 0)
+        .min_by_key(|ts| ts.wrapping_sub(target) as i32)?;
+    buffer.remove(&timestamp).map(|frame| (timestamp, frame))
+}
+
+fn source_frames(elapsed: std::time::Duration, sample_rate: u32) -> u32 {
+    (elapsed.as_nanos() * u128::from(sample_rate) / 1_000_000_000) as u32
+}
+
+fn pcm_budget(sample_rate: u32, channels: u8) -> usize {
+    (sample_rate as usize * channels as usize * 2).min(8 * 1024 * 1024 / 4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn resampled_playout_uses_source_clock() {
+        assert_eq!(source_frames(std::time::Duration::from_secs(1), 44100), 44100);
+        assert_eq!(pcm_budget(48000, 2), 192000);
+        assert!(pcm_budget(192000, 8) * 4 <= 8 * 1024 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    struct Handler;
+    impl AudioHandler for Handler {
+        fn audio_init(&self, _: AudioFormat) -> Box<dyn crate::raop::AudioSession> {
+            Box::new(Session)
+        }
+    }
+    struct Session;
+    impl crate::raop::AudioSession for Session {
+        fn audio_process(&mut self, _: &[f32]) {}
+    }
+
+    #[tokio::test]
+    async fn abandoned_and_partial_streams_release_listener_and_tasks() {
+        for connect in [false, true, false, true] {
+            let processor = BufferedAudioProcessor::bind("127.0.0.1:0").await.unwrap();
+            let address = processor.listener.local_addr().unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
+            let (commands, _) = processor.start(
+                [0; 32],
+                OutputConfig {
+                    sample_rate: None,
+                    max_channels: None,
+                },
+                Arc::new(Handler),
+                &mut tasks,
+            );
+            let mut client = if connect {
+                Some(TcpStream::connect(address).await.unwrap())
+            } else {
+                None
+            };
+            if let Some(client) = &mut client {
+                use tokio::io::AsyncWriteExt;
+                client.write_all(&[0]).await.unwrap(); // incomplete packet length
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), tasks.shutdown())
+                .await
+                .unwrap();
+            assert!(tasks.is_empty());
+            assert!(commands.is_closed());
+            assert!(TcpStream::connect(address).await.is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    pub(super) fn state() -> PlayoutState {
+        PlayoutState {
+            buffer: BTreeMap::new(),
+            epoch: 0,
+            in_flight_samples: 0,
+            flush_range: None,
+            anchor_rtp: 0,
+            anchor_local: std::time::Instant::now(),
+            rate: 1,
+            sample_rate: 48000,
+            source_sample_rate: 44100,
+            channels: 2,
+            stopped: false,
+            stop_reason: None,
+            format_changed: false,
+        }
+    }
+    #[test]
+    fn flush_uses_sequence_not_timestamp_and_wraps() {
+        let mut s = state();
+        for (timestamp, sequence) in [(10000, 65534), (10352, 65535), (10704, 0), (11056, 1), (11408, 2)] {
+            s.buffer.insert(
+                timestamp,
+                BufferedFrame {
+                    sequence,
+                    samples: vec![sequence as f32],
+                },
+            );
+        }
+        s.flush(65535, 1);
+        assert_eq!(s.buffer.keys().copied().collect::<Vec<_>>(), vec![10000, 11408]);
+        assert_eq!(s.epoch, 1);
+    }
+
+    #[test]
+    fn flush_callback_precedes_new_pcm_even_while_paused() {
+        struct Handler(std::sync::mpsc::Sender<&'static str>);
+        struct Session(std::sync::mpsc::Sender<&'static str>);
+        impl AudioHandler for Handler {
+            fn audio_init(&self, _: AudioFormat) -> Box<dyn crate::raop::AudioSession> {
+                Box::new(Session(self.0.clone()))
+            }
+        }
+        impl crate::raop::AudioSession for Session {
+            fn audio_process(&mut self, samples: &[f32]) {
+                self.0.send(if samples[0] == 1.0 { "old" } else { "new" }).unwrap();
+            }
+            fn audio_flush(&mut self) {
+                self.0.send("flush").unwrap();
+            }
+        }
+        let mut s = state();
+        s.buffer.insert(
+            0,
+            BufferedFrame {
+                sequence: 1,
+                samples: vec![1.0, 1.0],
+            },
+        );
+        let shared = Arc::new((Mutex::new(s), Condvar::new()));
+        let worker_state = shared.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            delivery_loop(
+                worker_state,
+                Arc::new(Handler(tx)),
+                OutputConfig {
+                    sample_rate: None,
+                    max_channels: None,
+                },
+            )
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "old");
+        {
+            let mut s = shared.0.lock().unwrap();
+            s.rate = 0;
+            s.flush(1, 1);
+            shared.1.notify_all();
+        }
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "flush");
+        {
+            let mut s = shared.0.lock().unwrap();
+            s.rate = 1;
+            s.buffer.insert(
+                0,
+                BufferedFrame {
+                    sequence: 2,
+                    samples: vec![2.0, 2.0],
+                },
+            );
+            shared.1.notify_all();
+        }
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "new");
+        shared.0.lock().unwrap().stopped = true;
+        shared.1.notify_all();
+        thread.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    #[test]
+    fn delivery_moves_allocations_in_wrapped_timestamp_order() {
+        let mut buffer = BTreeMap::new();
+        let samples = vec![0.25; 1024];
+        let pointer = samples.as_ptr();
+        buffer.insert(u32::MAX - 10, BufferedFrame { sequence: 1, samples });
+        buffer.insert(
+            5,
+            BufferedFrame {
+                sequence: 2,
+                samples: vec![0.5; 1024],
+            },
+        );
+        buffer.insert(
+            50,
+            BufferedFrame {
+                sequence: 3,
+                samples: vec![1.0; 1024],
+            },
+        );
+        let first = take_ready_frame(&mut buffer, 10).unwrap();
+        let second = take_ready_frame(&mut buffer, 10).unwrap();
+        assert_eq!([first.0, second.0], [u32::MAX - 10, 5]);
+        assert_eq!(first.1.samples.as_ptr(), pointer);
+        assert!(take_ready_frame(&mut buffer, 10).is_none());
+        assert_eq!(buffer.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod downstream_backpressure_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    enum Event {
+        Rejected,
+        Flushed,
+        Accepted(f32),
+    }
+    struct Handler {
+        ready: Arc<AtomicBool>,
+        events: std::sync::mpsc::Sender<Event>,
+    }
+    struct Session {
+        ready: Arc<AtomicBool>,
+        events: std::sync::mpsc::Sender<Event>,
+    }
+    impl AudioHandler for Handler {
+        fn audio_init(&self, _: AudioFormat) -> Box<dyn crate::raop::AudioSession> {
+            Box::new(Session {
+                ready: self.ready.clone(),
+                events: self.events.clone(),
+            })
+        }
+    }
+    impl crate::raop::AudioSession for Session {
+        fn audio_process(&mut self, _: &[f32]) {
+            panic!("buffered delivery must use admission callback");
+        }
+        fn audio_process_buffered(&mut self, samples: &[f32], _: Option<std::time::Instant>) -> bool {
+            if !self.ready.load(Ordering::Acquire) {
+                self.events.send(Event::Rejected).unwrap();
+                return false;
+            }
+            self.events.send(Event::Accepted(samples[0])).unwrap();
+            true
+        }
+        fn audio_flush(&mut self) {
+            self.events.send(Event::Flushed).unwrap();
+        }
+    }
+    #[test]
+    fn stalled_downstream_keeps_frame_and_flush_cancels_retry() {
+        let mut state = super::flush_tests::state();
+        state.buffer.insert(
+            0,
+            BufferedFrame {
+                sequence: 1,
+                samples: vec![1.0; 16],
+            },
+        );
+        let state = Arc::new((Mutex::new(state), Condvar::new()));
+        let worker_state = state.clone();
+        let ready = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handler = Arc::new(Handler {
+            ready: ready.clone(),
+            events: tx,
+        });
+        let thread = std::thread::spawn(move || {
+            delivery_loop(
+                worker_state,
+                handler,
+                OutputConfig {
+                    sample_rate: None,
+                    max_channels: None,
+                },
+            )
+        });
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            Event::Rejected
+        ));
+        {
+            let mut s = state.0.lock().unwrap();
+            let queued: usize = s.buffer.values().map(|frame| frame.samples.len()).sum();
+            assert_eq!(
+                queued + s.in_flight_samples,
+                16,
+                "rejected PCM remains owned and counted"
+            );
+            s.flush(1, 1);
+            s.buffer.insert(
+                0,
+                BufferedFrame {
+                    sequence: 2,
+                    samples: vec![2.0; 16],
+                },
+            );
+            state.1.notify_all();
+        }
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
+                Event::Flushed => break,
+                Event::Rejected => {}
+                Event::Accepted(_) => panic!("stalled PCM must not be accepted"),
+            }
+        }
+        ready.store(true, Ordering::Release);
+        state.1.notify_all();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
+                Event::Accepted(sample) => {
+                    assert_eq!(sample, 2.0, "old epoch must never be retried after FLUSH");
+                    break;
+                }
+                Event::Rejected => {}
+                Event::Flushed => panic!("unexpected duplicate flush"),
+            }
+        }
+        state.0.lock().unwrap().stopped = true;
+        state.1.notify_all();
+        thread.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod buffered_acceptance {
+    use super::*;
+    use chacha20poly1305::{
+        ChaCha20Poly1305, KeyInit, Nonce,
+        aead::{Aead, Payload},
+    };
+    use tokio::io::AsyncWriteExt;
+    #[tokio::test(start_paused = true)]
+    async fn paused_encrypted_aac_stops_admission_at_budget_and_resumes_after_drain() {
+        // Synthetic AAC-LC stereo silence, generated by FFmpeg from anullsrc.
+        let silence = [0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c];
+        assert_eq!(
+            AacDecoder::new(48000, 2).unwrap().decode(&silence).unwrap().len(),
+            1024 * 2 * 4
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let half_budget = pcm_budget(48000, 2) / 2;
+        let state = Arc::new((
+            Mutex::new(PlayoutState {
+                in_flight_samples: 0,
+                buffer: BTreeMap::from([(
+                    0,
+                    BufferedFrame {
+                        sequence: 0,
+                        samples: vec![0.0; half_budget - 2048],
+                    },
+                )]),
+                epoch: 0,
+                flush_range: None,
+                anchor_rtp: 0,
+                anchor_local: std::time::Instant::now(),
+                rate: 0,
+                sample_rate: 48000,
+                source_sample_rate: 48000,
+                channels: 2,
+                stopped: false,
+                stop_reason: None,
+                format_changed: false,
+            }),
+            Condvar::new(),
+        ));
+        let receiver_state = state.clone();
+        let task = tokio::spawn(async move {
+            receive_loop(
+                stream,
+                &[7; 32],
+                OutputConfig {
+                    sample_rate: None,
+                    max_channels: None,
+                },
+                receiver_state,
+            )
+            .await;
+        });
+        let cipher = ChaCha20Poly1305::new((&[7; 32]).into());
+        for sequence in 1..=100u16 {
+            let mut packet = vec![0x80, 96];
+            packet.extend_from_slice(&sequence.to_be_bytes());
+            packet.extend_from_slice(&(u32::from(sequence) * 1024).to_be_bytes());
+            packet.extend_from_slice(&(AudioSsrc::Aac48000F24Stereo as u32).to_be_bytes());
+            let mut nonce = [0; 12];
+            nonce[10..].copy_from_slice(&sequence.to_be_bytes());
+            packet.extend(
+                cipher
+                    .encrypt(
+                        Nonce::from_slice(&nonce),
+                        Payload {
+                            msg: &silence,
+                            aad: &packet[4..12],
+                        },
+                    )
+                    .unwrap(),
+            );
+            packet.extend_from_slice(&nonce[4..]);
+            client
+                .write_all(&((packet.len() + 2) as u16).to_be_bytes())
+                .await
+                .unwrap();
+            client.write_all(&packet).await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while state.0.lock().unwrap().buffer.len() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            state.0.lock().unwrap().buffer.len(),
+            2,
+            "paused receiver must stop decoding queued TCP packets"
+        );
+        state.0.lock().unwrap().buffer.clear();
+        tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while state.0.lock().unwrap().buffer.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let queued: usize = state
+            .0
+            .lock()
+            .unwrap()
+            .buffer
+            .values()
+            .map(|frame| frame.samples.len())
+            .sum();
+        assert!(queued <= pcm_budget(48000, 2));
+        state.0.lock().unwrap().stopped = true;
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn paused_full_queue_still_observes_peer_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut paused = super::flush_tests::state();
+        paused.rate = 0;
+        paused.buffer.insert(
+            0,
+            BufferedFrame {
+                sequence: 0,
+                samples: vec![0.0; pcm_budget(paused.sample_rate, paused.channels) / 2],
+            },
+        );
+        let state = Arc::new((Mutex::new(paused), Condvar::new()));
+        let task = tokio::spawn(receive_loop(
+            stream,
+            &[7; 32],
+            OutputConfig {
+                sample_rate: None,
+                max_channels: None,
+            },
+            state.clone(),
+        ));
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.0.lock().unwrap().stop_reason,
+            Some(AudioStopReason::StreamEndedWhilePaused)
+        );
+    }
 }

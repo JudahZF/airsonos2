@@ -29,6 +29,9 @@ pub enum ShairplayError {
 /// Errors from the AirPlay server and session handling.
 #[derive(Debug, Error)]
 pub enum ServerError {
+    /// Unsupported configured audio format.
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(String),
     /// Server has not been started yet.
     #[error("server not started")]
     NotStarted,

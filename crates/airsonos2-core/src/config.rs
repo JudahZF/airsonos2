@@ -1,5 +1,5 @@
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("invalid configuration: {0}")]
+    Invalid(String),
     #[error("failed to parse config TOML: {0}")]
     Parse(#[from] toml::de::Error),
 }
@@ -29,7 +31,88 @@ pub struct Config {
 
 impl Config {
     pub fn from_toml_str(toml: &str) -> Result<Self, ConfigError> {
-        Ok(toml::from_str(toml)?)
+        let config: Self = toml::from_str(toml)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Shared validation for file configuration and Home Assistant options.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |message: &str| ConfigError::Invalid(message.to_owned());
+        if self.server.http_port == 0 || self.airplay.base_rtsp_port == 0 {
+            return Err(invalid("HTTP and base RTSP ports must be in 1..=65535"));
+        }
+        let diagnostics = self
+            .diagnostics
+            .metrics_addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| invalid("diagnostics.metrics_addr must be an IP address and port"))?;
+        if diagnostics.port() == 0 {
+            return Err(invalid(
+                "diagnostics.metrics_addr port must be in 1..=65535",
+            ));
+        }
+        if let Some(advertise_addr) = self.server.advertise_addr {
+            if advertise_addr.is_unspecified() {
+                return Err(invalid(
+                    "server.advertise_addr must be a specific address reachable by Sonos",
+                ));
+            }
+            // The stream listener binds `server.bind`; only `::` accepts both families.
+            let bind = self.server.bind;
+            if advertise_addr.is_ipv4() != bind.is_ipv4() && bind != Ipv6Addr::UNSPECIFIED {
+                return Err(ConfigError::Invalid(format!(
+                    "server.advertise_addr {advertise_addr} is unreachable because the stream \
+                     listener binds {bind}; set server.bind to an address of the same family \
+                     (\"::\" for IPv6)"
+                )));
+            }
+        }
+        if self.server.state_dir.as_os_str().is_empty() {
+            return Err(invalid("server.state_dir must not be empty"));
+        }
+        if self.airplay.name_template.trim().is_empty()
+            || self.airplay.advertised_model.trim().is_empty()
+        {
+            return Err(invalid(
+                "AirPlay name_template and advertised_model must not be empty",
+            ));
+        }
+        if !(8_000..=192_000).contains(&self.airplay.output_sample_rate)
+            || !(1..=2).contains(&self.airplay.output_channels)
+        {
+            return Err(invalid(
+                "AirPlay output must have 8000..=192000 samples/second and 1..=2 channels",
+            ));
+        }
+        if self.airplay.max_clients_per_zone == 0 {
+            return Err(invalid("airplay.max_clients_per_zone must be positive"));
+        }
+        if !matches!(self.stream.codec.as_str(), "mp3" | "wav") {
+            return Err(invalid("stream.codec must be mp3 or wav"));
+        }
+        if !(32..=320).contains(&self.stream.mp3_bitrate_kbps) {
+            return Err(invalid("stream.mp3_bitrate_kbps must be in 32..=320"));
+        }
+        if !(-10_000..=10_000).contains(&self.sync.default_offset_ms)
+            || self
+                .sync
+                .zone_offsets_ms
+                .values()
+                .any(|offset| !(-10_000..=10_000).contains(offset))
+        {
+            return Err(invalid(
+                "sync offsets must be in -10000..=10000 milliseconds",
+            ));
+        }
+        if self.sync.start_deadline_ms > 60_000
+            || self.sync.multi_select_window_ms > self.sync.start_deadline_ms
+        {
+            return Err(invalid(
+                "sync.start_deadline_ms must be at most 60000 and multi_select_window_ms must not exceed it",
+            ));
+        }
+        Ok(())
     }
 
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -46,6 +129,10 @@ impl Config {
 #[serde(default)]
 pub struct ServerConfig {
     pub bind: IpAddr,
+    /// Explicit IP address advertised to Sonos in stream URLs. Required when
+    /// `bind` is unspecified (0.0.0.0/[::]) and the local address cannot be inferred.
+    /// Must match the address family of `bind` unless `bind` is `::`.
+    pub advertise_addr: Option<IpAddr>,
     pub http_port: u16,
     pub state_dir: PathBuf,
     pub log_level: String,
@@ -55,6 +142,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0".parse().expect("valid default bind address"),
+            advertise_addr: None,
             http_port: 7000,
             state_dir: PathBuf::from("/var/lib/airsonos2"),
             log_level: "info".to_owned(),
@@ -110,7 +198,6 @@ pub struct SonosConfig {
     pub include_rooms: Vec<String>,
     pub exclude_rooms: Vec<String>,
     pub force_standalone_on_start: bool,
-    pub stop_on_disconnect: bool,
     pub volume_mode: VolumeMode,
 }
 
@@ -122,7 +209,6 @@ impl Default for SonosConfig {
             include_rooms: Vec::new(),
             exclude_rooms: Vec::new(),
             force_standalone_on_start: true,
-            stop_on_disconnect: true,
             volume_mode: VolumeMode::Sonos,
         }
     }
@@ -188,10 +274,6 @@ pub struct SyncConfig {
     pub default_offset_ms: i64,
     pub multi_select_window_ms: u64,
     pub start_deadline_ms: u64,
-    pub startup_compensation: bool,
-    pub startup_sample_limit: usize,
-    pub startup_min_samples: usize,
-    pub startup_max_compensation_ms: u64,
     pub play_command_spread_warn_ms: u64,
     pub zone_offsets_ms: std::collections::BTreeMap<String, i64>,
 }
@@ -202,13 +284,27 @@ impl Default for SyncConfig {
             default_offset_ms: 0,
             multi_select_window_ms: 750,
             start_deadline_ms: 2_500,
-            startup_compensation: true,
-            startup_sample_limit: 20,
-            startup_min_samples: 3,
-            startup_max_compensation_ms: 1_000,
             play_command_spread_warn_ms: 80,
             zone_offsets_ms: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+impl SyncConfig {
+    /// Retain the common starting sample throughout the configured startup wait and
+    /// normalized room delay. Bounds also keep this safe for programmatic configs.
+    pub fn pcm_queue_duration(&self) -> std::time::Duration {
+        let fallback = self.default_offset_ms.clamp(-10_000, 10_000);
+        let (min, max) =
+            self.zone_offsets_ms
+                .values()
+                .fold((fallback, fallback), |(min, max), offset| {
+                    let offset = (*offset).clamp(-10_000, 10_000);
+                    (min.min(offset), max.max(offset))
+                });
+        std::time::Duration::from_millis(
+            self.start_deadline_ms.min(60_000) + (max - min) as u64 + 250,
+        )
     }
 }
 
@@ -217,10 +313,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn queue_startup_budget_matches_validated_deadlines() {
+        assert!(Config::from_toml_str("[sync]\nstart_deadline_ms = 60001").is_err());
+        assert!(
+            Config::from_toml_str("[sync]\nstart_deadline_ms = 100\nmulti_select_window_ms = 101")
+                .is_err()
+        );
+        let config = Config::from_toml_str("[sync]\nstart_deadline_ms = 60000\ndefault_offset_ms = -10000\n[sync.zone_offsets_ms]\nKitchen = 10000").unwrap();
+        assert_eq!(
+            config.sync.pcm_queue_duration(),
+            std::time::Duration::from_millis(80250)
+        );
+    }
+
+    #[test]
+    fn rejects_offsets_that_can_overflow_runtime_deadlines() {
+        for value in [i64::MIN, -10_001, 10_001, i64::MAX] {
+            assert!(
+                Config::from_toml_str(&format!("[sync]\ndefault_offset_ms = {value}")).is_err()
+            );
+            assert!(
+                Config::from_toml_str(&format!("[sync.zone_offsets_ms]\nKitchen = {value}"))
+                    .is_err()
+            );
+        }
+        assert!(
+            Config::from_toml_str(
+                "[sync]\ndefault_offset_ms = -10000\n[sync.zone_offsets_ms]\nKitchen = 10000"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn config_defaults_match_public_interface() {
         let config = Config::default();
 
         assert_eq!(config.server.http_port, 7000);
+        assert_eq!(config.server.advertise_addr, None);
         assert_eq!(config.airplay.pin, "3939");
         assert_eq!(config.airplay.advertised_model, "AudioAccessory5,1");
         assert_eq!(config.airplay.rtsp_password, None);
@@ -234,10 +364,6 @@ mod tests {
         assert_eq!(config.sync.default_offset_ms, 0);
         assert_eq!(config.sync.multi_select_window_ms, 750);
         assert_eq!(config.sync.start_deadline_ms, 2_500);
-        assert!(config.sync.startup_compensation);
-        assert_eq!(config.sync.startup_sample_limit, 20);
-        assert_eq!(config.sync.startup_min_samples, 3);
-        assert_eq!(config.sync.startup_max_compensation_ms, 1_000);
         assert_eq!(config.sync.play_command_spread_warn_ms, 80);
     }
 
@@ -260,6 +386,33 @@ mod tests {
                 "2001:db8::10".parse::<IpAddr>().expect("ipv6"),
             ]
         );
+    }
+
+    #[test]
+    fn server_advertise_addr_can_be_configured() {
+        let config = Config::from_toml_str(
+            r#"
+            [server]
+            advertise_addr = "192.0.2.20"
+            "#,
+        )
+        .expect("valid config");
+
+        assert_eq!(
+            config.server.advertise_addr,
+            Some("192.0.2.20".parse::<IpAddr>().expect("ipv4"))
+        );
+    }
+
+    #[test]
+    fn server_advertise_addr_must_be_reachable_through_the_stream_listener() {
+        let config = |toml: &str| Config::from_toml_str(&format!("[server]\n{toml}"));
+
+        assert!(config(r#"advertise_addr = "0.0.0.0""#).is_err());
+        let error = config(r#"advertise_addr = "2001:db8::5""#).expect_err("IPv4-only listener");
+        assert!(error.to_string().contains("binds 0.0.0.0"));
+        assert!(config("bind = \"::\"\nadvertise_addr = \"192.0.2.5\"").is_ok());
+        assert!(config("bind = \"::\"\nadvertise_addr = \"2001:db8::5\"").is_ok());
     }
 
     #[test]
@@ -310,6 +463,24 @@ mod tests {
         assert_eq!(config.airplay.output_channels, 2);
     }
 
+    /// Existing configs must keep loading after an option is removed.
+    #[test]
+    fn removed_options_are_ignored() {
+        Config::from_toml_str(
+            r#"
+            [sonos]
+            stop_on_disconnect = false
+
+            [sync]
+            startup_compensation = true
+            startup_sample_limit = 12
+            startup_min_samples = 4
+            startup_max_compensation_ms = 700
+            "#,
+        )
+        .expect("removed options are ignored");
+    }
+
     #[test]
     fn sync_config_can_be_configured() {
         let config = Config::from_toml_str(
@@ -318,10 +489,6 @@ mod tests {
             default_offset_ms = 10
             multi_select_window_ms = 600
             start_deadline_ms = 1800
-            startup_compensation = false
-            startup_sample_limit = 12
-            startup_min_samples = 4
-            startup_max_compensation_ms = 700
             play_command_spread_warn_ms = 40
 
             [sync.zone_offsets_ms]
@@ -334,10 +501,6 @@ mod tests {
         assert_eq!(config.sync.default_offset_ms, 10);
         assert_eq!(config.sync.multi_select_window_ms, 600);
         assert_eq!(config.sync.start_deadline_ms, 1800);
-        assert!(!config.sync.startup_compensation);
-        assert_eq!(config.sync.startup_sample_limit, 12);
-        assert_eq!(config.sync.startup_min_samples, 4);
-        assert_eq!(config.sync.startup_max_compensation_ms, 700);
         assert_eq!(config.sync.play_command_spread_warn_ms, 40);
         assert_eq!(config.sync.zone_offsets_ms["Kitchen"], 120);
         assert_eq!(config.sync.zone_offsets_ms["Office"], 80);

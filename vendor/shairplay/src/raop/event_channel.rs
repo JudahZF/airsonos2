@@ -14,20 +14,28 @@ use crate::error::NetworkError;
 /// Handle for sending commands through the event channel.
 #[derive(Clone)]
 pub struct EventSender {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl EventSender {
     /// Create from an existing channel sender.
-    pub fn from_tx(tx: mpsc::UnboundedSender<Vec<u8>>) -> Self {
+    pub fn from_tx(tx: mpsc::Sender<Vec<u8>>) -> Self {
         Self { tx }
     }
 
     /// Send a plaintext message (will be encrypted before transmission).
+    ///
+    /// Fails with [`std::io::ErrorKind::WouldBlock`] when the queue is full, so
+    /// the caller may retry, and [`std::io::ErrorKind::NotConnected`] once the
+    /// channel has closed.
     pub fn send(&self, data: Vec<u8>) -> Result<(), NetworkError> {
-        self.tx
-            .send(data)
-            .map_err(|_| NetworkError::Mdns("event channel closed".into()))
+        use std::io::{Error, ErrorKind};
+        self.tx.try_send(data).map_err(|error| {
+            NetworkError::Io(match error {
+                mpsc::error::TrySendError::Full(_) => Error::new(ErrorKind::WouldBlock, "event channel full"),
+                mpsc::error::TrySendError::Closed(_) => Error::new(ErrorKind::NotConnected, "event channel closed"),
+            })
+        })
     }
 }
 
@@ -49,7 +57,7 @@ impl EventChannel {
 
     /// Run the event channel. Returns an EventSender for sending commands.
     pub async fn run(self, channel: EncryptedChannel) -> EventSender {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(16);
         let sender = EventSender { tx };
 
         let (stream, addr) = match self.listener.accept().await {
@@ -66,15 +74,11 @@ impl EventChannel {
     }
 
     /// Handle a connected event channel stream (public for use from handlers).
-    pub async fn handle_stream(stream: TcpStream, channel: EncryptedChannel, cmd_rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    pub async fn handle_stream(stream: TcpStream, channel: EncryptedChannel, cmd_rx: mpsc::Receiver<Vec<u8>>) {
         Self::handle(stream, channel, cmd_rx).await;
     }
 
-    async fn handle(
-        mut stream: TcpStream,
-        mut channel: EncryptedChannel,
-        mut cmd_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    ) {
+    async fn handle(mut stream: TcpStream, mut channel: EncryptedChannel, mut cmd_rx: mpsc::Receiver<Vec<u8>>) {
         let mut buf = vec![0u8; 4096];
         let mut encrypted_buf = Vec::new();
         loop {
@@ -83,6 +87,7 @@ impl EventChannel {
                     match result {
                         Ok(0) => { debug!("Event channel closed by client"); break; }
                         Ok(n) => {
+                            if encrypted_buf.len() + n > 8192 { break; }
                             encrypted_buf.extend_from_slice(&buf[..n]);
                             debug!(n, "Event channel data received");
                             match channel.decrypt_ctx.decrypt(&encrypted_buf) {
@@ -92,13 +97,14 @@ impl EventChannel {
                                         debug!(len = plain.len(), "Event channel message received");
                                     }
                                 }
-                                Err(e) => { warn!("Event channel decrypt error: {e}"); }
+                                Err(e) => { warn!("Event channel decrypt error: {e}"); break; }
                             }
                         }
                         Err(e) => { warn!("Event channel read error: {e}"); break; }
                     }
                 }
-                Some(data) = cmd_rx.recv() => {
+                data = cmd_rx.recv() => {
+                    let Some(data) = data else { break; };
                     debug!(len = data.len(), "Sending on event channel");
                     let encrypted = match channel.encrypt_ctx.encrypt(&data) {
                         Ok(e) => e,
@@ -147,5 +153,48 @@ mod tests {
         // Close triggers server exit
         drop(client);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    #[test]
+    fn full_queue_is_retryable_and_closed_channel_is_not() {
+        let (tx, rx) = mpsc::channel(1);
+        let sender = EventSender::from_tx(tx);
+        sender.send(vec![1]).unwrap();
+        let kind = |result: Result<(), NetworkError>| match result {
+            Err(NetworkError::Io(error)) => error.kind(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(kind(sender.send(vec![2])), std::io::ErrorKind::WouldBlock);
+        drop(rx);
+        assert_eq!(kind(sender.send(vec![3])), std::io::ErrorKind::NotConnected);
+    }
+    #[tokio::test]
+    async fn invalid_ciphertext_closes_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (_tx, rx) = mpsc::channel(16);
+        let task = tokio::spawn(EventChannel::handle_stream(
+            stream,
+            EncryptedChannel::events(&[7; 32]).unwrap(),
+            rx,
+        ));
+        client
+            .write_all(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        task.await.unwrap();
     }
 }

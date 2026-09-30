@@ -37,11 +37,16 @@ pub struct AirPlaySession {
     pub volume: Option<f32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PcmFrame {
+    /// Present for buffered delivery; returned only after processing or cancellation.
+    pub buffered_permit: Option<crate::pcm_queue::PcmPermit>,
+    /// FLUSH advances this counter before the next callback is admitted.
+    pub playback_epoch: u64,
     pub sample_rate: u32,
     pub channels: u8,
     pub samples_f32_interleaved: Vec<f32>,
+    /// Source presentation time mapped to the local monotonic clock, when available.
     pub presentation_time: Option<Instant>,
 }
 

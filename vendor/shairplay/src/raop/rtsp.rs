@@ -17,8 +17,6 @@ type Handler = fn(&mut RaopConnection, &HttpRequest, &mut HttpResponse) -> Optio
 
 /// Result of route resolution.
 enum RouteResolution {
-    /// Request is handled inline and has no body.
-    NoBody,
     /// Request should be passed to a handler function.
     Handler(Handler),
 }
@@ -184,16 +182,67 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
     response.add_header("CSeq", cseq);
     response.add_header("Apple-Jack-Status", "connected; type=analog");
 
-    // --- Middleware: authentication ---
-    if method != "OPTIONS" && !conn.password.is_empty() {
-        let authorization = request.header("Authorization");
-        if !digest::is_valid("airplay", &conn.password, &conn.nonce, method, url, authorization) {
-            let auth_str = format!("Digest realm=\"airplay\", nonce=\"{}\"", conn.nonce);
+    // Pairing and capability negotiation are public. Every mutating route requires
+    // either a completed AP2 handshake or explicitly configured legacy credentials.
+    let public = method == "OPTIONS"
+        || (method == "GET" && matches!(url, "/info" | "/server-info"))
+        || (method == "POST" && matches!(url, "/pair-setup" | "/pair-verify" | "/fp-setup"));
+    if !public
+        && matches!(
+            method,
+            "ANNOUNCE"
+                | "SETUP"
+                | "RECORD"
+                | "PAUSE"
+                | "FLUSH"
+                | "FLUSHBUFFERED"
+                | "TEARDOWN"
+                | "SET_PARAMETER"
+                | "GET_PARAMETER"
+                | "SETRATEANCHORTIME"
+                | "SETPEERS"
+                | "SETPEERSX"
+                | "POST"
+                | "PUT"
+        )
+    {
+        #[cfg(feature = "ap2")]
+        let ap2_authenticated = conn.ap2_shared_secret.is_some() && conn.controller_id.is_some();
+        #[cfg(not(feature = "ap2"))]
+        let ap2_authenticated = false;
+        let legacy_authenticated = !conn.password.is_empty()
+            && digest::is_valid(
+                "airplay",
+                &conn.password,
+                &conn.nonce,
+                method,
+                url,
+                request.header("Authorization"),
+            );
+        if !ap2_authenticated && !legacy_authenticated {
             response = HttpResponse::new("RTSP/1.0", 401, "Unauthorized");
             response.add_header("CSeq", cseq);
-            response.add_header("WWW-Authenticate", &auth_str);
+            response.add_header(
+                "WWW-Authenticate",
+                &format!("Digest realm=\"airplay\", nonce=\"{}\"", conn.nonce),
+            );
             response.finish(None);
             return response;
+        }
+        #[cfg(feature = "ap2")]
+        {
+            let active = conn.controller_session.lock().unwrap();
+            if let Some((code, reason)) = session_rejection(conn, &active) {
+                response = HttpResponse::new("RTSP/1.0", code, reason);
+                response.add_header("CSeq", cseq);
+                response.finish(None);
+                return response;
+            }
+            // A separately verified control connection for the same identity may
+            // control the active pipeline; an address alone never grants access.
+            if ap2_authenticated {
+                conn.playout_cmd = active.playout.clone();
+            }
         }
     }
 
@@ -207,7 +256,6 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
     // --- Route resolution ---
     let response_data = match resolve_handler(conn, request, method, url) {
         Some(RouteResolution::Handler(handler)) => handler(conn, request, &mut response),
-        Some(RouteResolution::NoBody) => None,
         None => {
             tracing::debug!(method, url, "Unhandled RTSP request");
             response = HttpResponse::new("RTSP/1.0", 404, "Not Found");
@@ -216,6 +264,9 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
             return response;
         }
     };
+    if response.status_code() != 200 {
+        response.add_header("CSeq", cseq);
+    }
     response.finish(response_data.as_deref());
     response
 }
@@ -243,10 +294,7 @@ fn resolve_handler(
     match method {
         "SETUP" => resolve_setup(conn, request).map(RouteResolution::Handler),
         "RECORD" => resolve_record(conn).map(RouteResolution::Handler),
-        "FLUSH" => {
-            handle_flush_inline(conn, request);
-            Some(RouteResolution::NoBody)
-        }
+        "FLUSH" => Some(RouteResolution::Handler(handle_flush_inline)),
         "TEARDOWN" => Some(RouteResolution::Handler(handle_teardown as Handler)),
         _ => None,
     }
@@ -275,27 +323,100 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
     None
 }
 
-/// FLUSH: parse RTP-Info header and flush the buffer inline.
-fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
-    if let Some(rtp_info) = request.header("RTP-Info")
-        && let Some(seq_str) = rtp_info.strip_prefix("seq=")
-        && let Ok(next_seq) = seq_str.parse::<i32>()
-        && let Some(rtp) = &conn.raop_rtp
-    {
-        rtp.flush(next_seq);
+/// Why `conn` may not act on the shared session, if it may not. Callers that
+/// mutate the session must hold the lock from this check through the mutation,
+/// because another connection can claim the session between two lock sections.
+#[cfg(feature = "ap2")]
+pub(crate) fn session_rejection(
+    conn: &RaopConnection,
+    active: &super::connection::ControllerSession,
+) -> Option<(u16, &'static str)> {
+    // A former media connection is tied to its old stream. Only a separate
+    // control-only connection may follow replacements for the same identity.
+    if conn.has_owned_audio && active.owner_connection.as_deref() != Some(conn.nonce.as_str()) {
+        return Some((409, "Stale Session"));
     }
+    let authenticated = conn.ap2_shared_secret.is_some() && conn.controller_id.is_some();
+    (!active.permits(authenticated, conn.controller_id.as_deref())).then_some((403, "Forbidden"))
+}
+
+#[cfg(feature = "ap2")]
+pub(crate) fn send_playout_command(
+    conn: &RaopConnection,
+    command: super::buffered_audio::PlayoutCommand,
+    response: &mut HttpResponse,
+) -> bool {
+    match conn.playout_cmd.as_ref().map(|sender| sender.try_send(command)) {
+        Some(Ok(())) => true,
+        Some(Err(tokio::sync::mpsc::error::TrySendError::Full(_))) => {
+            *response = HttpResponse::new("RTSP/1.0", 503, "Control Queue Full");
+            response.add_header("Retry-After", "1");
+            false
+        }
+        None | Some(Err(tokio::sync::mpsc::error::TrySendError::Closed(_))) => {
+            *response = HttpResponse::new("RTSP/1.0", 454, "Session Not Found");
+            false
+        }
+    }
+}
+
+/// FLUSH: parse RTP-Info header and flush the buffer inline. `seq` is the
+/// first packet to keep, so everything in the half of the sequence space
+/// before it is flushed.
+fn handle_flush_inline(
+    conn: &mut RaopConnection,
+    request: &HttpRequest,
+    _response: &mut HttpResponse,
+) -> Option<Vec<u8>> {
+    let next_seq = request
+        .header("RTP-Info")
+        .and_then(|info| info.split(';').find_map(|field| field.trim().strip_prefix("seq=")))
+        .and_then(|sequence| sequence.parse::<u16>().ok());
+    if let Some(next_seq) = next_seq {
+        if let Some(rtp) = &conn.raop_rtp {
+            rtp.flush(i32::from(next_seq));
+        }
+        #[cfg(feature = "ap2")]
+        if conn.raop_rtp.is_none() {
+            send_playout_command(
+                conn,
+                super::buffered_audio::PlayoutCommand::Flush {
+                    from_seq: u32::from(next_seq.wrapping_sub(0x8000)),
+                    until_seq: u32::from(next_seq.wrapping_sub(1)),
+                },
+                _response,
+            );
+        }
+    }
+    None
 }
 
 /// TEARDOWN: stop RTP, stop buffered audio, close connection.
 fn handle_teardown(conn: &mut RaopConnection, _request: &HttpRequest, response: &mut HttpResponse) -> Option<Vec<u8>> {
+    conn.audio_tasks.abort_all();
+    conn.tasks.abort_all();
     response.add_header("Connection", "close");
     response.set_disconnect(true);
     if let Some(mut rtp) = conn.raop_rtp.take() {
         rtp.stop();
     }
     #[cfg(feature = "ap2")]
-    if let Some(cmd) = &conn.playout_cmd {
-        let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
+    {
+        let mut active = conn.controller_session.lock().unwrap();
+        // Dispatch authorized this request under an earlier lock. A replacement
+        // may have claimed the session since, so a stale media connection must
+        // not cancel it.
+        if session_rejection(conn, &active).is_some() {
+            return None;
+        }
+        // Terminal cancellation bypasses the bounded command queue, including
+        // when TEARDOWN arrives on an associated control-only connection.
+        if let Some(task) = active.media_abort.take() {
+            task.abort();
+        }
+        active.playout = None;
+        active.owner = None;
+        active.owner_connection = None;
     }
     None
 }

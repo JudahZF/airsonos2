@@ -16,7 +16,10 @@ const HA_METRICS_ADDR: &str = "0.0.0.0:9100";
 #[serde(default)]
 pub(crate) struct HomeAssistantOptions {
     pub(crate) log_level: String,
+    pub(crate) http_bind: IpAddr,
+    pub(crate) diagnostics_addr: String,
     pub(crate) run_doctor_on_start: bool,
+    pub(crate) advertise_addr: Option<String>,
     pub(crate) name_template: String,
     pub(crate) advertised_model: String,
     pub(crate) pin: String,
@@ -30,7 +33,6 @@ pub(crate) struct HomeAssistantOptions {
     pub(crate) include_rooms: Vec<String>,
     pub(crate) exclude_rooms: Vec<String>,
     pub(crate) force_standalone_on_start: bool,
-    pub(crate) stop_on_disconnect: bool,
     pub(crate) stream_codec: String,
     pub(crate) mp3_bitrate_kbps: u16,
     pub(crate) prebuffer_ms: u64,
@@ -38,10 +40,6 @@ pub(crate) struct HomeAssistantOptions {
     pub(crate) default_offset_ms: i64,
     pub(crate) multi_select_window_ms: u64,
     pub(crate) start_deadline_ms: u64,
-    pub(crate) startup_compensation: bool,
-    pub(crate) startup_sample_limit: usize,
-    pub(crate) startup_min_samples: usize,
-    pub(crate) startup_max_compensation_ms: u64,
     pub(crate) play_command_spread_warn_ms: u64,
     pub(crate) zone_offsets: Vec<HomeAssistantZoneOffset>,
 }
@@ -57,7 +55,10 @@ impl Default for HomeAssistantOptions {
         let config = Config::default();
         Self {
             log_level: config.server.log_level,
+            http_bind: HA_BIND.parse().expect("HA bind"),
+            diagnostics_addr: HA_METRICS_ADDR.to_owned(),
             run_doctor_on_start: false,
+            advertise_addr: config.server.advertise_addr.map(|ip| ip.to_string()),
             name_template: config.airplay.name_template,
             advertised_model: config.airplay.advertised_model,
             pin: config.airplay.pin,
@@ -76,7 +77,6 @@ impl Default for HomeAssistantOptions {
             include_rooms: config.sonos.include_rooms,
             exclude_rooms: config.sonos.exclude_rooms,
             force_standalone_on_start: config.sonos.force_standalone_on_start,
-            stop_on_disconnect: config.sonos.stop_on_disconnect,
             stream_codec: config.stream.codec,
             mp3_bitrate_kbps: config.stream.mp3_bitrate_kbps,
             prebuffer_ms: config.stream.prebuffer_ms,
@@ -84,10 +84,6 @@ impl Default for HomeAssistantOptions {
             default_offset_ms: config.sync.default_offset_ms,
             multi_select_window_ms: config.sync.multi_select_window_ms,
             start_deadline_ms: config.sync.start_deadline_ms,
-            startup_compensation: config.sync.startup_compensation,
-            startup_sample_limit: config.sync.startup_sample_limit,
-            startup_min_samples: config.sync.startup_min_samples,
-            startup_max_compensation_ms: config.sync.startup_max_compensation_ms,
             play_command_spread_warn_ms: config.sync.play_command_spread_warn_ms,
             zone_offsets: config
                 .sync
@@ -107,7 +103,8 @@ impl HomeAssistantOptions {
     pub(crate) fn to_config(&self) -> anyhow::Result<Config> {
         let mut config = Config::default();
 
-        config.server.bind = HA_BIND.parse()?;
+        config.server.bind = self.http_bind;
+        config.server.advertise_addr = parse_optional_ip(self.advertise_addr.as_deref())?;
         config.server.http_port = HA_HTTP_PORT;
         config.server.state_dir = PathBuf::from(HA_STATE_DIR);
         config.server.log_level = self.log_level.clone();
@@ -126,7 +123,6 @@ impl HomeAssistantOptions {
         config.sonos.include_rooms = self.include_rooms.clone();
         config.sonos.exclude_rooms = self.exclude_rooms.clone();
         config.sonos.force_standalone_on_start = self.force_standalone_on_start;
-        config.sonos.stop_on_disconnect = self.stop_on_disconnect;
 
         config.stream.codec = validate_stream_codec(&self.stream_codec)?.to_owned();
         config.stream.mp3_bitrate_kbps = self.mp3_bitrate_kbps;
@@ -134,18 +130,15 @@ impl HomeAssistantOptions {
         config.stream.startup_wait_ms = self.startup_wait_ms;
         config.stream.ffmpeg_path = PathBuf::from(HA_FFMPEG_PATH);
 
-        config.diagnostics.metrics_addr = HA_METRICS_ADDR.to_owned();
+        config.diagnostics.metrics_addr = self.diagnostics_addr.clone();
 
         config.sync.default_offset_ms = self.default_offset_ms;
         config.sync.multi_select_window_ms = self.multi_select_window_ms;
         config.sync.start_deadline_ms = self.start_deadline_ms;
-        config.sync.startup_compensation = self.startup_compensation;
-        config.sync.startup_sample_limit = self.startup_sample_limit;
-        config.sync.startup_min_samples = self.startup_min_samples;
-        config.sync.startup_max_compensation_ms = self.startup_max_compensation_ms;
         config.sync.play_command_spread_warn_ms = self.play_command_spread_warn_ms;
         config.sync.zone_offsets_ms = zone_offsets_map(&self.zone_offsets)?;
 
+        config.validate()?;
         Ok(config)
     }
 }
@@ -177,6 +170,17 @@ fn non_empty_password(password: &str) -> Option<String> {
     } else {
         Some(password.to_owned())
     }
+}
+
+fn parse_optional_ip(value: Option<&str>) -> anyhow::Result<Option<IpAddr>> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .map_err(|error| anyhow::anyhow!("invalid advertise_addr {value:?}: {error}"))
+        })
+        .transpose()
 }
 
 fn parse_static_ips(values: &[String]) -> anyhow::Result<Vec<IpAddr>> {
@@ -222,6 +226,7 @@ mod tests {
         assert_eq!(config.server.bind, defaults.server.bind);
         assert_eq!(config.server.http_port, defaults.server.http_port);
         assert_eq!(config.server.log_level, defaults.server.log_level);
+        assert_eq!(config.server.advertise_addr, defaults.server.advertise_addr);
         assert_eq!(config.server.state_dir, PathBuf::from(HA_STATE_DIR));
         assert_eq!(config.airplay, defaults.airplay);
         assert_eq!(config.sonos, defaults.sonos);
@@ -243,6 +248,28 @@ mod tests {
     }
 
     #[test]
+    fn custom_listener_addresses_round_trip_and_use_shared_validation() {
+        let options = HomeAssistantOptions {
+            http_bind: "192.0.2.10".parse().expect("IP"),
+            diagnostics_addr: "127.0.0.1:9201".to_owned(),
+            ..HomeAssistantOptions::default()
+        };
+        let config =
+            Config::from_toml_str(&render_config_toml(&options).expect("render")).expect("config");
+        assert_eq!(config.server.bind, options.http_bind);
+        assert_eq!(config.server.http_port, 7000); // Supervisor watchdog port.
+        assert_eq!(config.diagnostics.metrics_addr, options.diagnostics_addr);
+        assert!(
+            HomeAssistantOptions {
+                output_channels: 8,
+                ..options
+            }
+            .to_config()
+            .is_err()
+        );
+    }
+
+    #[test]
     fn empty_rtsp_password_becomes_none() {
         let options = HomeAssistantOptions {
             rtsp_password: String::new(),
@@ -252,6 +279,47 @@ mod tests {
         let config = options.to_config().expect("config");
 
         assert_eq!(config.airplay.rtsp_password, None);
+    }
+
+    #[test]
+    fn advertise_addr_is_preserved_in_generated_toml() {
+        let options = HomeAssistantOptions::from_json_str(r#"{"advertise_addr":"192.0.2.20"}"#)
+            .expect("options");
+
+        let toml = render_config_toml(&options).expect("render");
+        let config = Config::from_toml_str(&toml).expect("generated config");
+
+        assert!(toml.contains("advertise_addr = \"192.0.2.20\""));
+        assert_eq!(
+            config.server.advertise_addr,
+            Some("192.0.2.20".parse::<IpAddr>().expect("ipv4"))
+        );
+    }
+
+    #[test]
+    fn advertise_addr_must_be_an_ip_the_http_bind_accepts() {
+        for value in ["not an ip", "2001:db8::20"] {
+            let options = HomeAssistantOptions {
+                advertise_addr: Some(value.to_owned()),
+                ..HomeAssistantOptions::default()
+            };
+
+            assert!(options.to_config().is_err(), "{value} must be rejected");
+        }
+
+        let dual_stack = HomeAssistantOptions {
+            http_bind: "::".parse().expect("IP"),
+            advertise_addr: Some("2001:db8::20".to_owned()),
+            ..HomeAssistantOptions::default()
+        };
+        assert_eq!(
+            dual_stack
+                .to_config()
+                .expect("config")
+                .server
+                .advertise_addr,
+            Some("2001:db8::20".parse::<IpAddr>().expect("ipv6"))
+        );
     }
 
     #[test]

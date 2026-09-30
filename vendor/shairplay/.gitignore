@@ -2,6 +2,5 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
-Cargo.lock
 .vscode/
 persistence.json

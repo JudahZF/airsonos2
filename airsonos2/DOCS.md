@@ -21,6 +21,12 @@ ffmpeg_path = "/usr/bin/ffmpeg"
 metrics_addr = "0.0.0.0:9100"
 ```
 
+Set `advertise_addr` to the Home Assistant host address that Sonos should use when pulling audio streams if automatic route-based address detection is unavailable or chooses the wrong interface. The stream listener binds `http_bind`, so the address must use the same family: the default `0.0.0.0` needs an IPv4 address, and an IPv6 address needs `http_bind: "::"`.
+
+```yaml
+advertise_addr: 192.168.1.10
+```
+
 Use `static_ips` when SSDP multicast does not reach every Sonos speaker. Use `include_rooms` and `exclude_rooms` to limit which visible Sonos rooms receive AirPlay endpoints.
 
 `stream_codec` supports `mp3` and `wav`. MP3 is the compatibility default. WAV can reduce startup latency when your Sonos devices accept it.
@@ -44,11 +50,18 @@ Enable `run_doctor_on_start` to run startup diagnostics without blocking bridge 
 airsonos2 doctor --config /data/config.toml
 ```
 
-The bridge serves:
+The stream HTTP port (7000) serves:
 
 ```text
 /healthz
-/metrics
 /test-tone.mp3
 /streams/<session>
 ```
+
+The diagnostics listener (`diagnostics_addr`) serves `/healthz` and `/metrics`.
+
+## Listener addresses and diagnostics
+
+`http_bind` selects the local IP address used by stream HTTP and the AirPlay listeners (default `0.0.0.0`). It must be reachable from the speakers and Home Assistant Supervisor. The HTTP port stays at 7000 so the Supervisor watchdog and stream health endpoint agree. `diagnostics_addr` accepts an IP address and port, such as `127.0.0.1:9201`, for detailed `/metrics` and `/healthz`. IPv6 addresses use brackets: `[::1]:9201`. These options are checked by the same Rust validation as file configuration.
+
+The renderer rejects unsupported codecs and output formats. Output supports one or two channels at 8000–192000 Hz; a short doctor MP3 encode checks the installed encoder against the configured rate and bitrate. Doctor also checks the configured listener addresses and actual filtered room ports. Hardware visibility and playback remain separate acceptance checks.

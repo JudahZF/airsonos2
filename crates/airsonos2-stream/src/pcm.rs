@@ -1,5 +1,12 @@
 pub fn f32_pcm_to_s16le_bytes(samples: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(samples.len() * 2);
+    write_f32_pcm_to_s16le(samples, &mut bytes);
+    bytes
+}
+
+pub fn write_f32_pcm_to_s16le(samples: &[f32], bytes: &mut Vec<u8>) {
+    bytes.clear();
+    bytes.reserve(samples.len() * 2);
 
     for sample in samples {
         let clamped = if sample.is_finite() {
@@ -15,8 +22,6 @@ pub fn f32_pcm_to_s16le_bytes(samples: &[f32]) -> Vec<u8> {
 
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-
-    bytes
 }
 
 #[cfg(test)]

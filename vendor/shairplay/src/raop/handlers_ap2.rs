@@ -25,20 +25,78 @@ fn bind_udp(addr: std::net::SocketAddr) -> Option<tokio::net::UdpSocket> {
 
 #[cfg(feature = "ap2")]
 impl RaopConnection {
+    /// Claim the shared session for a new audio stream. Revalidation, cancelling
+    /// the previous media, and registering the stream from `start` share one
+    /// lock, so concurrent SETUPs cannot both claim a vacant session or leave an
+    /// unregistered pipeline feeding the handler.
+    fn claim_audio(
+        &mut self,
+        response: &mut HttpResponse,
+        start: impl FnOnce(
+            &mut tokio::task::JoinSet<()>,
+        ) -> (
+            tokio::sync::mpsc::Sender<crate::raop::buffered_audio::PlayoutCommand>,
+            tokio::task::AbortHandle,
+        ),
+    ) -> bool {
+        let mut active = self.controller_session.lock().unwrap();
+        if let Some((code, reason)) = super::rtsp::session_rejection(self, &active) {
+            *response = HttpResponse::new("RTSP/1.0", code, reason);
+            return false;
+        }
+        self.has_owned_audio = true;
+        self.audio_tasks.abort_all();
+        while self.audio_tasks.try_join_next().is_some() {}
+        if let Some(task) = active.media_abort.take() {
+            task.abort();
+        }
+        let (playout, media_abort) = start(&mut self.audio_tasks);
+        active.owner = self.controller_id.clone();
+        active.owner_connection = Some(self.nonce.clone());
+        active.media_abort = Some(media_abort);
+        active.playout = Some(playout.clone());
+        self.playout_cmd = Some(playout);
+        true
+    }
+
     /// Decouple network event stream listener spawning from high-level RTSP handlers.
     pub fn spawn_event_channel(
         &mut self,
         event_listener: tokio::net::TcpListener,
         event_channel_cipher: crate::crypto::chacha_transport::EncryptedChannel,
-        rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) {
-        tokio::spawn(async move {
+        let peer = self.remote_socket.ip();
+        self.tasks.spawn(async move {
             if let Ok((stream, addr)) = event_listener.accept().await {
+                if addr.ip() != peer {
+                    return;
+                }
                 tracing::info!(%addr, "RC event channel client connected");
                 crate::raop::event_channel::EventChannel::handle_stream(stream, event_channel_cipher, rx).await;
             }
         });
     }
+}
+
+/// Drive a legacy RTP stream as registered session media, so replacement and
+/// FLUSH or TEARDOWN from any authorized connection reach it like an AP2
+/// stream. Aborting this task drops `rtp`, which aborts its receive tasks.
+#[cfg(feature = "video")]
+async fn run_legacy_rtp(
+    mut rtp: RaopRtp,
+    mut commands: tokio::sync::mpsc::Receiver<crate::raop::buffered_audio::PlayoutCommand>,
+) {
+    use crate::raop::buffered_audio::PlayoutCommand;
+    while let Some(command) = commands.recv().await {
+        match command {
+            // `until_seq` is the last flushed packet; RTP flush takes the next one to keep.
+            PlayoutCommand::Flush { until_seq, .. } => rtp.flush(i32::from((until_seq as u16).wrapping_add(1))),
+            PlayoutCommand::SetRate { .. } => {}
+            PlayoutCommand::Stop => break,
+        }
+    }
+    rtp.shutdown().await;
 }
 
 #[cfg(feature = "ap2")]
@@ -74,6 +132,7 @@ pub(crate) fn handle_pair_setup(
             if ok && srp.is_transient() {
                 conn.ap2_shared_secret = srp.shared_secret().map(|s| s.to_vec());
                 conn.is_ap2 = true;
+                conn.controller_id = Some(format!("transient:{}", conn.nonce));
                 tracing::info!("AP2 transient pair-setup complete");
             }
             Some(m4)
@@ -84,6 +143,7 @@ pub(crate) fn handle_pair_setup(
                 Ok((client_id, client_pk)) => {
                     let m6 = srp.build_m6(&conn.device_id).ok()?;
                     conn.pairing_store.put(&client_id, client_pk);
+                    conn.controller_id = Some(client_id.clone());
                     tracing::info!(client_id, "AP2 normal pair-setup complete, client key stored");
                     conn.ap2_shared_secret = srp.session_key().map(|s| s.to_vec());
                     conn.is_ap2 = true;
@@ -148,6 +208,7 @@ pub(crate) fn handle_pair_verify(
             let store = conn.pairing_store.clone();
             match pv.process_m3_build_m4(data, Some(&|id| store.get(id))) {
                 Ok(m4) => {
+                    conn.controller_id = pv.controller_id.clone();
                     conn.pair_verify_secret = pv.shared_secret().copied();
                     conn.ap2_shared_secret = pv.shared_secret().map(|s| s.to_vec());
                     conn.is_ap2 = true;
@@ -265,7 +326,6 @@ pub(crate) fn handle_setup(
         match stream_type {
             96 => {
                 let sr = stream0.get("sr").and_then(|v| v.as_unsigned_integer()).unwrap_or(44100);
-                #[cfg(feature = "video")]
                 let spf = stream0.get("spf").and_then(|v| v.as_unsigned_integer()).unwrap_or(352);
                 let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
 
@@ -279,17 +339,33 @@ pub(crate) fn handle_setup(
                     let audio_port = socket.local_addr().ok()?.port();
 
                     let handler = conn.handler.clone();
+                    let channels = stream0.get("ch").and_then(|v| v.as_unsigned_integer()).unwrap_or(2);
+                    let bits = stream0.get("ss").and_then(|v| v.as_unsigned_integer()).unwrap_or(16);
+                    let fmtp = format!("96 {spf} 0 {bits} 40 10 14 {channels} 255 0 0 {sr}");
+                    let Some(alac) = super::buffer::parse_fmtp(&fmtp) else {
+                        *response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
+                        return None;
+                    };
                     let output_config = crate::raop::realtime_audio::OutputConfig {
+                        alac,
                         sample_rate: conn.output_sample_rate,
                         max_channels: conn.output_max_channels,
                     };
 
-                    tokio::spawn(crate::raop::realtime_audio::run(
-                        socket,
-                        shk_arr,
-                        handler,
-                        output_config,
-                    ));
+                    let claimed = conn.claim_audio(response, |tasks| {
+                        let (commands, receiver) = tokio::sync::mpsc::channel(64);
+                        let task = tasks.spawn(crate::raop::realtime_audio::run(
+                            socket,
+                            shk_arr,
+                            handler,
+                            output_config,
+                            receiver,
+                        ));
+                        (commands, task)
+                    });
+                    if !claimed {
+                        return None;
+                    }
 
                     stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
                 } else {
@@ -301,7 +377,7 @@ pub(crate) fn handle_setup(
                         let aes_key = conn.ekey.unwrap_or([0u8; 16]);
                         let aes_iv = conn.eiv.unwrap_or([0u8; 16]);
                         let fmtp = format!("96 {spf} 0 16 40 10 14 2 255 0 0 {sr}");
-                        conn.raop_rtp = Some(RaopRtp::new(
+                        let Some(mut rtp) = RaopRtp::new(
                             conn.handler.clone(),
                             crate::raop::rtp::RtpConfig {
                                 remote: conn.remote_socket.ip().to_string(),
@@ -313,16 +389,28 @@ pub(crate) fn handle_setup(
                                 output_sample_rate: conn.output_sample_rate,
                                 remote_socket: conn.remote_socket,
                             },
-                        ));
-                        if let Some(rtp) = &mut conn.raop_rtp {
-                            let control_port = stream0
-                                .get("controlPort")
-                                .and_then(|v| v.as_unsigned_integer())
-                                .unwrap_or(0) as u16;
-                            let (cport, _tport, dport) = rtp.start(true, control_port, 0).ok()?;
-                            stream_resp.insert("dataPort".into(), plist::Value::Integer(dport.into()));
-                            stream_resp.insert("controlPort".into(), plist::Value::Integer(cport.into()));
+                        ) else {
+                            *response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
+                            return None;
+                        };
+                        let control_port = stream0
+                            .get("controlPort")
+                            .and_then(|v| v.as_unsigned_integer())
+                            .unwrap_or(0) as u16;
+                        // Start before claiming, so a failed SETUP leaves the active stream alone.
+                        let Ok((cport, _tport, dport)) = rtp.start(true, control_port, 0) else {
+                            *response = HttpResponse::new("RTSP/1.0", 500, "Internal Server Error");
+                            return None;
+                        };
+                        let claimed = conn.claim_audio(response, |tasks| {
+                            let (commands, receiver) = tokio::sync::mpsc::channel(64);
+                            (commands, tasks.spawn(run_legacy_rtp(rtp, receiver)))
+                        });
+                        if !claimed {
+                            return None;
                         }
+                        stream_resp.insert("dataPort".into(), plist::Value::Integer(dport.into()));
+                        stream_resp.insert("controlPort".into(), plist::Value::Integer(cport.into()));
                     } // cfg(feature = "video")
                     #[cfg(not(feature = "video"))]
                     {
@@ -362,8 +450,9 @@ pub(crate) fn handle_setup(
                     listener,
                     port: audio_port,
                 };
-                let cmd_tx = proc.start(shk_arr, output_config, handler);
-                conn.playout_cmd = Some(cmd_tx);
+                if !conn.claim_audio(response, |tasks| proc.start(shk_arr, output_config, handler, tasks)) {
+                    return None;
+                }
 
                 stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
                 stream_resp.insert("audioBufferSize".into(), plist::Value::Integer(0x10_0000_i64.into()));
@@ -381,7 +470,7 @@ pub(crate) fn handle_setup(
                     tracing::debug!(data_port, "RC data channel opened");
 
                     // Spawn listener (just accept + log for now)
-                    tokio::spawn(async move {
+                    conn.tasks.spawn(async move {
                         if let Ok((_, addr)) = data_listener.accept().await {
                             tracing::info!(%addr, "RC data channel client connected");
                         }
@@ -487,7 +576,8 @@ pub(crate) fn handle_setup(
 
                 if let Some(vh) = &conn.video_handler {
                     let session = vh.video_init();
-                    tokio::spawn(crate::raop::video_stream::run(listener, cipher, session));
+                    conn.tasks
+                        .spawn(crate::raop::video_stream::run(listener, cipher, session));
                 }
 
                 stream_resp.insert("dataPort".into(), plist::Value::Integer(video_port.into()));
@@ -577,7 +667,7 @@ pub(crate) fn handle_setup(
                     crate::crypto::chacha_transport::EncryptedChannel::events(shared_secret)
                 {
                     let event_sender = {
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        let (tx, rx) = tokio::sync::mpsc::channel(16);
 
                         let mut update_info = plist::Dictionary::new();
                         update_info.insert("type".into(), plist::Value::String("updateInfo".into()));
@@ -608,7 +698,7 @@ pub(crate) fn handle_setup(
                             );
                             let mut msg = rtsp.into_bytes();
                             msg.extend_from_slice(&body);
-                            let _ = tx.send(msg);
+                            let _ = tx.try_send(msg);
                             tracing::debug!("updateInfo queued for RC event channel");
                         }
 
@@ -660,7 +750,7 @@ pub(crate) fn handle_setup(
         {
             // Spawn bidirectional event channel
             let event_sender = {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
 
                 // Queue updateInfo so it's sent immediately when client connects
                 let mut update_info = plist::Dictionary::new();
@@ -692,17 +782,12 @@ pub(crate) fn handle_setup(
                     );
                     let mut msg = rtsp.into_bytes();
                     msg.extend_from_slice(&body);
-                    let _ = tx.send(msg);
+                    let _ = tx.try_send(msg);
                     tracing::debug!("updateInfo queued for event channel");
                 }
 
                 let sender = crate::raop::event_channel::EventSender::from_tx(tx);
-                tokio::spawn(async move {
-                    if let Ok((stream, addr)) = event_listener.accept().await {
-                        tracing::info!(%addr, "Event channel client connected");
-                        crate::raop::event_channel::EventChannel::handle_stream(stream, event_channel_cipher, rx).await;
-                    }
-                });
+                conn.spawn_event_channel(event_listener, event_channel_cipher, rx);
                 sender
             };
             conn.event_sender = Some(event_sender);
@@ -730,7 +815,8 @@ pub(crate) fn handle_setup(
                     let local_port = tsock.local_addr().ok()?.port();
                     let mut remote_timing = conn.remote_socket;
                     remote_timing.set_port(timing_rport);
-                    crate::raop::ntp::spawn_ntp_responder(tsock, remote_timing);
+                    conn.tasks
+                        .spawn(crate::raop::ntp::run_ntp_responder(tsock, remote_timing));
                     Some(local_port)
                 })
                 .unwrap_or(0);
@@ -769,7 +855,7 @@ pub(crate) fn handle_record(
 pub(crate) fn handle_set_rate_anchor_time(
     conn: &mut RaopConnection,
     request: &HttpRequest,
-    _response: &mut HttpResponse,
+    response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
     let data = request.data()?;
     let plist_val: plist::Value = plist::from_bytes(data).ok()?;
@@ -788,7 +874,7 @@ pub(crate) fn handle_set_rate_anchor_time(
 
     // Convert network time to nanoseconds
     let frac_ns = ((net_frac >> 32) * 1_000_000_000) >> 32;
-    let anchor_time_ns = net_secs * 1_000_000_000 + frac_ns;
+    let anchor_time_ns = net_secs.checked_mul(1_000_000_000)?.checked_add(frac_ns)?;
 
     let playing = rate & 1 != 0;
     if playing {
@@ -796,16 +882,20 @@ pub(crate) fn handle_set_rate_anchor_time(
     } else {
         tracing::info!("AP2 play pause");
     }
-    conn.handler.on_playback_rate(playing);
 
-    if let Some(cmd) = &conn.playout_cmd {
-        let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::SetRate {
+    if !super::rtsp::send_playout_command(
+        conn,
+        crate::raop::buffered_audio::PlayoutCommand::SetRate {
             anchor_rtp: rtp_time,
             anchor_time_ns,
             rate,
-        });
+        },
+        response,
+    ) {
+        return None;
     }
 
+    conn.handler.on_playback_rate(playing);
     None
 }
 
@@ -831,7 +921,7 @@ pub(crate) fn handle_set_peers(
 pub(crate) fn handle_flush_buffered(
     conn: &mut RaopConnection,
     request: &HttpRequest,
-    _response: &mut HttpResponse,
+    response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
     if let Some(data) = request.data()
         && let Ok(plist_val) = plist::from_bytes::<plist::Value>(data)
@@ -846,9 +936,11 @@ pub(crate) fn handle_flush_buffered(
             .and_then(|v| v.as_unsigned_integer())
             .unwrap_or(0) as u32;
         tracing::debug!(from_seq, until_seq, "FLUSHBUFFERED");
-        if let Some(cmd) = &conn.playout_cmd {
-            let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Flush { from_seq, until_seq });
-        }
+        super::rtsp::send_playout_command(
+            conn,
+            crate::raop::buffered_audio::PlayoutCommand::Flush { from_seq, until_seq },
+            response,
+        );
     }
     None
 }

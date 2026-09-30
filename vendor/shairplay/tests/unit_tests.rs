@@ -341,7 +341,7 @@ fn alac_init_and_set_info() {
 fn rtp_buffer_queue_dequeue() {
     let key = [0u8; 16];
     let iv = [0u8; 16];
-    let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv);
+    let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).unwrap();
     // Queue returns >= 0 for valid-length packets (ALAC decode may fail on dummy data)
     let mut pkt = vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     pkt.extend_from_slice(&[0u8; 256]);
@@ -356,7 +356,7 @@ fn rtp_buffer_queue_dequeue() {
 fn rtp_buffer_flush() {
     let key = [0u8; 16];
     let iv = [0u8; 16];
-    let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv);
+    let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).unwrap();
     buf.flush(100);
     assert!(buf.dequeue(true).is_none());
 }
@@ -365,7 +365,7 @@ fn rtp_buffer_flush() {
 fn rtp_buffer_reject_short_packet() {
     let key = [0u8; 16];
     let iv = [0u8; 16];
-    let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv);
+    let mut buf = RaopBuffer::new("96 352", "96 352 0 16 40 10 14 2 255 0 0 44100", &key, &iv).unwrap();
     assert_eq!(buf.queue(&[0u8; 4], true), -1); // too short
 }
 
@@ -499,7 +499,7 @@ mod ap2_tests {
         use shairplay::net::features::receiver_features;
         let lo = receiver_features() & 0xFFFFFFFF;
         let hi = (receiver_features() >> 32) & 0xFFFFFFFF;
-        let formatted = format!("0x{:X},0x{:X}", lo, hi);
+        let formatted = format!("0x{lo:X},0x{hi:X}");
         // Must contain comma-separated hi,lo
         assert!(formatted.contains(","));
         // Recombine and verify

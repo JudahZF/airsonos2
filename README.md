@@ -21,9 +21,9 @@ Real-device AirPlay 2 and Sonos sync acceptance still must be validated on hardw
 
 When you multi-select several AirSonos2 speakers from AirPlay, sessions that start within `[sync].multi_select_window_ms` are treated as one startup cohort. AirSonos2 prepares each Sonos stream first, waits until every stream is ready or `[sync].start_deadline_ms` expires, then dispatches the Sonos `Play` commands concurrently.
 
-With `[sync].startup_compensation = true`, AirSonos2 keeps recent per-room startup timing samples for `SetAVTransportURI`, HTTP subscriber connection, first bytes served, and `Play` command completion. Once a room has at least `[sync].startup_min_samples`, its rolling median startup lag is compared with the slowest room in the cohort and faster rooms are delayed up to `[sync].startup_max_compensation_ms`.
+There is no automatic startup compensation. SOAP round trips and HTTP stream timings are not acoustic latency measurements, so the former `[sync].startup_*` settings were removed. Old configs that still set them load normally and the keys are ignored.
 
-For `stream.codec = "wav"`, cohorts also receive a shared future playback anchor with automatic compensation plus `[sync.zone_offsets_ms]` manual room offsets. MP3 remains supported, but sync is best-effort because it cannot use sample-aligned WAV anchors. The automatic measurement is stream-arrival timing, not acoustic output; use manual offsets, or microphone calibration outside the service, for residual speaker-specific output delay.
+For `stream.codec = "wav"`, cohorts also receive a shared future playback anchor with `[sync.zone_offsets_ms]` manual room offsets. MP3 remains supported, but sync is best-effort because it cannot use sample-aligned WAV anchors. Measure speaker-specific output delay with a microphone outside the service and set it as manual offsets.
 
 ## Development
 
@@ -49,10 +49,10 @@ nix develop -c docker build -f packaging/docker/Dockerfile .
 
 ## Configuration
 
-Start from [docs/config.example.toml](docs/config.example.toml).
+Start from [docs/config.example.toml](docs/config.example.toml). When `[server].bind` is unspecified, AirSonos2 normally infers the local address used to reach each Sonos zone. Set `[server].advertise_addr` to a specific IPv4 or IPv6 LAN address when inference is unavailable or the host has multiple interfaces and Sonos must use a particular one. An IPv6 `advertise_addr` also needs `bind = "::"` so the stream listener accepts IPv6.
 
 ```bash
-install -d ~/.local/state/airsonos2
+sudo install -d -o "$(id -un)" -g "$(id -gn)" /var/lib/airsonos2
 cargo run -p airsonos2-cli -- serve --config docs/config.example.toml
 ```
 
@@ -65,7 +65,9 @@ auto_discover = false
 static_ips = ["192.168.20.10", "192.168.20.11"]
 ```
 
-You can also leave `auto_discover = true` and use `static_ips` as extra discovery seeds.
+You can also leave `auto_discover = true` and use `static_ips` as fallback discovery seeds, including when multicast fails. Discovery has one overall deadline, tries up to four seeds at once, and uses the first nonempty topology. Only topology-confirmed visible rooms are advertised; nested satellite speakers stay hidden. Endpoints are sorted by stable zone ID so discovery response order does not change RTSP assignments.
+
+The source command above uses the example's `/var/lib/airsonos2` and assigns it to the current user. For the systemd service, create the `airsonos2` service user and use `sudo install -d -o airsonos2 -g airsonos2 /var/lib/airsonos2` instead; systemd also manages this directory through `StateDirectory=airsonos2`. Run doctor as the same user that runs the service.
 
 The service creates one virtual AirPlay endpoint per included Sonos room. It persists virtual endpoint identity metadata under `state_dir/endpoints` and AirPlay 2 pairing keys under `state_dir/pairings`.
 
@@ -104,15 +106,20 @@ RUST_LOG=airsonos2=debug,airsonos2_airplay=debug,shairplay=debug \
   nix develop -c cargo run -p airsonos2-cli -- serve --config config.toml
 ```
 
-Expected behavior after a fix:
+Pause stops the affected room. Resume prepares a new downstream generation. FLUSH keeps the AirPlay session but closes its old HTTP body and replaces the Sonos stream so queued old audio is discarded. A slow room's network requests run independently from other rooms' PCM.
 
-- `AP2 play pause` in shairplay logs is followed by `pausing Sonos playback` in airsonos2 logs.
-- `AP2 play start` is followed by `resuming Sonos playback`.
-- `AirPlay audio buffer flushed` should not be followed by `bridge session stopped`.
-- `live MP3 stream ready; starting Sonos playback` should appear before the first Sonos `Play` for a new session.
+WAV headers are available during preparation, but PCM waits for the cohort's release. The MP3 path remains the compatibility default. Network and HTTP timings do not measure acoustic latency, and automatic sync compensation is disabled.
 
-Tune `[stream].prebuffer_ms` if startup still feels slow. Lower values start Sonos sooner once MP3 data is available; higher values wait longer for the encoder buffer (default `500` ms).
+See [playback timing and offset migration](docs/playback-timing.md) before reusing existing room offsets. Positive offsets describe rooms measured late; `default_offset_ms` is only a fallback. WAV uses the normalized release delays; MP3 does not support this sample alignment mechanism. Missing source timing produces a visible best-effort fallback.
 
 ## License Notice
 
 AirSonos2 is licensed as `MIT OR Apache-2.0`. The AirPlay receiver dependency `shairplay` is licensed `LGPL-3.0-or-later`; downstream distributors should review the LGPL obligations for their packaging model.
+
+## Operational checks
+
+`doctor` validates the selected codec, tests a short MP3 encode with a five-second deadline, and skips FFmpeg for native WAV. It discovers and filters the configured rooms before testing their exact RTSP port range, the HTTP listener, and the diagnostics listener. It writes and removes temporary probes in the state, endpoint and pairing directories to check the runtime user's access. Port checks require the service to be stopped.
+
+Stream HTTP exposes `/healthz` for container and Home Assistant health checks. Detailed `/metrics` is available only on `[diagnostics].metrics_addr` (default `0.0.0.0:9100`). Set that address to a local or management interface when needed. Device discovery and SOAP connect directly, ignore ambient HTTP proxies, refuse redirects, and bound response sizes.
+
+Release publication runs the reusable CI checks on the tagged commit. The tag, workspace Cargo version, and Home Assistant version must agree before either architecture is published.

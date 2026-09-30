@@ -6,8 +6,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{HeaderValue, Response, StatusCode};
-use axum::response::IntoResponse;
+use axum::http::{Response, StatusCode};
 use axum::routing::get;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -36,7 +35,6 @@ pub fn build_stream_router(registry: StreamRegistry, ffmpeg_path: PathBuf) -> Ro
 
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/metrics", get(metrics))
         .route("/streams/{session_id}", get(stream_session))
         .route("/test-tone.mp3", get(test_tone))
         .with_state(state)
@@ -58,16 +56,6 @@ pub async fn serve_stream_http(
 
 async fn healthz() -> &'static str {
     "ok\n"
-}
-
-async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
-    (
-        [(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; version=0.0.4"),
-        )],
-        state.registry.metrics_text().await,
-    )
 }
 
 async fn stream_session(
@@ -94,19 +82,39 @@ async fn stream_session(
     }
     let (prelude, subscriber) = stream.attach_subscriber();
     debug!(%session_id, "HTTP stream subscriber attached");
-    let live_stream = BroadcastStream::new(subscriber).filter_map(|message| async {
-        match message {
-            Ok(bytes) => Some(Ok::<Bytes, Infallible>(bytes)),
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => None,
-        }
-    });
+    let live_stream =
+        BroadcastStream::new(subscriber)
+            .take_while(|message| {
+                futures_util::future::ready(message.as_ref().is_ok_and(|chunk| {
+                    chunk.queued_at.elapsed() <= std::time::Duration::from_secs(2)
+                }))
+            })
+            .map(|message| Ok::<Bytes, Infallible>(message.expect("valid live chunk").bytes));
     let prelude_stream = stream::iter(prelude.map(Ok::<Bytes, Infallible>));
-    let body_stream = prelude_stream.chain(live_stream);
+    let terminal = stream.clone();
+    let guard = SubscriberGuard(stream.clone());
+    let body_stream = prelude_stream
+        .chain(live_stream)
+        .take_until(async move { terminal.closed().await })
+        .map(move |chunk| {
+            if let Ok(bytes) = &chunk {
+                guard.0.record_body_consumed(bytes.len());
+            }
+            chunk
+        });
 
     Ok(stream_response(
         stream.session.codec,
         Body::from_stream(body_stream),
     ))
+}
+
+struct SubscriberGuard(crate::registry::LiveStream);
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        self.0.detach_subscriber();
+    }
 }
 
 fn stream_generation(query: Option<&str>) -> Result<Option<u64>, StatusCode> {
@@ -145,15 +153,15 @@ async fn test_tone(State(state): State<HttpState>) -> Result<Response<Body>, Sta
         .arg("-b:a")
         .arg("128k")
         .arg("pipe:1")
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let stdout = child.stdout.take().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let stream = ReaderStream::new(stdout);
-
-    tokio::spawn(async move {
-        let _ = child.wait().await;
+    let stream = ReaderStream::new(stdout).map(move |chunk| {
+        let _ = &child;
+        chunk
     });
 
     Ok(stream_response(StreamCodec::Mp3, Body::from_stream(stream)))
@@ -189,6 +197,134 @@ mod tests {
     use http::{Request, StatusCode};
     use tower::ServiceExt;
     use url::Url;
+
+    #[tokio::test]
+    async fn removal_and_replacement_close_attached_bodies() {
+        for replace in [false, true] {
+            let registry = StreamRegistry::new();
+            let session = StreamSession {
+                session_id: SessionId::new(),
+                zone_id: ZoneId::new("TEST"),
+                codec: StreamCodec::Wav,
+                generation: 1,
+                local_url: Url::parse("http://localhost/stream.wav").unwrap(),
+                encoder_state: EncoderState::Running,
+            };
+            let id = session.session_id;
+            let live = registry.create(session.clone()).await;
+            let response = build_stream_router(registry.clone(), PathBuf::from("ffmpeg"))
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/streams/{id}.wav"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut body = response.into_body().into_data_stream();
+            live.publish(Bytes::from_static(b"queued-old-data"));
+            if replace {
+                registry
+                    .create(StreamSession {
+                        generation: 2,
+                        ..session
+                    })
+                    .await;
+            } else {
+                registry.remove(&id).await;
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+                    .await
+                    .expect("body must close")
+                    .is_none()
+            );
+            assert!(live.is_closed());
+            drop(body);
+            assert!(!live.timing().subscriber_connected);
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_body_closes_when_bounded_output_queue_overflows() {
+        let registry = StreamRegistry::new();
+        let session_id = SessionId::new();
+        let stream = registry
+            .create(StreamSession {
+                session_id,
+                zone_id: ZoneId::new("test"),
+                codec: StreamCodec::Mp3,
+                generation: 1,
+                local_url: Url::parse("http://localhost/test.mp3").unwrap(),
+                encoder_state: EncoderState::Running,
+            })
+            .await;
+        let response = build_stream_router(registry, PathBuf::from("unused"))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/streams/{session_id}.mp3"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..65 {
+            stream.publish(Bytes::from(vec![1; 16 * 1024]));
+        }
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().await.is_none());
+        assert_eq!(stream.bytes_served(), 0);
+    }
+
+    #[tokio::test]
+    async fn body_accounting_counts_consumption_and_survives_removal_and_replacement() {
+        let registry = StreamRegistry::new();
+        let session_id = SessionId::new();
+        let session = StreamSession {
+            session_id,
+            zone_id: ZoneId::new("test"),
+            codec: StreamCodec::Mp3,
+            generation: 1,
+            local_url: Url::parse("http://localhost/test.mp3").unwrap(),
+            encoder_state: EncoderState::Running,
+        };
+        let stream = registry.create(session.clone()).await;
+        let response = build_stream_router(registry.clone(), PathBuf::from("unused"))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/streams/{session_id}.mp3"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        stream.publish(Bytes::from_static(b"abc"));
+        assert_eq!(stream.bytes_served(), 0);
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap().len(), 3);
+        assert_eq!(stream.bytes_served(), 3);
+        assert!(
+            registry
+                .metrics_text()
+                .await
+                .contains("airsonos2_http_body_bytes_consumed 3\n")
+        );
+        registry.create(session).await;
+        assert!(
+            registry
+                .metrics_text()
+                .await
+                .contains("airsonos2_http_body_bytes_consumed 3\n")
+        );
+        registry.remove(&session_id).await;
+        assert!(
+            registry
+                .metrics_text()
+                .await
+                .contains("airsonos2_http_body_bytes_consumed 3\n")
+        );
+        assert!(body.next().await.is_none());
+    }
 
     #[tokio::test]
     async fn streams_registered_mp3_chunks() {

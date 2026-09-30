@@ -423,6 +423,9 @@ impl AlacDecoder {
 
     /// Decode one ALAC frame. Returns the number of bytes written to output (S16LE).
     pub fn decode_frame(&mut self, input: &[u8], output: &mut [u8]) -> usize {
+        if input.is_empty() || (input[0] >> 5) as i32 != self.num_channels - 1 {
+            return 0;
+        }
         let mut reader = BitReader::new(input);
         let mut output_samples = self.max_samples_per_frame as usize;
         let channels = reader.readbits(3);
@@ -438,10 +441,16 @@ impl AlacDecoder {
 
     /// Decode an ALAC frame and return F32LE interleaved samples.
     pub fn decode_frame_f32(&mut self, input: &[u8]) -> Option<Vec<f32>> {
-        let mut s16_buf = vec![0u8; 16384];
+        let capacity = (self.max_samples_per_frame as usize)
+            .checked_mul(self.num_channels as usize)?
+            .checked_mul(2)?;
+        if capacity == 0 || capacity > 16384 {
+            return None;
+        }
+        let mut s16_buf = vec![0u8; capacity];
         let len = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.decode_frame(input, &mut s16_buf)))
             .unwrap_or(0);
-        if len == 0 {
+        if len == 0 || len > s16_buf.len() {
             return None;
         }
         Some(
@@ -470,6 +479,14 @@ impl AlacDecoder {
             *output_size = *output_samples * self.bytes_per_sample as usize;
         }
 
+        if *output_samples == 0
+            || *output_samples > self.max_samples_per_frame as usize
+            || *output_size > output.len()
+            || uncompressed_bytes * 8 >= self.sample_size_config as u32
+        {
+            *output_size = 0;
+            return;
+        }
         let readsamplesize = self.sample_size_config as u32 - uncompressed_bytes * 8;
 
         if is_not_compressed == 0 {
@@ -513,19 +530,17 @@ impl AlacDecoder {
                 predictor_coef_num,
                 prediction_quantitization as i32,
             );
+        } else if self.sample_size_config <= 16 {
+            for i in 0..*output_samples {
+                let v = reader.readbits(self.sample_size_config as u32);
+                self.outputsamples_buffer_a[i] = sign_extend_32(v as i32, self.sample_size_config as u32);
+            }
         } else {
-            if self.sample_size_config <= 16 {
-                for i in 0..*output_samples {
-                    let v = reader.readbits(self.sample_size_config as u32);
-                    self.outputsamples_buffer_a[i] = sign_extend_32(v as i32, self.sample_size_config as u32);
-                }
-            } else {
-                for i in 0..*output_samples {
-                    let mut v = reader.readbits(16) as i32;
-                    v <<= self.sample_size_config as u32 - 16;
-                    v |= reader.readbits(self.sample_size_config as u32 - 16) as i32;
-                    self.outputsamples_buffer_a[i] = sign_extend_24(v);
-                }
+            for i in 0..*output_samples {
+                let mut v = reader.readbits(16) as i32;
+                v <<= self.sample_size_config as u32 - 16;
+                v |= reader.readbits(self.sample_size_config as u32 - 16) as i32;
+                self.outputsamples_buffer_a[i] = sign_extend_24(v);
             }
         }
 
@@ -573,6 +588,14 @@ impl AlacDecoder {
             *output_size = *output_samples * self.bytes_per_sample as usize;
         }
 
+        if *output_samples == 0
+            || *output_samples > self.max_samples_per_frame as usize
+            || *output_size > output.len()
+            || uncompressed_bytes * 8 >= self.sample_size_config as u32
+        {
+            *output_size = 0;
+            return;
+        }
         let readsamplesize = self.sample_size_config as u32 - uncompressed_bytes * 8 + 1;
         let mut interlacing_shift = 0u8;
         let mut interlacing_leftweight = 0u8;
@@ -653,26 +676,24 @@ impl AlacDecoder {
                 pred_num_b,
                 pred_quant_b as i32,
             );
+        } else if self.sample_size_config <= 16 {
+            for i in 0..*output_samples {
+                let a = reader.readbits(self.sample_size_config as u32);
+                let b = reader.readbits(self.sample_size_config as u32);
+                self.outputsamples_buffer_a[i] = sign_extend_32(a as i32, self.sample_size_config as u32);
+                self.outputsamples_buffer_b[i] = sign_extend_32(b as i32, self.sample_size_config as u32);
+            }
         } else {
-            if self.sample_size_config <= 16 {
-                for i in 0..*output_samples {
-                    let a = reader.readbits(self.sample_size_config as u32);
-                    let b = reader.readbits(self.sample_size_config as u32);
-                    self.outputsamples_buffer_a[i] = sign_extend_32(a as i32, self.sample_size_config as u32);
-                    self.outputsamples_buffer_b[i] = sign_extend_32(b as i32, self.sample_size_config as u32);
-                }
-            } else {
-                for i in 0..*output_samples {
-                    let mut a = reader.readbits(16) as i32;
-                    a <<= self.sample_size_config as u32 - 16;
-                    a |= reader.readbits(self.sample_size_config as u32 - 16) as i32;
-                    self.outputsamples_buffer_a[i] = sign_extend_24(a);
+            for i in 0..*output_samples {
+                let mut a = reader.readbits(16) as i32;
+                a <<= self.sample_size_config as u32 - 16;
+                a |= reader.readbits(self.sample_size_config as u32 - 16) as i32;
+                self.outputsamples_buffer_a[i] = sign_extend_24(a);
 
-                    let mut b = reader.readbits(16) as i32;
-                    b <<= self.sample_size_config as u32 - 16;
-                    b |= reader.readbits(self.sample_size_config as u32 - 16) as i32;
-                    self.outputsamples_buffer_b[i] = sign_extend_24(b);
-                }
+                let mut b = reader.readbits(16) as i32;
+                b <<= self.sample_size_config as u32 - 16;
+                b |= reader.readbits(self.sample_size_config as u32 - 16) as i32;
+                self.outputsamples_buffer_b[i] = sign_extend_24(b);
             }
         }
 
