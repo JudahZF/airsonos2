@@ -42,10 +42,13 @@ pub enum DiscoveryError {
     #[error("discovery exhausted its overall budget without a usable topology")]
     NoTopology,
     #[error("failed to create direct-device HTTP client: {0}")]
-    Http(#[from] reqwest::Error),
+    HttpClient(reqwest::Error),
     #[error("failed to query Sonos topology: {0}")]
     Topology(#[from] crate::client::SonosClientError),
 }
+
+/// Sonos may delay its SSDP reply by up to the `MX` seconds sent in M-SEARCH.
+const SSDP_MX: Duration = Duration::from_secs(1);
 
 pub async fn discover_sonos_devices(
     timeout: Duration,
@@ -108,10 +111,12 @@ pub async fn discover_sonos_zones_from_sources(
     static_ips: &[IpAddr],
     auto_discover: bool,
 ) -> Result<Vec<SonosZone>, DiscoveryError> {
-    // Reserve most of the overall budget for HTTP, including fallback seeds.
+    // Listen for a third of the budget, but never less than the advertised SSDP
+    // response window. The rest is reserved for HTTP, including fallback seeds.
     let deadline = time::Instant::now() + timeout;
+    let multicast_window = (timeout / 3).max(SSDP_MX).min(timeout);
     let multicast = if auto_discover {
-        time::timeout(timeout / 3, discover_sonos_devices(timeout / 3))
+        time::timeout(multicast_window, discover_sonos_devices(multicast_window))
             .await
             .unwrap_or(Err(DiscoveryError::NoTopology))
     } else {
@@ -156,7 +161,8 @@ async fn discover_devices_until(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(2))
-        .build()?;
+        .build()
+        .map_err(DiscoveryError::HttpClient)?;
     let mut pending = devices.into_iter();
     let mut probes = JoinSet::new();
     let mut zones = BTreeMap::new();
@@ -211,11 +217,16 @@ async fn fetch_description(
     http: &reqwest::Client,
     device: &DiscoveredDevice,
 ) -> Result<SonosZone, DiscoveryError> {
+    let fetch_error = |source| DiscoveryError::DescriptionFetch {
+        url: device.location.clone(),
+        source,
+    };
     let mut response = http
         .get(device.location.clone())
         .send()
-        .await?
-        .error_for_status()?;
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(fetch_error)?;
     const MAX_DESCRIPTION_BYTES: usize = 1024 * 1024;
     if response
         .content_length()
@@ -224,7 +235,7 @@ async fn fetch_description(
         return Err(DiscoveryError::BodyTooLarge);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    while let Some(chunk) = response.chunk().await.map_err(fetch_error)? {
         if chunk.len() > MAX_DESCRIPTION_BYTES - body.len() {
             return Err(DiscoveryError::BodyTooLarge);
         }
@@ -413,6 +424,11 @@ mod tests {
         assert!(matches!(
             fetch_description(&http, &device).await,
             Err(DiscoveryError::DescriptionParse { .. })
+        ));
+        device.location.set_path("/missing");
+        assert!(matches!(
+            fetch_description(&http, &device).await,
+            Err(DiscoveryError::DescriptionFetch { .. })
         ));
         task.abort();
         let _ = task.await;
