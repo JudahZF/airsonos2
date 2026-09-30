@@ -11,7 +11,8 @@ pub struct ZoneGroupMember {
 }
 
 /// Parse direct topology XML or the escaped payload inside a SOAP response.
-/// An incomplete or malformed topology is never used to advertise rooms.
+/// A structurally incomplete or malformed topology is never used to advertise
+/// rooms. Attribute values that fail entity decoding keep their raw text.
 pub fn parse_zone_group_state(xml: &str) -> Vec<ZoneGroupMember> {
     let mut envelope = Reader::from_str(xml);
     let mut payload = None;
@@ -89,17 +90,19 @@ pub fn parse_zone_group_state(xml: &str) -> Vec<ZoneGroupMember> {
     members
 }
 
+/// Falls back to the raw text when entity decoding fails (for example an
+/// unescaped `&` in a room name), so the room keeps its UUID and name.
 fn attr(element: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
-    element.attributes().flatten().find_map(|attribute| {
-        (attribute.key.as_ref() == key)
-            .then(|| {
-                attribute
-                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                    .ok()
-                    .map(|value| value.into_owned())
-            })
-            .flatten()
-    })
+    let attribute = element
+        .attributes()
+        .flatten()
+        .find(|attribute| attribute.key.as_ref() == key)?;
+    Some(
+        match attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
+            Ok(value) => value.into_owned(),
+            Err(_) => String::from_utf8_lossy(&attribute.value).into_owned(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -125,6 +128,15 @@ mod tests {
         let soap = r#"<Envelope><ZoneGroupState><![CDATA[<ZoneGroups><ZoneGroup Coordinator="main"><ZoneGroupMember UUID="main" ZoneName="Kitchen &amp; Dining" /></ZoneGroup></ZoneGroups>]]></ZoneGroupState></Envelope>"#;
         let members = parse_zone_group_state(soap);
         assert_eq!(members[0].zone_name, "Kitchen & Dining");
+    }
+
+    #[test]
+    fn keeps_raw_attribute_text_when_entity_decoding_fails() {
+        let xml = r#"<ZoneGroups><ZoneGroup Coordinator="main"><ZoneGroupMember UUID="main" ZoneName="Bad &unknown; Name" /><ZoneGroupMember UUID="other" ZoneName="Kitchen & Dining" /></ZoneGroup></ZoneGroups>"#;
+        let members = parse_zone_group_state(xml);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].zone_name, "Bad &unknown; Name");
+        assert_eq!(members[1].zone_name, "Kitchen & Dining");
     }
 
     #[test]
