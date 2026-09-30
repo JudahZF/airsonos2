@@ -14,20 +14,35 @@ use crate::raop::video::{PacketKind, VideoPacket, VideoSession};
 const VIDEO_HEADER_LEN: usize = 128;
 const MAX_VIDEO_PAYLOAD_LEN: usize = 32 * 1024 * 1024;
 
-/// Run the video stream receiver. Accepts one TCP connection and processes packets.
-pub async fn run(listener: TcpListener, cipher: VideoCipher, session: Box<dyn VideoSession>) {
-    let (stream, addr) = match listener.accept().await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Video stream accept failed: {e}");
-            return;
-        }
-    };
-    info!(%addr, "Video stream client connected");
-    process(stream, cipher, session).await;
+/// Calls [`VideoSession::on_video_end`] exactly once, including when the
+/// receiver future is cancelled before or during streaming.
+struct EndOnDrop(Box<dyn VideoSession>);
+
+impl Drop for EndOnDrop {
+    fn drop(&mut self) {
+        self.0.on_video_end();
+    }
 }
 
-async fn process(mut stream: TcpStream, mut cipher: VideoCipher, mut session: Box<dyn VideoSession>) {
+/// Run the video stream receiver. Accepts one TCP connection and processes packets.
+///
+/// The session is ended when the returned future completes or is dropped.
+pub fn run(listener: TcpListener, cipher: VideoCipher, session: Box<dyn VideoSession>) -> impl Future<Output = ()> {
+    let mut session = EndOnDrop(session);
+    async move {
+        let (stream, addr) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Video stream accept failed: {e}");
+                return;
+            }
+        };
+        info!(%addr, "Video stream client connected");
+        process(stream, cipher, session.0.as_mut()).await;
+    }
+}
+
+async fn process(mut stream: TcpStream, mut cipher: VideoCipher, session: &mut dyn VideoSession) {
     let mut header = [0u8; VIDEO_HEADER_LEN];
 
     loop {
@@ -85,5 +100,31 @@ async fn process(mut stream: TcpStream, mut cipher: VideoCipher, mut session: Bo
             payload: payload.freeze(),
         });
     }
-    session.on_video_end();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Session(std::sync::mpsc::Sender<()>);
+    impl VideoSession for Session {
+        fn on_video(&mut self, _: VideoPacket) {}
+        fn on_video_end(&mut self) {
+            self.0.send(()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_receiver_ends_session_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (ended, end_events) = std::sync::mpsc::channel();
+        let task = tokio::spawn(run(
+            listener,
+            VideoCipher::new(&[0; 16], &[0; 16]),
+            Box::new(Session(ended)),
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(end_events.try_recv().is_ok());
+        assert!(end_events.try_recv().is_err());
+    }
 }
