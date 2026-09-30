@@ -111,14 +111,14 @@ pub async fn discover_sonos_zones_from_sources(
     static_ips: &[IpAddr],
     auto_discover: bool,
 ) -> Result<Vec<SonosZone>, DiscoveryError> {
-    // Listen for a third of the budget, but never less than the advertised SSDP
-    // response window. The rest is reserved for HTTP, including fallback seeds.
+    // Listen for a third of the budget, and at least the advertised SSDP response
+    // window when the budget allows it. At least half is reserved for HTTP,
+    // including fallback seeds. The listener stops at its own deadline, so an
+    // outer timeout would only race it and discard the replies it collected.
     let deadline = time::Instant::now() + timeout;
-    let multicast_window = (timeout / 3).max(SSDP_MX).min(timeout);
+    let multicast_window = (timeout / 3).max(SSDP_MX).min(timeout / 2);
     let multicast = if auto_discover {
-        time::timeout(multicast_window, discover_sonos_devices(multicast_window))
-            .await
-            .unwrap_or(Err(DiscoveryError::NoTopology))
+        discover_sonos_devices(multicast_window).await
     } else {
         Ok(Vec::new())
     };
