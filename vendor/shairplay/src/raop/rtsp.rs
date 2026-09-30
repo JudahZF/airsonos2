@@ -232,16 +232,8 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
         #[cfg(feature = "ap2")]
         {
             let active = conn.controller_session.lock().unwrap();
-            // A former media connection is tied to its old stream. Only a separate
-            // control-only connection may follow replacements for the same identity.
-            if conn.has_owned_audio && active.owner_connection.as_deref() != Some(conn.nonce.as_str()) {
-                response = HttpResponse::new("RTSP/1.0", 409, "Stale Session");
-                response.add_header("CSeq", cseq);
-                response.finish(None);
-                return response;
-            }
-            if !active.permits(ap2_authenticated, conn.controller_id.as_deref()) {
-                response = HttpResponse::new("RTSP/1.0", 403, "Forbidden");
+            if let Some((code, reason)) = session_rejection(conn, &active) {
+                response = HttpResponse::new("RTSP/1.0", code, reason);
                 response.add_header("CSeq", cseq);
                 response.finish(None);
                 return response;
@@ -331,6 +323,23 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
     None
 }
 
+/// Why `conn` may not act on the shared session, if it may not. Callers that
+/// mutate the session must hold the lock from this check through the mutation,
+/// because another connection can claim the session between two lock sections.
+#[cfg(feature = "ap2")]
+pub(crate) fn session_rejection(
+    conn: &RaopConnection,
+    active: &super::connection::ControllerSession,
+) -> Option<(u16, &'static str)> {
+    // A former media connection is tied to its old stream. Only a separate
+    // control-only connection may follow replacements for the same identity.
+    if conn.has_owned_audio && active.owner_connection.as_deref() != Some(conn.nonce.as_str()) {
+        return Some((409, "Stale Session"));
+    }
+    let authenticated = conn.ap2_shared_secret.is_some() && conn.controller_id.is_some();
+    (!active.permits(authenticated, conn.controller_id.as_deref())).then_some((403, "Forbidden"))
+}
+
 #[cfg(feature = "ap2")]
 pub(crate) fn send_playout_command(
     conn: &RaopConnection,
@@ -392,6 +401,12 @@ fn handle_teardown(conn: &mut RaopConnection, _request: &HttpRequest, response: 
     #[cfg(feature = "ap2")]
     {
         let mut active = conn.controller_session.lock().unwrap();
+        // Dispatch authorized this request under an earlier lock. A replacement
+        // may have claimed the session since, so a stale media connection must
+        // not cancel it.
+        if session_rejection(conn, &active).is_some() {
+            return None;
+        }
         // Terminal cancellation bypasses the bounded command queue, including
         // when TEARDOWN arrives on an associated control-only connection.
         if let Some(task) = active.media_abort.take() {
