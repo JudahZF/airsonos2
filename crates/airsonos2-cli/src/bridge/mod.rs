@@ -57,13 +57,23 @@ impl ZoneWorker {
                                 }
                             }
                         };
+                        // Idle (disconnect without stop_on_disconnect) cannot recall a Play
+                        // that Sonos already received, so undo it once Sonos replies.
+                        let orphaned = matches!(*commands.borrow(), Some(TransportCommand::Idle))
+                            && matches!(
+                                outcome,
+                                DownstreamStartOutcome::Started | DownstreamStartOutcome::Unknown
+                            );
                         let _ = result_tx.send(DownstreamStartResult {
                             session_id: stream.session_id,
-                            zone_id: stream.zone_id,
+                            zone_id: stream.zone_id.clone(),
                             generation: stream.generation,
                             outcome,
                             timing: (outcome == DownstreamStartOutcome::Started).then_some(timing),
                         });
+                        if orphaned && let Err(error) = transport_client.stop().await {
+                            warn!(zone_id = %stream.zone_id, "Stop after disconnected Play failed: {error}");
+                        }
                     }
                     Some(TransportCommand::Stop {
                         session_id,

@@ -150,3 +150,23 @@ async fn play_timeout_is_unknown_and_has_no_startup_timing() {
     assert!(result.timing.is_none());
     worker.shutdown().await;
 }
+
+#[tokio::test]
+async fn play_completed_after_idle_is_stopped() {
+    let mut fake = FakeSonos::start().await;
+    let (tx, _) = mpsc::unbounded_channel();
+    let worker = ZoneWorker::new(fake.client.clone(), tx, Duration::ZERO, Duration::ZERO);
+    let mut prepared =
+        crate::tests::prepared_downstream(SessionId::new(), ZoneId::new("TEST"), StreamCodec::Mp3);
+    prepared.client = fake.client.clone();
+    worker.command(TransportCommand::Play(prepared));
+    let (body, release) = fake.request().await;
+    assert!(body.contains("#Play"));
+    worker.command(TransportCommand::Idle);
+    release.send(()).unwrap();
+    let (body, release) = fake.request().await;
+    assert!(body.contains("#Stop"));
+    release.send(()).unwrap();
+    worker.shutdown().await;
+    assert!(fake.requests.try_recv().is_err());
+}
