@@ -36,7 +36,9 @@ pub async fn run(
     mut commands: tokio::sync::mpsc::Receiver<super::buffered_audio::PlayoutCommand>,
 ) {
     let cipher = ChaCha20Poly1305::new((&shk).into());
-    let mut buf = vec![0u8; 4096];
+    // An uncompressed 4096-frame S16 stereo ALAC packet is ~16 KiB; recv
+    // silently truncates datagrams that do not fit.
+    let mut buf = vec![0u8; super::buffer::RAOP_PACKET_LEN];
     let config = &output_config.alac;
     let mut decoder = crate::codec::alac::AlacDecoder::new(config.bit_depth as i32, config.num_channels as i32);
     decoder.set_info(&super::buffer::build_decoder_info(config));
@@ -54,10 +56,8 @@ pub async fn run(
 
     loop {
         let n = tokio::select! {
-            result = socket.recv(&mut buf) => match result {
-                Ok(0) => break, Ok(n) => n,
-                Err(error) => { warn!(%error, "Realtime receive failed"); break; }
-            },
+            // A pending FLUSH must reset state before any later packet is delivered.
+            biased;
             command = commands.recv() => {
                 match command {
                     Some(super::buffered_audio::PlayoutCommand::Flush { until_seq, .. }) => {
@@ -72,6 +72,10 @@ pub async fn run(
                 }
                 continue;
             }
+            result = socket.recv(&mut buf) => match result {
+                Ok(n) => n,
+                Err(error) => { warn!(%error, "Realtime receive failed"); break; }
+            },
         };
 
         let packet = &buf[..n];

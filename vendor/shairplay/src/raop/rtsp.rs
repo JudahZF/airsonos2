@@ -360,7 +360,9 @@ pub(crate) fn send_playout_command(
     }
 }
 
-/// FLUSH: parse RTP-Info header and flush the buffer inline.
+/// FLUSH: parse RTP-Info header and flush the buffer inline. `seq` is the
+/// first packet to keep, so everything in the half of the sequence space
+/// before it is flushed.
 fn handle_flush_inline(
     conn: &mut RaopConnection,
     request: &HttpRequest,
@@ -379,8 +381,8 @@ fn handle_flush_inline(
             send_playout_command(
                 conn,
                 super::buffered_audio::PlayoutCommand::Flush {
-                    from_seq: 0,
-                    until_seq: u32::from(next_seq),
+                    from_seq: u32::from(next_seq.wrapping_sub(0x8000)),
+                    until_seq: u32::from(next_seq.wrapping_sub(1)),
                 },
                 _response,
             );

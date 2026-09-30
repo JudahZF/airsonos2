@@ -577,6 +577,40 @@ mod controller_acceptance {
         assert!(server.shared.controller_session.lock().unwrap().owner.is_none());
     }
     #[tokio::test]
+    async fn inline_flush_keeps_announced_sequence_across_wraparound() {
+        use crate::raop::buffered_audio::PlayoutCommand;
+        let server = RaopServer::builder()
+            .pin("1234")
+            .build(Arc::new(Handler::default()))
+            .unwrap();
+        let key = SigningKey::from_bytes(&[17; 32]);
+        server.shared.pairing_store.put("owner", key.verifying_key().to_bytes());
+        let mut control = server
+            .shared
+            .conn_init("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:8000".parse().unwrap())
+            .unwrap();
+        verify(control.as_mut(), "owner", &key);
+        let (commands, mut pending) = tokio::sync::mpsc::channel(1);
+        {
+            let mut active = server.shared.controller_session.lock().unwrap();
+            active.owner = Some("owner".into());
+            active.playout = Some(commands);
+        }
+        let mut flush = HttpRequest::new();
+        flush
+            .add_data(b"FLUSH /stream RTSP/1.0\r\nCSeq: 1\r\nRTP-Info: seq=2;rtptime=0\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        assert_eq!(control.conn_request(&flush).status_code(), 200);
+        // seq=2 is the first packet to keep; 65535 from before the wrap is stale.
+        assert!(matches!(
+            pending.try_recv(),
+            Ok(PlayoutCommand::Flush {
+                from_seq: 32770,
+                until_seq: 1
+            })
+        ));
+    }
+    #[tokio::test]
     async fn saturated_control_queue_rejects_mutation_but_teardown_always_cancels() {
         use crate::raop::buffered_audio::PlayoutCommand;
         let handler = Arc::new(Handler::default());
