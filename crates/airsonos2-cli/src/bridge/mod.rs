@@ -3,9 +3,8 @@ use tokio::sync::watch;
 
 #[derive(Clone)]
 pub(super) enum TransportCommand {
-    Idle,
-    Prepare(SonosStreamPrepare),
-    Play(PreparedDownstream),
+    Prepare(Box<SonosStreamPrepare>),
+    Play(Box<PreparedDownstream>),
     Stop {
         session_id: SessionId,
         zone_id: ZoneId,
@@ -34,16 +33,11 @@ impl ZoneWorker {
                 let command = commands.borrow_and_update().clone();
                 match command {
                     Some(TransportCommand::Prepare(start)) => {
-                        prepare(start, &commands, subscriber_wait, prebuffer).await;
+                        prepare(*start, &commands, subscriber_wait, prebuffer).await;
                     }
                     Some(TransportCommand::Play(stream)) => {
-                        let started = Instant::now();
-                        let mut timing = stream.timing.clone();
                         let outcome = match stream.client.play().await {
-                            Ok(()) => {
-                                timing.play_ms = Some(started.elapsed().as_millis() as u64);
-                                DownstreamStartOutcome::Started
-                            }
+                            Ok(()) => DownstreamStartOutcome::Started,
                             Err(error) if error.is_timeout() => {
                                 warn!(zone_id = %stream.zone_id, "Play timed out; playback is unknown, retrying the same stream");
                                 DownstreamStartOutcome::Unknown
@@ -57,23 +51,12 @@ impl ZoneWorker {
                                 }
                             }
                         };
-                        // Idle (disconnect without stop_on_disconnect) cannot recall a Play
-                        // that Sonos already received, so undo it once Sonos replies.
-                        let orphaned = matches!(*commands.borrow(), Some(TransportCommand::Idle))
-                            && matches!(
-                                outcome,
-                                DownstreamStartOutcome::Started | DownstreamStartOutcome::Unknown
-                            );
                         let _ = result_tx.send(DownstreamStartResult {
                             session_id: stream.session_id,
-                            zone_id: stream.zone_id.clone(),
+                            zone_id: stream.zone_id,
                             generation: stream.generation,
                             outcome,
-                            timing: (outcome == DownstreamStartOutcome::Started).then_some(timing),
                         });
-                        if orphaned && let Err(error) = transport_client.stop().await {
-                            warn!(zone_id = %stream.zone_id, "Stop after disconnected Play failed: {error}");
-                        }
                     }
                     Some(TransportCommand::Stop {
                         session_id,
@@ -92,10 +75,9 @@ impl ZoneWorker {
                             zone_id,
                             generation,
                             outcome,
-                            timing: None,
                         });
                     }
-                    Some(TransportCommand::Idle) | None => {}
+                    None => {}
                 }
             }
         });
@@ -161,7 +143,6 @@ async fn prepare(
             } else {
                 DownstreamStartOutcome::PermanentFailure
             },
-            timing: None,
         });
     };
     // Group members reject AVTransport commands, so leave the group before the
@@ -181,7 +162,6 @@ async fn prepare(
     if commands.has_changed().unwrap_or(true) {
         return;
     }
-    let prepare_started = Instant::now();
     if let Err(error) = start
         .client
         .set_av_transport_uri(
@@ -193,7 +173,6 @@ async fn prepare(
         failure(error);
         return;
     }
-    let set_uri_ms = prepare_started.elapsed().as_millis() as u64;
     if commands.has_changed().unwrap_or(true) {
         return;
     }
@@ -208,7 +187,6 @@ async fn prepare(
             }
         } => {}
     }
-    let timing = start.live_stream.timing();
     let _ = start.prepared_tx.send(PreparedDownstream {
         session_id: start.session_id,
         zone_id: start.zone_id,
@@ -216,16 +194,6 @@ async fn prepare(
         zone_room_name: start.zone.room_name,
         client: start.client,
         live_stream: start.live_stream,
-        timing: ZoneStartupTiming {
-            set_uri_ms: Some(set_uri_ms),
-            subscriber_connect_ms: timing
-                .subscriber_connected_at
-                .map(|at| at.saturating_duration_since(prepare_started).as_millis() as u64),
-            first_bytes_ms: timing
-                .first_served_at
-                .map(|at| at.saturating_duration_since(prepare_started).as_millis() as u64),
-            play_ms: None,
-        },
     });
 }
 

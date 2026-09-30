@@ -8,9 +8,8 @@ use airsonos2_airplay::{
     AirPlayEndpointRunner, AirPlayEvent, FilePairingStore, PcmFormat, ZoneVolumeState,
 };
 use airsonos2_core::{
-    Config, EncoderState, SessionId, SonosZone, StartupDelayEstimator, StreamCodec, StreamSession,
-    VirtualAirPlayEndpoint, ZoneId, ZoneStartupTiming, configured_delays, filter_zones,
-    sonos_volume_to_airplay_db, virtual_endpoint_for_zone,
+    Config, EncoderState, SessionId, SonosZone, StreamCodec, StreamSession, VirtualAirPlayEndpoint,
+    ZoneId, configured_delays, filter_zones, sonos_volume_to_airplay_db, virtual_endpoint_for_zone,
 };
 use airsonos2_diagnostics::{CheckStatus, run_doctor, serve_diagnostics};
 use airsonos2_sonos::{SonosClient, discover_sonos_zones_from_sources};
@@ -542,7 +541,6 @@ struct BridgeRuntime {
     cohort_wake_tx: mpsc::UnboundedSender<()>,
     cohort_wake_rx: mpsc::UnboundedReceiver<()>,
     sync_cohort: Option<SyncCohort>,
-    startup_estimator: StartupDelayEstimator,
     tasks: tokio::task::JoinSet<()>,
 }
 
@@ -629,7 +627,6 @@ struct DownstreamStartResult {
     zone_id: ZoneId,
     generation: u64,
     outcome: DownstreamStartOutcome,
-    timing: Option<ZoneStartupTiming>,
 }
 
 #[derive(Debug)]
@@ -649,7 +646,6 @@ struct PreparedDownstream {
     zone_room_name: String,
     client: SonosClient,
     live_stream: LiveStream,
-    timing: ZoneStartupTiming,
 }
 
 #[derive(Clone, Debug)]
@@ -671,10 +667,6 @@ impl BridgeRuntime {
         let (downstream_retry_tx, downstream_retry_rx) = mpsc::unbounded_channel();
         let (prepared_tx, prepared_rx) = mpsc::unbounded_channel();
         let (cohort_wake_tx, cohort_wake_rx) = mpsc::unbounded_channel();
-        let startup_estimator = StartupDelayEstimator::new(
-            config.sync.startup_sample_limit,
-            config.sync.startup_min_samples,
-        );
         Self {
             config,
             registry,
@@ -694,7 +686,6 @@ impl BridgeRuntime {
             cohort_wake_tx,
             cohort_wake_rx,
             sync_cohort: None,
-            startup_estimator,
             tasks: tokio::task::JoinSet::new(),
         }
     }
@@ -852,9 +843,6 @@ impl BridgeRuntime {
                 session.observed = ObservedPlayback::Playing;
                 session.reset_needed = false;
                 session.retry_attempts = 0;
-                if let Some(timing) = result.timing {
-                    self.startup_estimator.record(result.zone_id, &timing);
-                }
                 self.cancel_downstream_retry(result.session_id);
             }
             DownstreamStartOutcome::PermanentFailure => {
@@ -888,7 +876,7 @@ impl BridgeRuntime {
         }
         if let Some(prepared) = session.prepared.clone() {
             if let Some(worker) = self.worker(&retry.zone_id) {
-                worker.command(TransportCommand::Play(prepared));
+                worker.command(TransportCommand::Play(Box::new(prepared)));
             }
         } else {
             self.restart_downstream_for_play(retry.session_id, retry.zone_id)
@@ -1218,11 +1206,6 @@ impl BridgeRuntime {
             self.config.sync.default_offset_ms,
         );
         let common_sample = Instant::now() + Duration::from_millis(120);
-        if self.config.sync.startup_compensation {
-            warn!(
-                "automatic sync compensation is disabled: SOAP and HTTP timings are not acoustic latency measurements"
-            );
-        }
         for stream in prepared {
             if stream.live_stream.session.codec == StreamCodec::Wav {
                 let delay = delays
@@ -1246,7 +1229,7 @@ impl BridgeRuntime {
         self.apply_sync_anchors(&prepared);
         for stream in prepared {
             if let Some(worker) = self.worker(&stream.zone_id) {
-                worker.command(TransportCommand::Play(stream));
+                worker.command(TransportCommand::Play(Box::new(stream)));
             }
         }
     }
@@ -1343,7 +1326,7 @@ impl BridgeRuntime {
             result_tx: self.downstream_result_tx.clone(),
         };
         if let Some(worker) = self.worker(&zone_id) {
-            worker.command(TransportCommand::Prepare(start));
+            worker.command(TransportCommand::Prepare(Box::new(start)));
         }
         self.maybe_start_sync_cohort(false).await;
         Ok(())
@@ -1397,17 +1380,12 @@ impl BridgeRuntime {
         let zone_id = fallback_zone_id.unwrap_or_else(|| session.zone_id.clone());
         self.registry.remove(&session_id).await;
         self.retire_encoder(session.encoder.take());
-        let command = if self.config.sonos.stop_on_disconnect {
-            TransportCommand::Stop {
+        if let Some(worker) = self.worker(&zone_id) {
+            worker.command(TransportCommand::Stop {
                 session_id,
                 zone_id: zone_id.clone(),
                 generation: session.generation,
-            }
-        } else {
-            TransportCommand::Idle
-        };
-        if let Some(worker) = self.worker(&zone_id) {
-            worker.command(command);
+            });
         }
         self.maybe_start_sync_cohort(false).await;
         info!(%session_id, "bridge session stopped");
@@ -1547,10 +1525,6 @@ mod tests {
             )
             .expect("client"),
             live_stream: live_stream_for(session_id, zone_id, codec),
-            timing: ZoneStartupTiming {
-                subscriber_connect_ms: Some(100),
-                ..ZoneStartupTiming::default()
-            },
         }
     }
 
@@ -1809,9 +1783,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_play_retries_same_generation_without_recording_timing() {
+    async fn unknown_play_retries_same_generation() {
         let mut runtime = runtime();
-        runtime.config.sync.startup_min_samples = 1;
         let id = zone_id();
         let session_id = SessionId::new();
         let prepared = prepared_downstream(session_id, id.clone(), StreamCodec::Mp3);
@@ -1824,14 +1797,12 @@ mod tests {
             zone_id: id.clone(),
             generation: 7,
             outcome: DownstreamStartOutcome::Unknown,
-            timing: None,
         });
         assert_eq!(
             runtime.sessions[&session_id].observed,
             ObservedPlayback::Unknown
         );
         assert!(!runtime.sessions[&session_id].reset_needed);
-        assert!(runtime.startup_estimator.median_lag_ms(&id).is_none());
         runtime
             .handle_downstream_retry(DownstreamRetry {
                 session_id,
@@ -2001,7 +1972,6 @@ mod tests {
             zone_id,
             generation: 3,
             outcome: DownstreamStartOutcome::Started,
-            timing: None,
         });
 
         assert!(!runtime.sessions[&session_id].reset_needed);
@@ -2029,7 +1999,6 @@ mod tests {
             zone_id,
             generation: 4,
             outcome: DownstreamStartOutcome::Failed,
-            timing: None,
         });
 
         assert!(runtime.sessions[&session_id].reset_needed);
@@ -2059,7 +2028,6 @@ mod tests {
             zone_id,
             generation: 4,
             outcome: DownstreamStartOutcome::Started,
-            timing: None,
         });
 
         assert!(runtime.sessions[&session_id].reset_needed);
@@ -2173,7 +2141,6 @@ mod tests {
             zone_id: zone_id.clone(),
             generation: 3,
             outcome: DownstreamStartOutcome::Failed,
-            timing: None,
         });
         assert!(runtime.sessions[&session_id].retry_task.is_none());
 

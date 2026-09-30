@@ -21,7 +21,7 @@ Real-device AirPlay 2 and Sonos sync acceptance still must be validated on hardw
 
 When you multi-select several AirSonos2 speakers from AirPlay, sessions that start within `[sync].multi_select_window_ms` are treated as one startup cohort. AirSonos2 prepares each Sonos stream first, waits until every stream is ready or `[sync].start_deadline_ms` expires, then dispatches the Sonos `Play` commands concurrently.
 
-Automatic startup compensation is disabled. SOAP round trips and HTTP stream timings are not acoustic latency measurements, so `[sync].startup_compensation = true` only logs a warning, and the other `startup_*` compensation settings have no effect on playback.
+There is no automatic startup compensation. SOAP round trips and HTTP stream timings are not acoustic latency measurements, so the former `[sync].startup_*` settings were removed. Old configs that still set them load normally and the keys are ignored.
 
 For `stream.codec = "wav"`, cohorts also receive a shared future playback anchor with `[sync.zone_offsets_ms]` manual room offsets. MP3 remains supported, but sync is best-effort because it cannot use sample-aligned WAV anchors. Measure speaker-specific output delay with a microphone outside the service and set it as manual offsets.
 

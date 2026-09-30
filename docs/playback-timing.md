@@ -31,9 +31,9 @@ valid relative measurements. Old configurations that treated positive offsets
 as direct added delays must be recalibrated using this convention.
 
 MP3 remains the default codec. It does not implement the WAV sample alignment
-or offset mechanism, and configuration of offsets emits a warning. Automatic
-compensation is disabled, including when old configurations request it: SOAP
-round trips and HTTP body consumption are not measurements of acoustic latency.
+or offset mechanism, and configuration of offsets emits a warning. There is no
+automatic compensation, and old `startup_*` settings are ignored: SOAP round
+trips and HTTP body consumption are not measurements of acoustic latency.
 
 These rules establish sample-level behavior. Actual speaker skew and drift need
 microphone measurements on named senders and speakers before any audible sync

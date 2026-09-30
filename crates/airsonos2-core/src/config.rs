@@ -96,14 +96,6 @@ impl Config {
                 "sync.start_deadline_ms must be at most 60000 and multi_select_window_ms must not exceed it",
             ));
         }
-        if self.sync.startup_sample_limit == 0
-            || self.sync.startup_min_samples == 0
-            || self.sync.startup_min_samples > self.sync.startup_sample_limit
-        {
-            return Err(invalid(
-                "sync startup sample counts must be positive and min_samples must not exceed sample_limit",
-            ));
-        }
         Ok(())
     }
 
@@ -185,7 +177,6 @@ pub struct SonosConfig {
     pub include_rooms: Vec<String>,
     pub exclude_rooms: Vec<String>,
     pub force_standalone_on_start: bool,
-    pub stop_on_disconnect: bool,
     pub volume_mode: VolumeMode,
 }
 
@@ -197,7 +188,6 @@ impl Default for SonosConfig {
             include_rooms: Vec::new(),
             exclude_rooms: Vec::new(),
             force_standalone_on_start: true,
-            stop_on_disconnect: true,
             volume_mode: VolumeMode::Sonos,
         }
     }
@@ -263,10 +253,6 @@ pub struct SyncConfig {
     pub default_offset_ms: i64,
     pub multi_select_window_ms: u64,
     pub start_deadline_ms: u64,
-    pub startup_compensation: bool,
-    pub startup_sample_limit: usize,
-    pub startup_min_samples: usize,
-    pub startup_max_compensation_ms: u64,
     pub play_command_spread_warn_ms: u64,
     pub zone_offsets_ms: std::collections::BTreeMap<String, i64>,
 }
@@ -277,10 +263,6 @@ impl Default for SyncConfig {
             default_offset_ms: 0,
             multi_select_window_ms: 750,
             start_deadline_ms: 2_500,
-            startup_compensation: false,
-            startup_sample_limit: 20,
-            startup_min_samples: 3,
-            startup_max_compensation_ms: 1_000,
             play_command_spread_warn_ms: 80,
             zone_offsets_ms: std::collections::BTreeMap::new(),
         }
@@ -360,10 +342,6 @@ mod tests {
         assert_eq!(config.sync.default_offset_ms, 0);
         assert_eq!(config.sync.multi_select_window_ms, 750);
         assert_eq!(config.sync.start_deadline_ms, 2_500);
-        assert!(!config.sync.startup_compensation);
-        assert_eq!(config.sync.startup_sample_limit, 20);
-        assert_eq!(config.sync.startup_min_samples, 3);
-        assert_eq!(config.sync.startup_max_compensation_ms, 1_000);
         assert_eq!(config.sync.play_command_spread_warn_ms, 80);
     }
 
@@ -436,6 +414,24 @@ mod tests {
         assert_eq!(config.airplay.output_channels, 2);
     }
 
+    /// Existing configs must keep loading after an option is removed.
+    #[test]
+    fn removed_options_are_ignored() {
+        Config::from_toml_str(
+            r#"
+            [sonos]
+            stop_on_disconnect = false
+
+            [sync]
+            startup_compensation = true
+            startup_sample_limit = 12
+            startup_min_samples = 4
+            startup_max_compensation_ms = 700
+            "#,
+        )
+        .expect("removed options are ignored");
+    }
+
     #[test]
     fn sync_config_can_be_configured() {
         let config = Config::from_toml_str(
@@ -444,10 +440,6 @@ mod tests {
             default_offset_ms = 10
             multi_select_window_ms = 600
             start_deadline_ms = 1800
-            startup_compensation = false
-            startup_sample_limit = 12
-            startup_min_samples = 4
-            startup_max_compensation_ms = 700
             play_command_spread_warn_ms = 40
 
             [sync.zone_offsets_ms]
@@ -460,10 +452,6 @@ mod tests {
         assert_eq!(config.sync.default_offset_ms, 10);
         assert_eq!(config.sync.multi_select_window_ms, 600);
         assert_eq!(config.sync.start_deadline_ms, 1800);
-        assert!(!config.sync.startup_compensation);
-        assert_eq!(config.sync.startup_sample_limit, 12);
-        assert_eq!(config.sync.startup_min_samples, 4);
-        assert_eq!(config.sync.startup_max_compensation_ms, 700);
         assert_eq!(config.sync.play_command_spread_warn_ms, 40);
         assert_eq!(config.sync.zone_offsets_ms["Kitchen"], 120);
         assert_eq!(config.sync.zone_offsets_ms["Office"], 80);

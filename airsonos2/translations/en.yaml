@@ -50,9 +50,6 @@ configuration:
   force_standalone_on_start:
     name: Force standalone on start
     description: Move a Sonos room out of its current group before AirSonos2 starts playback.
-  stop_on_disconnect:
-    name: Stop on disconnect
-    description: Stop Sonos playback when the matching AirPlay session disconnects.
   stream_codec:
     name: Stream codec
     description: Audio format served for Sonos HTTP pull streams.
@@ -74,18 +71,6 @@ configuration:
   start_deadline_ms:
     name: Start deadline
     description: Maximum time to wait for streams in a sync cohort before starting ready rooms.
-  startup_compensation:
-    name: Startup compensation
-    description: Disabled. Network timings are not acoustic latency, so enabling this only logs a warning. Use zone offsets instead.
-  startup_sample_limit:
-    name: Startup sample limit
-    description: Maximum timing samples retained per room. Not used for playback while startup compensation is disabled.
-  startup_min_samples:
-    name: Startup minimum samples
-    description: Not used while startup compensation is disabled.
-  startup_max_compensation_ms:
-    name: Startup max compensation
-    description: Not used while startup compensation is disabled.
   play_command_spread_warn_ms:
     name: Play command warning threshold
     description: Log a warning when grouped Sonos play commands spread beyond this duration.

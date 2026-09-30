@@ -32,7 +32,6 @@ options:
   include_rooms: []
   exclude_rooms: []
   force_standalone_on_start: true
-  stop_on_disconnect: true
   stream_codec: mp3
   mp3_bitrate_kbps: 320
   prebuffer_ms: 500
@@ -40,10 +39,6 @@ options:
   default_offset_ms: 0
   multi_select_window_ms: 750
   start_deadline_ms: 2500
-  startup_compensation: false
-  startup_sample_limit: 20
-  startup_min_samples: 3
-  startup_max_compensation_ms: 1000
   play_command_spread_warn_ms: 80
   zone_offsets: []
 schema:
@@ -67,7 +62,6 @@ schema:
   exclude_rooms:
     - str
   force_standalone_on_start: bool
-  stop_on_disconnect: bool
   stream_codec: list(mp3|wav)
   mp3_bitrate_kbps: int(32,320)
   prebuffer_ms: int(0,)
@@ -75,10 +69,6 @@ schema:
   default_offset_ms: int(-10000,10000)
   multi_select_window_ms: int(0,60000)
   start_deadline_ms: int(0,60000)
-  startup_compensation: bool
-  startup_sample_limit: int(1,)
-  startup_min_samples: int(1,)
-  startup_max_compensation_ms: int(0,)
   play_command_spread_warn_ms: int(0,)
   zone_offsets:
     - zone: str(1,)

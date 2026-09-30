@@ -109,7 +109,7 @@ async fn replacement_waits_for_inflight_stop_before_setting_uri() {
     let (body, release_stop) = fake.request().await;
     assert!(body.contains("#Stop"));
     let prepared = crate::tests::prepared_downstream(session_id, zone_id.clone(), StreamCodec::Mp3);
-    worker.command(TransportCommand::Prepare(SonosStreamPrepare {
+    worker.command(TransportCommand::Prepare(Box::new(SonosStreamPrepare {
         session_id,
         zone_id: zone_id.clone(),
         generation: 2,
@@ -120,7 +120,7 @@ async fn replacement_waits_for_inflight_stop_before_setting_uri() {
         force_standalone_on_start: false,
         prepared_tx,
         result_tx: tx,
-    }));
+    })));
     assert!(fake.requests.try_recv().is_err());
     release_stop.send(()).unwrap();
     let (body, release) = fake.request().await;
@@ -134,35 +134,39 @@ async fn replacement_waits_for_inflight_stop_before_setting_uri() {
 }
 
 #[tokio::test]
-async fn play_timeout_is_unknown_and_has_no_startup_timing() {
+async fn play_timeout_is_unknown() {
     let mut fake = FakeSonos::start().await;
     let (tx, mut results) = mpsc::unbounded_channel();
     let worker = ZoneWorker::new(fake.client.clone(), tx, Duration::ZERO, Duration::ZERO);
     let mut prepared =
         crate::tests::prepared_downstream(SessionId::new(), ZoneId::new("TEST"), StreamCodec::Mp3);
     prepared.client = fake.client.clone();
-    worker.command(TransportCommand::Play(prepared));
+    worker.command(TransportCommand::Play(Box::new(prepared)));
     let (_, _hold_response) = fake.request().await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(6)).await;
     let result = results.recv().await.unwrap();
     assert_eq!(result.outcome, DownstreamStartOutcome::Unknown);
-    assert!(result.timing.is_none());
     worker.shutdown().await;
 }
 
 #[tokio::test]
-async fn play_completed_after_idle_is_stopped() {
+async fn disconnect_during_play_stops_after_play_returns() {
     let mut fake = FakeSonos::start().await;
     let (tx, _) = mpsc::unbounded_channel();
     let worker = ZoneWorker::new(fake.client.clone(), tx, Duration::ZERO, Duration::ZERO);
     let mut prepared =
         crate::tests::prepared_downstream(SessionId::new(), ZoneId::new("TEST"), StreamCodec::Mp3);
     prepared.client = fake.client.clone();
-    worker.command(TransportCommand::Play(prepared));
+    let stop = TransportCommand::Stop {
+        session_id: prepared.session_id,
+        zone_id: prepared.zone_id.clone(),
+        generation: prepared.generation,
+    };
+    worker.command(TransportCommand::Play(Box::new(prepared)));
     let (body, release) = fake.request().await;
     assert!(body.contains("#Play"));
-    worker.command(TransportCommand::Idle);
+    worker.command(stop);
     release.send(()).unwrap();
     let (body, release) = fake.request().await;
     assert!(body.contains("#Stop"));
@@ -185,7 +189,7 @@ async fn grouped_member_leaves_group_before_stop_barrier() {
     let session_id = SessionId::new();
     let zone_id = ZoneId::new("TEST");
     let prepared = crate::tests::prepared_downstream(session_id, zone_id.clone(), StreamCodec::Mp3);
-    worker.command(TransportCommand::Prepare(SonosStreamPrepare {
+    worker.command(TransportCommand::Prepare(Box::new(SonosStreamPrepare {
         session_id,
         zone_id: zone_id.clone(),
         generation: 1,
@@ -196,7 +200,7 @@ async fn grouped_member_leaves_group_before_stop_barrier() {
         force_standalone_on_start: true,
         prepared_tx,
         result_tx: tx,
-    }));
+    })));
     for action in [
         "#BecomeCoordinatorOfStandaloneGroup",
         "#Stop",
