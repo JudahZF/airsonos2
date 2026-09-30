@@ -813,6 +813,8 @@ impl BridgeRuntime {
             return;
         };
         if session.retry_attempts >= 6 {
+            // A kept prepared stream may never have played; the next Play must rebuild it.
+            session.reset_needed = true;
             error!(%session_id, %zone_id, "downstream retry budget exhausted; session requires a new playback request");
             return;
         }
@@ -857,6 +859,7 @@ impl BridgeRuntime {
             }
             DownstreamStartOutcome::PermanentFailure => {
                 session.observed = ObservedPlayback::Unknown;
+                session.reset_needed = true;
                 session.retry_attempts = 6;
                 error!(session_id = %result.session_id, "permanent Sonos error; automatic retries stopped");
                 self.cancel_downstream_retry(result.session_id);
@@ -2149,6 +2152,37 @@ mod tests {
         }
 
         assert!(runtime.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn play_after_exhausted_retries_restarts_downstream() {
+        let mut runtime = runtime();
+        let session_id = SessionId::new();
+        let zone_id = zone_id();
+        let mut session = SessionRuntime::new(zone_id.clone(), format());
+        session.generation = 3;
+        session.retry_attempts = 6;
+        session.prepared = Some(prepared_downstream(
+            session_id,
+            zone_id.clone(),
+            StreamCodec::Mp3,
+        ));
+        runtime.sessions.insert(session_id, session);
+        runtime.handle_downstream_start_result(DownstreamStartResult {
+            session_id,
+            zone_id: zone_id.clone(),
+            generation: 3,
+            outcome: DownstreamStartOutcome::Failed,
+            timing: None,
+        });
+        assert!(runtime.sessions[&session_id].retry_task.is_none());
+
+        runtime
+            .set_playback_state(session_id, zone_id, true)
+            .await
+            .unwrap();
+
+        assert_ne!(runtime.sessions[&session_id].generation, 3);
     }
 
     #[tokio::test]
