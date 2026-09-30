@@ -39,6 +39,9 @@ class ReleaseGateTest(unittest.TestCase):
             (root / "airsonos2/config.yaml").write_text('version: "1.2.3"\n')
             git("commit", "--allow-empty", "-m", "new commit")
             self.assertNotEqual(gate().returncode, 0, "old tags must not authorize a new commit")
+            git("tag", "1.2.3")
+            self.assertNotEqual(gate("v1.2.3").returncode, 0, "a bare alias must not replace the requested v tag")
+            self.assertEqual(gate("1.2.3").returncode, 0)
 
 
 if __name__ == "__main__":

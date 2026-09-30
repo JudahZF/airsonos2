@@ -15,7 +15,8 @@ match = re.search(r'^version: "([^"]+)"$', Path("airsonos2/config.yaml").read_te
 if not match or version != match[1] or version != cargo:
     sys.exit(f"Version mismatch: requested={version}, Cargo={cargo}, HA={match[1] if match else 'missing'}")
 head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-for tag in dict.fromkeys([raw, f"v{version}", version]):
+# A v-prefixed request names one exact tag; a bare version may use either form.
+for tag in [raw] if raw.startswith("v") else [f"v{version}", version]:
     result = subprocess.run(["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"], capture_output=True, text=True)
     if result.returncode == 0 and result.stdout.strip() == head:
         print(version)
