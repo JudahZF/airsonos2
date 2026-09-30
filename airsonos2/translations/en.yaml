@@ -76,16 +76,16 @@ configuration:
     description: Maximum time to wait for streams in a sync cohort before starting ready rooms.
   startup_compensation:
     name: Startup compensation
-    description: Use recent startup timing samples to delay faster rooms in grouped playback.
+    description: Disabled. Network timings are not acoustic latency, so enabling this only logs a warning. Use zone offsets instead.
   startup_sample_limit:
     name: Startup sample limit
-    description: Maximum timing samples retained per room.
+    description: Maximum timing samples retained per room. Not used for playback while startup compensation is disabled.
   startup_min_samples:
     name: Startup minimum samples
-    description: Minimum timing samples required before automatic startup compensation is applied.
+    description: Not used while startup compensation is disabled.
   startup_max_compensation_ms:
     name: Startup max compensation
-    description: Maximum automatic compensation delay in milliseconds.
+    description: Not used while startup compensation is disabled.
   play_command_spread_warn_ms:
     name: Play command warning threshold
     description: Log a warning when grouped Sonos play commands spread beyond this duration.
