@@ -523,11 +523,6 @@ fn build_sonos_clients(
         .collect()
 }
 
-struct PausedCleanup {
-    session_id: SessionId,
-    generation: u64,
-}
-
 struct BridgeRuntime {
     config: Config,
     registry: StreamRegistry,
@@ -537,7 +532,7 @@ struct BridgeRuntime {
     zone_workers: HashMap<ZoneId, ZoneWorker>,
     next_generation: u64,
     pending_cohorts: VecDeque<SyncCohort>,
-    cleanup_tx: mpsc::UnboundedSender<PausedCleanup>,
+    cleanup_tx: mpsc::UnboundedSender<SessionId>,
     downstream_result_tx: mpsc::UnboundedSender<DownstreamStartResult>,
     downstream_result_rx: mpsc::UnboundedReceiver<DownstreamStartResult>,
     downstream_retry_tx: mpsc::UnboundedSender<DownstreamRetry>,
@@ -571,6 +566,9 @@ struct SessionRuntime {
     retry_attempts: u32,
     retry_task: Option<JoinHandle<()>>,
     cleanup_task: Option<JoinHandle<()>>,
+    /// Paused-session grace deadline. Downstream generations can advance while
+    /// paused, so the cleanup timer does not use them.
+    cleanup_deadline: Option<tokio::time::Instant>,
 }
 
 impl SessionRuntime {
@@ -588,6 +586,7 @@ impl SessionRuntime {
             retry_attempts: 0,
             retry_task: None,
             cleanup_task: None,
+            cleanup_deadline: None,
         }
     }
 }
@@ -666,7 +665,7 @@ impl BridgeRuntime {
         registry: StreamRegistry,
         sonos: HashMap<ZoneId, (SonosZone, SonosClient)>,
         volume_states: HashMap<ZoneId, ZoneVolumeState>,
-        cleanup_tx: mpsc::UnboundedSender<PausedCleanup>,
+        cleanup_tx: mpsc::UnboundedSender<SessionId>,
     ) -> Self {
         let (downstream_result_tx, downstream_result_rx) = mpsc::unbounded_channel();
         let (downstream_retry_tx, downstream_retry_rx) = mpsc::unbounded_channel();
@@ -703,7 +702,7 @@ impl BridgeRuntime {
     async fn run(
         &mut self,
         mut events_rx: mpsc::UnboundedReceiver<AirPlayEvent>,
-        mut cleanup_rx: mpsc::UnboundedReceiver<PausedCleanup>,
+        mut cleanup_rx: mpsc::UnboundedReceiver<SessionId>,
     ) -> anyhow::Result<()> {
         loop {
             tokio::select! {
@@ -715,9 +714,14 @@ impl BridgeRuntime {
                     }
                 }
                 session_id = cleanup_rx.recv() => {
-                    let Some(PausedCleanup { session_id, generation }) = session_id else { continue };
-                    if self.sessions.get(&session_id).is_some_and(|session| session.generation == generation && !session.desired_playback)
-                    {
+                    let Some(session_id) = session_id else { continue };
+                    // A cancelled timer's message can still be queued, so check the live deadline.
+                    if self.sessions.get(&session_id).is_some_and(|session| {
+                        !session.desired_playback
+                            && session
+                                .cleanup_deadline
+                                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                    }) {
                         info!(
                             %session_id,
                             grace_secs = PAUSED_SESSION_GRACE_SECS,
@@ -768,10 +772,11 @@ impl BridgeRuntime {
     }
 
     fn cancel_paused_cleanup(&mut self, session_id: SessionId) {
-        if let Some(session) = self.sessions.get_mut(&session_id)
-            && let Some(task) = session.cleanup_task.take()
-        {
-            task.abort();
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.cleanup_deadline = None;
+            if let Some(task) = session.cleanup_task.take() {
+                task.abort();
+            }
         }
     }
 
@@ -779,13 +784,12 @@ impl BridgeRuntime {
         self.cancel_paused_cleanup(session_id);
         if let Some(session) = self.sessions.get_mut(&session_id) {
             let tx = self.cleanup_tx.clone();
-            let generation = session.generation;
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_secs(PAUSED_SESSION_GRACE_SECS);
+            session.cleanup_deadline = Some(deadline);
             session.cleanup_task = Some(tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(PAUSED_SESSION_GRACE_SECS)).await;
-                let _ = tx.send(PausedCleanup {
-                    session_id,
-                    generation,
-                });
+                tokio::time::sleep_until(deadline).await;
+                let _ = tx.send(session_id);
             }));
         }
     }
@@ -2108,6 +2112,43 @@ mod tests {
 
         assert!(!runtime.sessions[&session_id].reset_needed);
         assert!(runtime.sessions[&session_id].cleanup_task.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplicate_pause_keeps_paused_cleanup() {
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
+        let mut runtime = BridgeRuntime::new(
+            Config::default(),
+            StreamRegistry::new(),
+            HashMap::new(),
+            HashMap::new(),
+            cleanup_tx,
+        );
+        let session_id = SessionId::new();
+        let mut session = SessionRuntime::new(zone_id(), format());
+        session.desired_playback = false;
+        runtime.sessions.insert(session_id, session);
+        events_tx
+            .send(AirPlayEvent::StreamEndedWhilePaused {
+                session_id,
+                zone_id: zone_id(),
+            })
+            .unwrap();
+        events_tx
+            .send(AirPlayEvent::PlaybackState {
+                session_id,
+                zone_id: zone_id(),
+                playing: false,
+            })
+            .unwrap();
+
+        tokio::select! {
+            _ = runtime.run(events_rx, cleanup_rx) => unreachable!("event sender is alive"),
+            _ = tokio::time::sleep(Duration::from_secs(PAUSED_SESSION_GRACE_SECS + 1)) => {}
+        }
+
+        assert!(runtime.sessions.is_empty());
     }
 
     #[tokio::test]
