@@ -273,7 +273,7 @@ async fn receive_loop(
     let mut output_channels: u8 = 2;
     let mut decode_epoch = 0;
 
-    loop {
+    'receive: loop {
         // Stop reading TCP at two seconds or 8 MiB of decoded PCM, whichever is
         // smaller. One bounded decoded packet may wait outside the queue.
         loop {
@@ -289,7 +289,9 @@ async fn receive_loop(
             if !full {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if peer_closed_while_waiting(&stream).await {
+                break 'receive;
+            }
         }
         if stream.read_exact(&mut len_buf).await.is_err() {
             break;
@@ -391,6 +393,12 @@ async fn receive_loop(
             // Signal format change to delivery thread
             let (lock, cvar) = &*state;
             let mut s = lock.lock().unwrap();
+            // Advance the playout clock at the old rate first, so the new rate
+            // only applies to time after the switch.
+            let now = std::time::Instant::now();
+            let elapsed = source_frames(now.saturating_duration_since(s.anchor_local), s.source_sample_rate);
+            s.anchor_rtp = s.anchor_rtp.wrapping_add(elapsed);
+            s.anchor_local = now;
             s.sample_rate = target_sr;
             s.source_sample_rate = src_sr;
             s.channels = target_ch;
@@ -458,7 +466,9 @@ async fn receive_loop(
                 if admitted {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                if peer_closed_while_waiting(&stream).await {
+                    break 'receive;
+                }
             }
         }
     }
@@ -475,6 +485,24 @@ async fn receive_loop(
         s.stopped = true;
         s.buffer.clear();
         cvar.notify_all();
+    }
+}
+
+/// Wait out one backpressure interval. Returns true once the peer has closed
+/// the stream. A close queued behind unread packets stays invisible until
+/// playout drains the queue and reading resumes.
+async fn peer_closed_while_waiting(stream: &TcpStream) -> bool {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+    let mut probe = [0u8; 1];
+    tokio::select! {
+        _ = tokio::time::sleep(INTERVAL) => false,
+        peeked = stream.peek(&mut probe) => match peeked {
+            Ok(0) | Err(_) => true,
+            Ok(_) => {
+                tokio::time::sleep(INTERVAL).await;
+                false
+            }
+        },
     }
 }
 
@@ -1006,5 +1034,40 @@ mod buffered_acceptance {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn paused_full_queue_still_observes_peer_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut paused = super::flush_tests::state();
+        paused.rate = 0;
+        paused.buffer.insert(
+            0,
+            BufferedFrame {
+                sequence: 0,
+                samples: vec![0.0; pcm_budget(paused.sample_rate, paused.channels) / 2],
+            },
+        );
+        let state = Arc::new((Mutex::new(paused), Condvar::new()));
+        let task = tokio::spawn(receive_loop(
+            stream,
+            &[7; 32],
+            OutputConfig {
+                sample_rate: None,
+                max_channels: None,
+            },
+            state.clone(),
+        ));
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.0.lock().unwrap().stop_reason,
+            Some(AudioStopReason::StreamEndedWhilePaused)
+        );
     }
 }
