@@ -555,11 +555,14 @@ impl LiveStream {
     }
 
     /// Waits until the encoder has produced stream data or the timeout elapses.
+    /// Closure wins over readiness, and readiness wins over a timeout that fires
+    /// in the same wakeup.
     pub async fn wait_until_ready(&self, timeout: Duration) -> bool {
         let mut ready = self.ready.subscribe();
         tokio::select! {
-            result = ready.wait_for(|ready| *ready) => result.is_ok(),
+            biased;
             _ = self.closed() => false,
+            result = ready.wait_for(|ready| *ready) => result.is_ok(),
             _ = tokio::time::sleep(timeout) => false,
         }
     }
@@ -568,8 +571,9 @@ impl LiveStream {
     pub async fn wait_for_subscriber(&self, timeout: Duration) -> bool {
         let mut subscriber = self.subscriber.subscribe();
         tokio::select! {
-            result = subscriber.wait_for(|connected| *connected) => result.is_ok(),
+            biased;
             _ = self.closed() => false,
+            result = subscriber.wait_for(|connected| *connected) => result.is_ok(),
             _ = tokio::time::sleep(timeout) => false,
         }
     }
@@ -657,6 +661,24 @@ mod tests {
         assert!(stream.wait_until_ready(Duration::ZERO).await);
         let _subscriber = stream.attach_subscriber();
         assert!(stream.wait_for_subscriber(Duration::ZERO).await);
+    }
+
+    /// Readiness and the timeout can wake a waiter together; the latched state must win.
+    #[tokio::test(start_paused = true)]
+    async fn latched_state_wins_when_timeout_elapses_together() {
+        const TIMEOUT: Duration = Duration::from_millis(10);
+        for _ in 0..32 {
+            let stream = LiveStream::new(session());
+            let mut ready = std::pin::pin!(stream.wait_until_ready(TIMEOUT));
+            let mut subscriber = std::pin::pin!(stream.wait_for_subscriber(TIMEOUT));
+            assert!(futures_util::poll!(&mut ready).is_pending());
+            assert!(futures_util::poll!(&mut subscriber).is_pending());
+            stream.publish(Bytes::from_static(b"ready"));
+            stream.on_subscriber_connected();
+            tokio::time::advance(TIMEOUT).await;
+            assert!(ready.await);
+            assert!(subscriber.await);
+        }
     }
 
     #[tokio::test]
