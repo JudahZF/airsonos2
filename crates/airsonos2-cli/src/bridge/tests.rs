@@ -170,3 +170,42 @@ async fn play_completed_after_idle_is_stopped() {
     worker.shutdown().await;
     assert!(fake.requests.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn grouped_member_leaves_group_before_stop_barrier() {
+    let mut fake = FakeSonos::start().await;
+    let (tx, _) = mpsc::unbounded_channel();
+    let (prepared_tx, mut prepared_rx) = mpsc::unbounded_channel();
+    let worker = ZoneWorker::new(
+        fake.client.clone(),
+        tx.clone(),
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    let session_id = SessionId::new();
+    let zone_id = ZoneId::new("TEST");
+    let prepared = crate::tests::prepared_downstream(session_id, zone_id.clone(), StreamCodec::Mp3);
+    worker.command(TransportCommand::Prepare(SonosStreamPrepare {
+        session_id,
+        zone_id: zone_id.clone(),
+        generation: 1,
+        zone: crate::tests::zone(zone_id),
+        client: fake.client.clone(),
+        local_url: prepared.live_stream.session.local_url.clone(),
+        live_stream: prepared.live_stream,
+        force_standalone_on_start: true,
+        prepared_tx,
+        result_tx: tx,
+    }));
+    for action in [
+        "#BecomeCoordinatorOfStandaloneGroup",
+        "#Stop",
+        "#SetAVTransportURI",
+    ] {
+        let (body, release) = fake.request().await;
+        assert!(body.contains(action), "expected {action}");
+        release.send(()).unwrap();
+    }
+    assert_eq!(prepared_rx.recv().await.unwrap().generation, 1);
+    worker.shutdown().await;
+}

@@ -164,6 +164,14 @@ async fn prepare(
             timing: None,
         });
     };
+    // Group members reject AVTransport commands, so leave the group before the
+    // Stop barrier.
+    if start.force_standalone_on_start
+        && let Err(error) = start.client.become_coordinator_of_standalone_group().await
+    {
+        failure(error);
+        return;
+    }
     // Never cancel an in-flight Stop. Every replacement passes this barrier,
     // even when watch coalesces an earlier pause/stop command.
     if let Err(error) = start.client.stop().await {
@@ -172,15 +180,6 @@ async fn prepare(
     }
     if commands.has_changed().unwrap_or(true) {
         return;
-    }
-    if start.force_standalone_on_start {
-        if let Err(error) = start.client.become_coordinator_of_standalone_group().await {
-            failure(error);
-            return;
-        }
-        if commands.has_changed().unwrap_or(true) {
-            return;
-        }
     }
     let prepare_started = Instant::now();
     if let Err(error) = start
