@@ -381,8 +381,9 @@ impl RaopRtp {
         self.tasks.shutdown().await;
     }
 
-    /// Stop the receive task and flush the buffer. The flush is applied by the
-    /// next [`start`](Self::start), so a restarted stream never replays old packets.
+    /// Stop the receive tasks and queue a full buffer flush. In-crate callers
+    /// drop the session right after stopping; the queued flush only matters if
+    /// the same session is started again, which then never replays old packets.
     pub fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
