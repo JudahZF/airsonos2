@@ -24,10 +24,18 @@ impl EventSender {
     }
 
     /// Send a plaintext message (will be encrypted before transmission).
+    ///
+    /// Fails with [`std::io::ErrorKind::WouldBlock`] when the queue is full, so
+    /// the caller may retry, and [`std::io::ErrorKind::NotConnected`] once the
+    /// channel has closed.
     pub fn send(&self, data: Vec<u8>) -> Result<(), NetworkError> {
-        self.tx
-            .try_send(data)
-            .map_err(|_| NetworkError::Mdns("event channel closed".into()))
+        use std::io::{Error, ErrorKind};
+        self.tx.try_send(data).map_err(|error| {
+            NetworkError::Io(match error {
+                mpsc::error::TrySendError::Full(_) => Error::new(ErrorKind::WouldBlock, "event channel full"),
+                mpsc::error::TrySendError::Closed(_) => Error::new(ErrorKind::NotConnected, "event channel closed"),
+            })
+        })
     }
 }
 
@@ -151,6 +159,19 @@ mod tests {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+    #[test]
+    fn full_queue_is_retryable_and_closed_channel_is_not() {
+        let (tx, rx) = mpsc::channel(1);
+        let sender = EventSender::from_tx(tx);
+        sender.send(vec![1]).unwrap();
+        let kind = |result: Result<(), NetworkError>| match result {
+            Err(NetworkError::Io(error)) => error.kind(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(kind(sender.send(vec![2])), std::io::ErrorKind::WouldBlock);
+        drop(rx);
+        assert_eq!(kind(sender.send(vec![3])), std::io::ErrorKind::NotConnected);
+    }
     #[tokio::test]
     async fn invalid_ciphertext_closes_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
