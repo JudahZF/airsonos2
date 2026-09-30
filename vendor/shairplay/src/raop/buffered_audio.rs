@@ -369,6 +369,7 @@ async fn receive_loop(
 
         // Detect format change
         if ssrc != AudioSsrc::None && ssrc != current_ssrc {
+            let switched = current_ssrc != AudioSsrc::None;
             current_ssrc = ssrc;
             let src_sr = ssrc.sample_rate();
             let src_ch = ssrc.channels();
@@ -393,12 +394,15 @@ async fn receive_loop(
             // Signal format change to delivery thread
             let (lock, cvar) = &*state;
             let mut s = lock.lock().unwrap();
-            // Advance the playout clock at the old rate first, so the new rate
-            // only applies to time after the switch.
-            let now = std::time::Instant::now();
-            let elapsed = source_frames(now.saturating_duration_since(s.anchor_local), s.source_sample_rate);
-            s.anchor_rtp = s.anchor_rtp.wrapping_add(elapsed);
-            s.anchor_local = now;
+            // On a switch during playback, advance the playout clock at the old
+            // rate first, so the new rate only applies to time after the switch.
+            // The first detection has no old rate, and SetRate re-anchors on resume.
+            if switched && s.rate != 0 {
+                let now = std::time::Instant::now();
+                let elapsed = source_frames(now.saturating_duration_since(s.anchor_local), s.source_sample_rate);
+                s.anchor_rtp = s.anchor_rtp.wrapping_add(elapsed);
+                s.anchor_local = now;
+            }
             s.sample_rate = target_sr;
             s.source_sample_rate = src_sr;
             s.channels = target_ch;
