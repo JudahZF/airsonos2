@@ -125,7 +125,7 @@ async fn main() {
             let mut body = response.into_body().into_data_stream();
             assert_eq!(body.next().await.unwrap().unwrap().len(), 44);
             stream.arm_playback_anchor_on_next_timed_pcm();
-            encoder.write_frame(pcm()).await.unwrap();
+            assert!(encoder.try_write_frame(pcm()).unwrap());
             assert_eq!(body.next().await.unwrap().unwrap().len(), 1920);
             startup_us.push(started.elapsed().as_micros());
             if round == 19 {
@@ -145,7 +145,7 @@ async fn main() {
     for _ in 0..frames {
         interval.tick().await;
         for (_, encoder, _) in &active {
-            encoder.write_frame(pcm()).await.unwrap();
+            assert!(encoder.try_write_frame(pcm()).unwrap());
         }
         for (_, _, body) in &mut active {
             assert_eq!(body.next().await.unwrap().unwrap().len(), 1920);

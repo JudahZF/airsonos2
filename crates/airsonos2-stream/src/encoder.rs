@@ -205,16 +205,14 @@ impl FfmpegEncoder {
         }
     }
 
+    /// Queues a frame without waiting. `Ok(false)` means the bounded queue rejected
+    /// it, so the caller decides whether that loss is acceptable.
     pub fn try_write_frame(&self, frame: PcmFrame) -> Result<bool, EncoderError> {
         let input = self.input.as_ref().ok_or(EncoderError::InputClosed)?;
         if self.task.is_finished() || input.is_closed() {
             return Err(EncoderError::InputClosed);
         }
         Ok(input.push(frame).accepted)
-    }
-
-    pub async fn write_frame(&self, frame: PcmFrame) -> Result<(), EncoderError> {
-        self.try_write_frame(frame).map(|_| ())
     }
 
     pub async fn shutdown(mut self) -> Result<(), EncoderError> {
@@ -381,28 +379,30 @@ mod tests {
         }
         let source_time = std::time::Instant::now();
         for encoder in [&first_encoder, &second_encoder] {
-            encoder
-                .write_frame(PcmFrame {
-                    buffered_permit: None,
-                    playback_epoch: 0,
-                    sample_rate: 1000,
-                    channels: 1,
-                    samples_f32_interleaved: vec![-1.0; 8],
-                    presentation_time: Some(source_time),
-                })
-                .await
-                .unwrap();
-            encoder
-                .write_frame(PcmFrame {
-                    buffered_permit: None,
-                    playback_epoch: 1,
-                    sample_rate: 1000,
-                    channels: 1,
-                    samples_f32_interleaved: vec![0.25, 0.5, 0.75, 1.0],
-                    presentation_time: Some(source_time),
-                })
-                .await
-                .unwrap();
+            assert!(
+                encoder
+                    .try_write_frame(PcmFrame {
+                        buffered_permit: None,
+                        playback_epoch: 0,
+                        sample_rate: 1000,
+                        channels: 1,
+                        samples_f32_interleaved: vec![-1.0; 8],
+                        presentation_time: Some(source_time),
+                    })
+                    .unwrap()
+            );
+            assert!(
+                encoder
+                    .try_write_frame(PcmFrame {
+                        buffered_permit: None,
+                        playback_epoch: 1,
+                        sample_rate: 1000,
+                        channels: 1,
+                        samples_f32_interleaved: vec![0.25, 0.5, 0.75, 1.0],
+                        presentation_time: Some(source_time),
+                    })
+                    .unwrap()
+            );
         }
         tokio::task::yield_now().await;
         assert!(first_rx.try_recv().is_err());
