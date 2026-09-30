@@ -32,7 +32,7 @@ nix develop -c cargo test --workspace --all-features --locked
 nix develop -c cargo test --manifest-path vendor/shairplay/Cargo.toml --locked
 nix develop -c cargo test --manifest-path vendor/shairplay/Cargo.toml --features ap2,resample --locked
 nix develop -c cargo test --manifest-path vendor/shairplay/Cargo.toml --features video,hls --locked
-nix develop -c cargo deny check advisories bans licenses sources
+nix develop -c cargo deny --locked check advisories bans licenses sources
 ```
 
 CI runs the workspace gates and each standalone feature combination. The same

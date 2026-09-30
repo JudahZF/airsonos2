@@ -44,14 +44,15 @@ Enable `run_doctor_on_start` to run startup diagnostics without blocking bridge 
 airsonos2 doctor --config /data/config.toml
 ```
 
-The bridge serves:
+The stream HTTP port (7000) serves:
 
 ```text
 /healthz
-/metrics
 /test-tone.mp3
 /streams/<session>
 ```
+
+The diagnostics listener (`diagnostics_addr`) serves `/healthz` and `/metrics`.
 
 ## Listener addresses and diagnostics
 
