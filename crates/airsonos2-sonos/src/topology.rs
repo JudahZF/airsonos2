@@ -47,34 +47,42 @@ pub fn parse_zone_group_state(xml: &str) -> Vec<ZoneGroupMember> {
     let mut reader = Reader::from_str(payload.as_deref().unwrap_or(xml));
     let mut members = Vec::new();
     let mut coordinator = None;
+    // quick-xml reports mismatched end tags but not elements left open at EOF.
+    let mut open_elements = 0_usize;
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(element)) | Ok(Event::Empty(element)) => {
-                match element.local_name().as_ref() {
-                    b"ZoneGroup" => coordinator = attr(&element, b"Coordinator"),
-                    b"ZoneGroupMember" | b"Satellite" if coordinator.is_some() => {
-                        let Some(uuid) = attr(&element, b"UUID").filter(|s| !s.is_empty()) else {
-                            continue;
-                        };
-                        let satellite = element.local_name().as_ref() == b"Satellite";
-                        members.push(ZoneGroupMember {
-                            is_group_coordinator: !satellite
-                                && coordinator.as_deref() == Some(&uuid),
-                            uuid,
-                            zone_name: attr(&element, b"ZoneName").unwrap_or_default(),
-                            location: attr(&element, b"Location"),
-                            is_visible_room: !satellite
-                                && attr(&element, b"Invisible").as_deref() != Some("1"),
-                        });
-                    }
-                    _ => {}
+        let element = match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                open_elements += 1;
+                element
+            }
+            Ok(Event::Empty(element)) => element,
+            Ok(Event::End(element)) => {
+                open_elements -= 1;
+                if element.local_name().as_ref() == b"ZoneGroup" {
+                    coordinator = None;
                 }
+                continue;
             }
-            Ok(Event::End(element)) if element.local_name().as_ref() == b"ZoneGroup" => {
-                coordinator = None
+            Ok(Event::Eof) if open_elements == 0 => break,
+            Ok(Event::Eof) | Err(_) => return Vec::new(),
+            Ok(_) => continue,
+        };
+        match element.local_name().as_ref() {
+            b"ZoneGroup" => coordinator = attr(&element, b"Coordinator"),
+            b"ZoneGroupMember" | b"Satellite" if coordinator.is_some() => {
+                let Some(uuid) = attr(&element, b"UUID").filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let satellite = element.local_name().as_ref() == b"Satellite";
+                members.push(ZoneGroupMember {
+                    is_group_coordinator: !satellite && coordinator.as_deref() == Some(&uuid),
+                    uuid,
+                    zone_name: attr(&element, b"ZoneName").unwrap_or_default(),
+                    location: attr(&element, b"Location"),
+                    is_visible_room: !satellite
+                        && attr(&element, b"Invisible").as_deref() != Some("1"),
+                });
             }
-            Ok(Event::Eof) => break,
-            Err(_) => return Vec::new(),
             _ => {}
         }
     }
@@ -110,6 +118,25 @@ mod tests {
         assert!(members[0].is_visible_room);
         assert!(!members[1].is_visible_room);
         assert!(!members[1].is_group_coordinator);
+    }
+
+    #[test]
+    fn keeps_escaped_room_names_inside_cdata_payloads() {
+        let soap = r#"<Envelope><ZoneGroupState><![CDATA[<ZoneGroups><ZoneGroup Coordinator="main"><ZoneGroupMember UUID="main" ZoneName="Kitchen &amp; Dining" /></ZoneGroup></ZoneGroups>]]></ZoneGroupState></Envelope>"#;
+        let members = parse_zone_group_state(soap);
+        assert_eq!(members[0].zone_name, "Kitchen & Dining");
+    }
+
+    #[test]
+    fn rejects_truncated_or_unbalanced_topology() {
+        let truncated = r#"<ZoneGroups><ZoneGroup Coordinator="main"><ZoneGroupMember UUID="main" ZoneName="Kitchen" />"#;
+        let soap = format!(
+            "<Envelope><ZoneGroupState>{}</ZoneGroupState></Envelope>",
+            quick_xml::escape::escape(truncated)
+        );
+        assert!(parse_zone_group_state(truncated).is_empty());
+        assert!(parse_zone_group_state(&soap).is_empty());
+        assert!(parse_zone_group_state("<ZoneGroups/></ZoneGroups>").is_empty());
     }
 
     #[test]
