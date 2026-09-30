@@ -2124,32 +2124,37 @@ mod tests {
 
     #[tokio::test]
     async fn play_after_exhausted_retries_restarts_downstream() {
-        let mut runtime = runtime();
-        let session_id = SessionId::new();
-        let zone_id = zone_id();
-        let mut session = SessionRuntime::new(zone_id.clone(), format());
-        session.generation = 3;
-        session.retry_attempts = 6;
-        session.prepared = Some(prepared_downstream(
-            session_id,
-            zone_id.clone(),
-            StreamCodec::Mp3,
-        ));
-        runtime.sessions.insert(session_id, session);
-        runtime.handle_downstream_start_result(DownstreamStartResult {
-            session_id,
-            zone_id: zone_id.clone(),
-            generation: 3,
-            outcome: DownstreamStartOutcome::Failed,
-        });
-        assert!(runtime.sessions[&session_id].retry_task.is_none());
+        for outcome in [
+            DownstreamStartOutcome::Failed,
+            DownstreamStartOutcome::PermanentFailure,
+        ] {
+            let mut runtime = runtime();
+            let session_id = SessionId::new();
+            let zone_id = zone_id();
+            let mut session = SessionRuntime::new(zone_id.clone(), format());
+            session.generation = 3;
+            session.retry_attempts = 6;
+            session.prepared = Some(prepared_downstream(
+                session_id,
+                zone_id.clone(),
+                StreamCodec::Mp3,
+            ));
+            runtime.sessions.insert(session_id, session);
+            runtime.handle_downstream_start_result(DownstreamStartResult {
+                session_id,
+                zone_id: zone_id.clone(),
+                generation: 3,
+                outcome,
+            });
+            assert!(runtime.sessions[&session_id].retry_task.is_none());
 
-        runtime
-            .set_playback_state(session_id, zone_id, true)
-            .await
-            .unwrap();
+            runtime
+                .set_playback_state(session_id, zone_id, true)
+                .await
+                .unwrap();
 
-        assert_ne!(runtime.sessions[&session_id].generation, 3);
+            assert_ne!(runtime.sessions[&session_id].generation, 3, "{outcome:?}");
+        }
     }
 
     #[tokio::test]
