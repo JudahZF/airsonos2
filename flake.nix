@@ -59,7 +59,6 @@
               pkgs.cargo-zigbuild
               pkgs.ffmpeg
               pkgs.python3
-              pkgs.python3
               pkgs.pkg-config
               pkgs.openssl
               pkgs.rust-analyzer
