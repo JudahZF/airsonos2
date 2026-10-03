@@ -61,6 +61,8 @@ struct ConfigView {
     path: PathBuf,
     read_only: bool,
     restart_required: bool,
+    /// Changes whenever the file content changes, secrets included.
+    revision: String,
     started_at_ms: u64,
     /// Where this page is served now. A saved change moves it after the restart.
     listener: String,
@@ -85,6 +87,10 @@ struct DraftRequest {
     config: Config,
     #[serde(default)]
     secrets: SecretState<Option<String>>,
+    /// The file revision the draft is based on. A save fails when the file has changed
+    /// since; `None` overwrites it.
+    #[serde(default)]
+    revision: Option<String>,
 }
 
 /// Speakers that the draft settings can reach, whether or not they are bridged.
@@ -150,7 +156,19 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
 pub fn router(ui: ConfigUi) -> Router {
     let ui = Arc::new(ui);
     Router::new()
-        .route("/", get(|| async { Html(INDEX_HTML) }))
+        .route(
+            "/",
+            get(|| async {
+                // No framing, so another site cannot trick clicks on Save or Restart.
+                (
+                    [
+                        (header::X_FRAME_OPTIONS, "DENY"),
+                        (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+                    ],
+                    Html(INDEX_HTML),
+                )
+            }),
+        )
         .route("/api/config", get(read_config).put(save_config))
         .route("/api/discover", post(discover))
         .route("/api/restart", post(restart))
@@ -220,9 +238,21 @@ async fn load_file(ui: &ConfigUi) -> Result<Config, ApiError> {
         .map_err(internal)
 }
 
+/// A content hash for optimistic concurrency. It only needs to be stable while this
+/// process runs, because a restarted bridge makes the page reload.
+fn revision(config: &Config) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    serde_json::to_string(config)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 fn view(ui: &ConfigUi, mut config: Config) -> ConfigView {
     // Compare before removing secrets, because secret changes also need a restart.
     let restart_required = config != ui.running;
+    let revision = revision(&config);
     let is_set = |secret: Option<String>| secret.is_some_and(|secret| !secret.is_empty());
     let secrets = SecretState {
         home_assistant_token: is_set(config.home_assistant.token.take()),
@@ -233,6 +263,7 @@ fn view(ui: &ConfigUi, mut config: Config) -> ConfigView {
         path: ui.path.clone(),
         read_only: ui.read_only,
         restart_required,
+        revision,
         started_at_ms: ui.started_at_ms,
         listener: ui.running.diagnostics.metrics_addr.clone(),
         status: ui.status.borrow().clone(),
@@ -252,6 +283,8 @@ struct Draft {
     /// receive a stored token, including `SUPERVISOR_TOKEN`, because anyone who can
     /// reach the GUI could point it at their own server.
     new_ha_url_without_token: bool,
+    /// The draft is based on an older file revision.
+    outdated: bool,
 }
 
 /// The draft config, with secrets taken from the request or else from the file.
@@ -262,8 +295,10 @@ async fn draft_config(
     let Json(DraftRequest {
         mut config,
         secrets,
+        revision: base_revision,
     }) = request.map_err(|rejection| ApiError(rejection.status(), rejection.body_text()))?;
     let stored = load_file(ui).await?;
+    let outdated = base_revision.is_some_and(|base| base != revision(&stored));
     let update = |change: Option<String>, stored: Option<String>| {
         change.map_or(stored, |value| (!value.is_empty()).then_some(value))
     };
@@ -280,6 +315,7 @@ async fn draft_config(
     Ok(Draft {
         config,
         new_ha_url_without_token: url_changed && !token_sent,
+        outdated,
     })
 }
 
@@ -294,6 +330,12 @@ async fn save_config(
         ));
     }
     let draft = draft_config(&ui, request).await?;
+    if draft.outdated {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "the file changed in another window since this page loaded it".to_owned(),
+        ));
+    }
     // Without a token, the bridge would send `SUPERVISOR_TOKEN` to the new URL.
     if draft.new_ha_url_without_token && draft.config.home_assistant.url.is_some() {
         return Err(ApiError(
@@ -324,6 +366,7 @@ async fn discover(
     let Draft {
         config,
         new_ha_url_without_token,
+        ..
     } = draft_config(&ui, request).await?;
     let sonos = async {
         let zones = discover_sonos_zones_from_sources(
@@ -443,7 +486,11 @@ mod tests {
                 home_assistant_token: token.map(str::to_owned),
                 rtsp_password: None,
             };
-            Ok(Json(DraftRequest { config, secrets }))
+            Ok(Json(DraftRequest {
+                config,
+                secrets,
+                revision: None,
+            }))
         };
         let draft = |url: &str, token: Option<&str>| draft_config(&ui, request(url, token));
 
@@ -467,5 +514,11 @@ mod tests {
             saved.err().map(|error| error.0),
             Some(StatusCode::UNPROCESSABLE_ENTITY)
         );
+
+        // A draft based on an older file must not overwrite it.
+        let mut outdated = request("http://ha.local:8123", None).expect("draft request");
+        outdated.revision = Some("stale".to_owned());
+        let saved = save_config(State(ui.clone()), Ok(outdated)).await;
+        assert_eq!(saved.err().map(|error| error.0), Some(StatusCode::CONFLICT));
     }
 }

@@ -548,7 +548,7 @@ function h(tag, props = {}, ...children) {
 async function api(path, init = {}) {
   const response = await fetch(path, { ...init, headers: { 'content-type': 'application/json' }, cache: 'no-store' });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error ?? `${response.status} ${response.statusText}`);
+  if (!response.ok) throw Object.assign(new Error(body.error ?? `${response.status} ${response.statusText}`), { status: response.status });
   return body;
 }
 
@@ -1063,11 +1063,21 @@ async function save() {
   const button = $('save');
   button.disabled = true;
   button.textContent = 'Saving…';
+  // Edits made during the request would be lost when the response reloads the form.
+  $('fields').disabled = true;
   try {
-    const next = await api('api/config', { method: 'PUT', body: JSON.stringify({ config: draft, secrets }) });
+    const revision = overwriteArmed ? null : view.revision;
+    const next = await api('api/config', { method: 'PUT', body: JSON.stringify({ config: draft, secrets, revision }) });
     load(next);
     toast(next.restart_required ? 'Saved. Restart to apply.' : 'Saved.');
   } catch (error) {
+    if (error.status === 409) {
+      staleFile = await api('api/config').catch(() => staleFile);
+      overwriteArmed = true;
+      renderStatus();
+      $('save-error').textContent = 'The file changed in another window. Save again to overwrite it.';
+      return;
+    }
     $('save-error').textContent = error.message;
     const field = FIELDS.find((candidate) => error.message.includes(candidate.path));
     const row = field && document.querySelector(`.field[data-path="${field.path}"]`);
@@ -1078,6 +1088,7 @@ async function save() {
   } finally {
     button.disabled = false;
     button.textContent = 'Save changes';
+    $('fields').disabled = view.read_only;
   }
 }
 

@@ -299,8 +299,6 @@ async fn serve(
     config_read_only: bool,
 ) -> anyhow::Result<ServeExit> {
     let diagnostics_addr: SocketAddr = config.diagnostics.metrics_addr.parse()?;
-    fs::create_dir_all(config.server.state_dir.join("endpoints"))?;
-    fs::create_dir_all(config.server.state_dir.join("pairings"))?;
 
     // Start the GUI first, so it can fix a config that finds no speakers.
     let registry = StreamRegistry::new();
@@ -455,11 +453,14 @@ struct StartedSpeakers {
 }
 
 /// Finds the speakers and starts their AirPlay endpoints. Any failure, such as no
-/// matching speaker or an RTSP port in use, lets `serve` keep the GUI up and retry.
+/// matching speaker, an RTSP port in use or an unwritable state directory, lets `serve`
+/// keep the GUI up and retry.
 async fn start_speakers(
     config: &Config,
     events_tx: &mpsc::UnboundedSender<AirPlayEvent>,
 ) -> anyhow::Result<StartedSpeakers> {
+    // Here, not before the GUI starts, so the GUI can repair an unusable state directory.
+    fs::create_dir_all(config.server.state_dir.join("pairings"))?;
     let renderers = discover_renderers(config).await?;
     info!("starting AirSonos2 for {} renderer(s)", renderers.len());
     let endpoints = build_endpoints(&renderers, config)?;
