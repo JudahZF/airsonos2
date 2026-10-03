@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::fs;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -24,6 +26,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub airplay: AirPlayConfig,
     pub sonos: SonosConfig,
+    pub home_assistant: HomeAssistantConfig,
     pub stream: StreamConfig,
     pub diagnostics: DiagnosticsConfig,
     pub sync: SyncConfig,
@@ -67,6 +70,34 @@ impl Config {
                      (\"::\" for IPv6)"
                 )));
             }
+        }
+        let mut media_players = HashSet::new();
+        for entity_id in &self.home_assistant.media_players {
+            // Same rule as the add-on schema. Entity ids become file names and API paths.
+            let valid_object_id = |object_id: &str| {
+                !object_id.is_empty()
+                    && object_id.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            };
+            if !entity_id
+                .strip_prefix("media_player.")
+                .is_some_and(valid_object_id)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "home_assistant.media_players entry {entity_id:?} is not a media_player entity id"
+                )));
+            }
+            if !media_players.insert(entity_id) {
+                return Err(ConfigError::Invalid(format!(
+                    "home_assistant.media_players lists {entity_id} more than once"
+                )));
+            }
+        }
+        if !media_players.is_empty() && self.home_assistant.url.is_none() {
+            return Err(invalid(
+                "home_assistant.url is required when home_assistant.media_players is set",
+            ));
         }
         if self.server.state_dir.as_os_str().is_empty() {
             return Err(invalid("server.state_dir must not be empty"));
@@ -219,6 +250,19 @@ impl Default for SonosConfig {
 pub enum VolumeMode {
     #[default]
     Sonos,
+}
+
+/// Home Assistant `media_player` entities to expose as AirPlay endpoints. Music Assistant
+/// players are `media_player` entities too.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct HomeAssistantConfig {
+    /// Base URL, such as `http://homeassistant.local:8123`.
+    pub url: Option<Url>,
+    /// Long-lived access token. When unset, the `SUPERVISOR_TOKEN` env var is used.
+    pub token: Option<String>,
+    /// Entity ids such as `media_player.kitchen`. An empty list disables Home Assistant.
+    pub media_players: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -385,6 +429,48 @@ mod tests {
                 "192.0.2.10".parse::<IpAddr>().expect("ipv4"),
                 "2001:db8::10".parse::<IpAddr>().expect("ipv6"),
             ]
+        );
+    }
+
+    #[test]
+    fn home_assistant_players_can_be_configured() {
+        let config = Config::from_toml_str(
+            r#"
+            [home_assistant]
+            url = "http://homeassistant.local:8123"
+            media_players = ["media_player.kitchen"]
+            "#,
+        )
+        .expect("valid config");
+
+        assert_eq!(
+            config.home_assistant.url.as_ref().map(Url::as_str),
+            Some("http://homeassistant.local:8123/")
+        );
+        assert_eq!(config.home_assistant.token, None);
+        assert_eq!(
+            config.home_assistant.media_players,
+            ["media_player.kitchen"]
+        );
+    }
+
+    #[test]
+    fn home_assistant_players_must_be_unique_media_players_with_a_url() {
+        let config = |players: &str| {
+            Config::from_toml_str(&format!(
+                "[home_assistant]\nurl = \"http://ha.local:8123\"\nmedia_players = {players}\n"
+            ))
+        };
+
+        assert!(config(r#"["media_player.kitchen"]"#).is_ok());
+        assert!(config(r#"["light.kitchen"]"#).is_err());
+        assert!(config(r#"["media_player."]"#).is_err());
+        assert!(config(r#"["media_player.kitchen/cast"]"#).is_err());
+        assert!(config(r#"["media_player.Kitchen"]"#).is_err());
+        assert!(config(r#"["media_player.kitchen", "media_player.kitchen"]"#).is_err());
+        assert!(
+            Config::from_toml_str("[home_assistant]\nmedia_players = [\"media_player.kitchen\"]\n")
+                .is_err()
         );
     }
 

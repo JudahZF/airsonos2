@@ -5,8 +5,8 @@ pub mod types;
 pub mod volume;
 
 pub use config::{
-    AirPlayConfig, Config, DiagnosticsConfig, ServerConfig, SonosConfig, StreamConfig, SyncConfig,
-    VolumeMode,
+    AirPlayConfig, Config, DiagnosticsConfig, HomeAssistantConfig, ServerConfig, SonosConfig,
+    StreamConfig, SyncConfig, VolumeMode,
 };
 pub use ids::{PortAllocationError, SessionId, ZoneId, allocate_rtsp_port, stable_virtual_hwaddr};
 pub use sync::{ZoneDelay, configured_delays, delays_from_offsets, recommended_delay_for_zone};

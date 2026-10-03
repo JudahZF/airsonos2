@@ -1,6 +1,6 @@
 # AirSonos2
 
-AirSonos2 is an experimental Rust service that exposes legacy Sonos S2 rooms as virtual AirPlay 2 speakers. It receives AirPlay PCM through `shairplay`, encodes a live MP3 stream with `ffmpeg`, serves that stream over HTTP, and controls Sonos playback through local UPnP/SOAP.
+AirSonos2 is an experimental Rust service that exposes legacy Sonos S2 rooms and Home Assistant media players as virtual AirPlay 2 speakers. It receives AirPlay PCM through `shairplay`, encodes a live MP3 stream with `ffmpeg`, and serves that stream over HTTP. It controls Sonos playback through local UPnP/SOAP and Home Assistant players through the Home Assistant REST API.
 
 The primary target is a Linux LXC on Proxmox with flat-LAN-like multicast behavior between iOS devices, Sonos speakers, and the AirSonos2 host.
 
@@ -8,9 +8,10 @@ The primary target is a Linux LXC on Proxmox with flat-LAN-like multicast behavi
 
 This repository contains the first working scaffold:
 
-- Rust workspace with `core`, `airplay`, `sonos`, `stream`, `diagnostics`, and `cli` crates.
+- Rust workspace with `core`, `airplay`, `sonos`, `homeassistant`, `stream`, `diagnostics`, and `cli` crates.
 - `shairplay = "=0.5.0"` pinned with `ap2` and `resample` features.
 - Sonos SSDP discovery, device XML parsing, zone topology parsing, and SOAP control actions.
+- Home Assistant `media_player` control (`play_media`, `media_stop`, `volume_set`), which also covers Music Assistant players.
 - Live stream registry, chunked MP3 HTTP routes, generated `ffmpeg` test tone, and supervised per-session `ffmpeg` encoder wrapper.
 - CLI commands: `serve`, `discover`, `doctor`, `pairings list`, `pairings reset --zone`, and `calibrate --zones`.
 - Docker, systemd, Nix dev shell, and GitHub Actions check workflow.
@@ -69,7 +70,22 @@ You can also leave `auto_discover = true` and use `static_ips` as fallback disco
 
 The source command above uses the example's `/var/lib/airsonos2` and assigns it to the current user. For the systemd service, create the `airsonos2` service user and use `sudo install -d -o airsonos2 -g airsonos2 /var/lib/airsonos2` instead; systemd also manages this directory through `StateDirectory=airsonos2`. Run doctor as the same user that runs the service.
 
-The service creates one virtual AirPlay endpoint per included Sonos room. It persists virtual endpoint identity metadata under `state_dir/endpoints` and AirPlay 2 pairing keys under `state_dir/pairings`.
+### Home Assistant media players
+
+AirSonos2 can also expose Home Assistant `media_player` entities, including Music Assistant players, as AirPlay 2 speakers:
+
+```toml
+[home_assistant]
+url = "http://homeassistant.local:8123"
+token = "<long-lived access token>"
+media_players = ["media_player.kitchen_cast"]
+```
+
+On each AirPlay session, AirSonos2 calls `media_player.play_media` with its stream URL. The player fetches the stream from AirSonos2. Home Assistant does not report a player's IP, so AirSonos2 advertises the address of its default route; set `[server].advertise_addr` if the player cannot reach it. Run `airsonos2 discover` to list the entities that support `play_media`. Cast and Music Assistant add their own buffer, so expect drift when you group them with Sonos rooms. Home Assistant player endpoints come after the Sonos rooms in RTSP port order.
+
+When AirSonos2 cannot read a speaker's volume at startup, it reports 20% to AirPlay. Home Assistant hides the volume of players that are off.
+
+The service creates one virtual AirPlay endpoint per included Sonos room and per Home Assistant player. It persists virtual endpoint identity metadata under `state_dir/endpoints` and AirPlay 2 pairing keys under `state_dir/pairings`.
 
 For normal AirPlay 2 pairing, keep `[airplay].pin` set to the HomeKit pairing PIN and leave `rtsp_password` unset. `rtsp_password` is only for legacy RTSP digest password authentication.
 
@@ -84,7 +100,7 @@ airsonos2 pairings reset --zone RINCON_000E58AAAAAA01400 --config /etc/airsonos2
 airsonos2 calibrate --zones Kitchen,Office,Den --config /etc/airsonos2/config.toml
 ```
 
-`pairings list` prints each pairing store file and the number of stored client keys. `pairings reset --zone` removes `state_dir/pairings/<zone-id>.json`.
+`pairings list` prints each pairing store file and the number of stored client keys. `pairings reset --zone` removes `state_dir/pairings/<zone-id>.json`. For a Home Assistant player, the zone id is its entity id.
 
 ## Troubleshooting
 

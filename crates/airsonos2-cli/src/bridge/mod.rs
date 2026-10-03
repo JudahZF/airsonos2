@@ -1,9 +1,10 @@
 use super::*;
+use crate::renderer::RendererError;
 use tokio::sync::watch;
 
 #[derive(Clone)]
 pub(super) enum TransportCommand {
-    Prepare(Box<SonosStreamPrepare>),
+    Prepare(Box<StreamPrepare>),
     Play(Box<PreparedDownstream>),
     Stop {
         session_id: SessionId,
@@ -21,13 +22,13 @@ pub(super) struct ZoneWorker {
 
 impl ZoneWorker {
     pub(super) fn new(
-        client: SonosClient,
+        renderer: Renderer,
         result_tx: mpsc::UnboundedSender<DownstreamStartResult>,
         subscriber_wait: Duration,
         prebuffer: Duration,
     ) -> Self {
         let (transport, mut commands) = watch::channel(None);
-        let transport_client = client.clone();
+        let transport_renderer = renderer.clone();
         let transport_task = tokio::spawn(async move {
             while commands.changed().await.is_ok() {
                 let command = commands.borrow_and_update().clone();
@@ -36,7 +37,11 @@ impl ZoneWorker {
                         prepare(*start, &commands, subscriber_wait, prebuffer).await;
                     }
                     Some(TransportCommand::Play(stream)) => {
-                        let outcome = match stream.client.play().await {
+                        let outcome = match stream
+                            .renderer
+                            .play(&stream.live_stream.session.local_url)
+                            .await
+                        {
                             Ok(()) => DownstreamStartOutcome::Started,
                             Err(error) if error.is_timeout() => {
                                 warn!(zone_id = %stream.zone_id, "Play timed out; playback is unknown, retrying the same stream");
@@ -63,7 +68,7 @@ impl ZoneWorker {
                         zone_id,
                         generation,
                     }) => {
-                        let outcome = match transport_client.stop().await {
+                        let outcome = match transport_renderer.stop().await {
                             Ok(()) => DownstreamStartOutcome::Stopped,
                             Err(error) => {
                                 warn!(%zone_id, "Stop failed: {error}");
@@ -86,9 +91,9 @@ impl ZoneWorker {
             while volumes.changed().await.is_ok() {
                 let value = *volumes.borrow_and_update();
                 if let Some(value) = value
-                    && let Err(error) = client.set_volume(value).await
+                    && let Err(error) = renderer.set_volume(value).await
                 {
-                    warn!("Sonos volume request failed: {error}");
+                    warn!(zone_id = %renderer.id(), "volume request failed: {error}");
                 }
             }
         });
@@ -127,13 +132,13 @@ impl Drop for ZoneWorker {
 }
 
 async fn prepare(
-    start: SonosStreamPrepare,
+    start: StreamPrepare,
     commands: &watch::Receiver<Option<TransportCommand>>,
     subscriber_wait: Duration,
     prebuffer: Duration,
 ) {
-    let failure = |error: airsonos2_sonos::SonosClientError| {
-        warn!(zone_id = %start.zone_id, "Sonos prepare failed: {error}");
+    let failure = |error: RendererError| {
+        warn!(zone_id = %start.zone_id, "prepare failed: {error}");
         let _ = start.result_tx.send(DownstreamStartResult {
             session_id: start.session_id,
             zone_id: start.zone_id.clone(),
@@ -145,43 +150,53 @@ async fn prepare(
             },
         });
     };
-    // Group members reject AVTransport commands, so leave the group before the
-    // Stop barrier.
-    if start.force_standalone_on_start
-        && let Err(error) = start.client.become_coordinator_of_standalone_group().await
-    {
-        failure(error);
-        return;
-    }
-    // Never cancel an in-flight Stop. Every replacement passes this barrier,
-    // even when watch coalesces an earlier pause/stop command.
-    if let Err(error) = start.client.stop().await {
-        failure(error);
-        return;
-    }
-    if commands.has_changed().unwrap_or(true) {
-        return;
-    }
-    if let Err(error) = start
-        .client
-        .set_av_transport_uri(
-            start.local_url.as_str(),
-            &format!("{} AirSonos2", start.zone.room_name),
-        )
-        .await
-    {
-        failure(error);
-        return;
-    }
-    if commands.has_changed().unwrap_or(true) {
-        return;
+    // Home Assistant players get the stream URL in Play. `play_media` replaces whatever
+    // they play, so they need no Stop barrier either.
+    let sonos = match &start.renderer {
+        Renderer::Sonos { zone, client } => Some((zone, client)),
+        Renderer::HomeAssistant { .. } => None,
+    };
+    if let Some((zone, client)) = sonos {
+        // Group members reject AVTransport commands, so leave the group before the
+        // Stop barrier.
+        if start.force_standalone_on_start
+            && let Err(error) = client.become_coordinator_of_standalone_group().await
+        {
+            failure(error.into());
+            return;
+        }
+        // Never cancel an in-flight Stop. Every replacement passes this barrier,
+        // even when watch coalesces an earlier pause/stop command.
+        if let Err(error) = client.stop().await {
+            failure(error.into());
+            return;
+        }
+        if commands.has_changed().unwrap_or(true) {
+            return;
+        }
+        if let Err(error) = client
+            .set_av_transport_uri(
+                start.local_url.as_str(),
+                &format!("{} AirSonos2", zone.room_name),
+            )
+            .await
+        {
+            failure(error.into());
+            return;
+        }
+        if commands.has_changed().unwrap_or(true) {
+            return;
+        }
     }
     // Readiness waits can be cancelled after the network command completes.
     let mut changed = commands.clone();
     tokio::select! {
         _ = changed.changed() => return,
         _ = async {
-            start.live_stream.wait_for_subscriber(subscriber_wait).await;
+            // Home Assistant players connect only after Play.
+            if sonos.is_some() {
+                start.live_stream.wait_for_subscriber(subscriber_wait).await;
+            }
             if start.live_stream.session.codec == StreamCodec::Wav {
                 start.live_stream.wait_until_ready(prebuffer).await;
             }
@@ -191,8 +206,7 @@ async fn prepare(
         session_id: start.session_id,
         zone_id: start.zone_id,
         generation: start.generation,
-        zone_room_name: start.zone.room_name,
-        client: start.client,
+        renderer: start.renderer,
         live_stream: start.live_stream,
     });
 }

@@ -13,10 +13,10 @@ configuration:
     description: Run AirSonos2 diagnostics during startup and continue even if diagnostics warn or fail.
   advertise_addr:
     name: Advertised stream address
-    description: Optional host IP that Sonos uses to pull audio streams. Leave empty to detect it per speaker.
+    description: Optional host IP that speakers use to pull audio streams. Leave empty to detect it per speaker.
   name_template:
     name: AirPlay name template
-    description: Display name pattern for generated AirPlay endpoints. Use {room} for the Sonos room name.
+    description: Display name pattern for generated AirPlay endpoints. Use {room} for the Sonos room or Home Assistant player name.
   advertised_model:
     name: Advertised model
     description: AirPlay hardware model identifier announced to Apple clients.
@@ -53,9 +53,12 @@ configuration:
   force_standalone_on_start:
     name: Force standalone on start
     description: Move a Sonos room out of its current group before AirSonos2 starts playback.
+  ha_media_players:
+    name: Home Assistant media players
+    description: Media player entity ids to expose as AirPlay 2 speakers, such as media_player.kitchen. Music Assistant players are supported.
   stream_codec:
     name: Stream codec
-    description: Audio format served for Sonos HTTP pull streams.
+    description: Audio format served for Sonos and Home Assistant HTTP pull streams.
   mp3_bitrate_kbps:
     name: MP3 bitrate
     description: Bitrate used when stream codec is MP3.
@@ -83,7 +86,7 @@ configuration:
     fields:
       zone:
         name: Zone
-        description: Sonos room name or zone id.
+        description: Sonos room name or zone id, or Home Assistant player name or entity id.
       offset_ms:
         name: Offset
         description: Sync offset in milliseconds.
