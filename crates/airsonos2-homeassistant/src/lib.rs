@@ -16,8 +16,10 @@ use url::Url;
 pub const SUPERVISOR_TOKEN_ENV: &str = "SUPERVISOR_TOKEN";
 
 const MEDIA_PLAYER_PREFIX: &str = "media_player.";
-/// `MediaPlayerEntityFeature.PLAY_MEDIA`.
+/// `MediaPlayerEntityFeature` bits for the services AirSonos2 calls.
+const FEATURE_VOLUME_SET: u32 = 4;
 const FEATURE_PLAY_MEDIA: u32 = 512;
+const FEATURE_STOP: u32 = 4096;
 /// Home Assistant answers a service call only after the service finishes. Cast and Music
 /// Assistant players can take several seconds to start a stream.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,6 +35,19 @@ pub struct MediaPlayer {
 impl MediaPlayer {
     pub fn supports_play_media(&self) -> bool {
         self.supported_features & FEATURE_PLAY_MEDIA != 0
+    }
+
+    /// The `media_player` services AirSonos2 calls that this player does not support.
+    pub fn unsupported_services(&self) -> Vec<&'static str> {
+        [
+            (FEATURE_PLAY_MEDIA, "play_media"),
+            (FEATURE_STOP, "media_stop"),
+            (FEATURE_VOLUME_SET, "volume_set"),
+        ]
+        .into_iter()
+        .filter(|(feature, _)| self.supported_features & feature == 0)
+        .map(|(_, service)| service)
+        .collect()
     }
 }
 
@@ -66,8 +81,11 @@ impl fmt::Debug for HomeAssistantClient {
 
 impl HomeAssistantClient {
     pub fn new(base_url: &Url, token: impl Into<String>) -> Result<Self, HomeAssistantError> {
+        // Like the Sonos clients: connect directly so the token never goes to a proxy.
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             api_url: api_url(base_url)?,
@@ -91,13 +109,19 @@ impl HomeAssistantClient {
     }
 
     pub async fn media_players(&self) -> Result<Vec<MediaPlayer>, HomeAssistantError> {
-        let body = self.get("states").await?;
+        let body = self.get(self.api_url.join("states")?).await?;
         Ok(parse_media_players(&body)?)
     }
 
     /// Reads `volume_level` (0.0 to 1.0). Home Assistant hides it while a player is off.
     pub async fn volume_level(&self, entity_id: &str) -> Result<f32, HomeAssistantError> {
-        let body = self.get(&format!("states/{entity_id}")).await?;
+        let mut url = self.api_url.join("states/")?;
+        // One encoded segment, so the id cannot change the request target.
+        url.path_segments_mut()
+            .expect("API URLs are HTTP URLs with a path")
+            .pop_if_empty()
+            .push(entity_id);
+        let body = self.get(url).await?;
         let state: EntityState<MediaPlayerAttributes> = serde_json::from_str(&body)?;
         state
             .attributes
@@ -136,10 +160,10 @@ impl HomeAssistantClient {
         .await
     }
 
-    async fn get(&self, path: &str) -> Result<String, HomeAssistantError> {
+    async fn get(&self, url: Url) -> Result<String, HomeAssistantError> {
         let response = self
             .http
-            .get(self.api_url.join(path)?)
+            .get(url)
             .bearer_auth(&self.token)
             .send()
             .await?
@@ -284,8 +308,11 @@ mod tests {
 
         assert_eq!(players.len(), 2);
         assert_eq!(players[0].name, "Kitchen");
-        assert!(players[0].supports_play_media());
+        assert!(players[0].unsupported_services().is_empty());
         assert_eq!(players[1].name, "tv");
-        assert!(!players[1].supports_play_media());
+        assert_eq!(
+            players[1].unsupported_services(),
+            ["play_media", "media_stop", "volume_set"]
+        );
     }
 }

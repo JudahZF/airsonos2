@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -39,9 +39,10 @@ const DOWNSTREAM_RETRY_MAX_MS: u64 = 5_000;
 /// AirPlay volume reported when a renderer cannot read its own. Home Assistant hides the
 /// volume of players that are off, and a maximum default would make the first session loud.
 const FALLBACK_VOLUME_PERCENT: u8 = 20;
-/// Picks the default-route source address for stream URLs when the renderer IP is unknown.
-/// No packets are sent to it.
-const DEFAULT_ROUTE_PROBE: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+/// Pick the default-route source address for stream URLs when the renderer IP is unknown.
+/// No packets are sent to them.
+const DEFAULT_ROUTE_PROBE_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+const DEFAULT_ROUTE_PROBE_V6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
 
 #[derive(Debug, Parser)]
 #[command(
@@ -164,11 +165,15 @@ async fn discover(config: &Config) -> anyhow::Result<()> {
     }
 
     if config.home_assistant.url.is_some() {
-        let players = HomeAssistantClient::from_config(&config.home_assistant)?
-            .media_players()
-            .await?;
+        let players = match HomeAssistantClient::from_config(&config.home_assistant) {
+            Ok(client) => client.media_players().await,
+            Err(error) => Err(error),
+        };
         println!();
-        print_media_players(&players);
+        match players {
+            Ok(players) => print_media_players(&players),
+            Err(error) => println!("Cannot list Home Assistant media players: {error}"),
+        }
     }
 
     Ok(())
@@ -457,8 +462,11 @@ async fn home_assistant_renderers(config: &HomeAssistantConfig) -> anyhow::Resul
                     %entity_id,
                     "Home Assistant player not found; using its entity id as the AirPlay name"
                 ),
-                (_, Some(player)) if !player.supports_play_media() => {
-                    warn!(%entity_id, "Home Assistant player does not support play_media");
+                (_, Some(player)) => {
+                    let unsupported = player.unsupported_services();
+                    if !unsupported.is_empty() {
+                        warn!(%entity_id, ?unsupported, "Home Assistant player does not support all services AirSonos2 calls");
+                    }
                 }
                 _ => {}
             }
@@ -560,13 +568,27 @@ async fn start_airplay_endpoints(
     Ok(runners)
 }
 
+/// Reads all volumes at once, so an unreachable renderer delays startup by one request
+/// timeout, not one per renderer.
 async fn load_volume_states(
     renderers: &HashMap<ZoneId, Renderer>,
 ) -> HashMap<ZoneId, ZoneVolumeState> {
-    let mut volume_states = HashMap::new();
+    let mut reads = tokio::task::JoinSet::new();
+    for renderer in renderers.values() {
+        let renderer = renderer.clone();
+        reads.spawn(async move {
+            let volume = renderer.volume().await;
+            (renderer, volume)
+        });
+    }
 
-    for (zone_id, renderer) in renderers {
-        let volume_percent = match renderer.volume().await {
+    let mut volume_states = HashMap::new();
+    while let Some(read) = reads.join_next().await {
+        let Ok((renderer, volume)) = read else {
+            continue;
+        };
+        let zone_id = renderer.id();
+        let volume_percent = match volume {
             Ok(volume_percent) => volume_percent,
             Err(error) => {
                 warn!(
@@ -1518,7 +1540,10 @@ async fn stream_url_for_zone(
     // Without a renderer IP, use the default route. Inside the Home Assistant app, the
     // route to Home Assistant itself is an internal Docker network LAN players cannot reach.
     let inferred_local_ip = if needs_inference {
-        local_ip_for_remote(renderer_ip.unwrap_or(DEFAULT_ROUTE_PROBE)).await
+        match renderer_ip {
+            Some(ip) => local_ip_for_remote(ip).await,
+            None => default_route_ip(config.server.bind).await,
+        }
     } else {
         None
     };
@@ -1590,6 +1615,15 @@ fn resolve_stream_host(
              to {target}; set server.advertise_addr to this host's LAN IP"
         )
     })
+}
+
+/// Prefers IPv4. An IPv6 listener (`::`) also tries the IPv6 route, for IPv6-only hosts.
+async fn default_route_ip(bind: IpAddr) -> Option<IpAddr> {
+    let ipv4 = local_ip_for_remote(DEFAULT_ROUTE_PROBE_V4).await;
+    if ipv4.is_some() || bind.is_ipv4() {
+        return ipv4;
+    }
+    local_ip_for_remote(DEFAULT_ROUTE_PROBE_V6).await
 }
 
 async fn local_ip_for_remote(remote: IpAddr) -> Option<IpAddr> {

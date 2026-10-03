@@ -354,14 +354,24 @@ async fn check_home_assistant(config: &HomeAssistantConfig) -> Vec<DoctorCheck> 
     for entity_id in &config.media_players {
         let player = players.iter().find(|player| &player.entity_id == entity_id);
         let (status, detail) = match player {
-            Some(player) if player.supports_play_media() => (
-                CheckStatus::Pass,
-                format!("{} is {}", player.name, player.state),
-            ),
-            Some(player) => (
+            Some(player) if !player.supports_play_media() => (
                 CheckStatus::Fail,
                 format!("{} does not support play_media", player.name),
             ),
+            Some(player) => match player.unsupported_services().as_slice() {
+                [] => (
+                    CheckStatus::Pass,
+                    format!("{} is {}", player.name, player.state),
+                ),
+                missing => (
+                    CheckStatus::Warn,
+                    format!(
+                        "{} does not support {}; pause or volume changes will fail",
+                        player.name,
+                        missing.join(", ")
+                    ),
+                ),
+            },
             None => (
                 CheckStatus::Fail,
                 "entity not found in Home Assistant".to_owned(),

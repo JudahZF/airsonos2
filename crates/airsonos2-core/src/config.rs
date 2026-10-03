@@ -73,9 +73,16 @@ impl Config {
         }
         let mut media_players = HashSet::new();
         for entity_id in &self.home_assistant.media_players {
-            if entity_id
+            // Same rule as the add-on schema. Entity ids become file names and API paths.
+            let valid_object_id = |object_id: &str| {
+                !object_id.is_empty()
+                    && object_id.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            };
+            if !entity_id
                 .strip_prefix("media_player.")
-                .is_none_or(str::is_empty)
+                .is_some_and(valid_object_id)
             {
                 return Err(ConfigError::Invalid(format!(
                     "home_assistant.media_players entry {entity_id:?} is not a media_player entity id"
@@ -458,6 +465,8 @@ mod tests {
         assert!(config(r#"["media_player.kitchen"]"#).is_ok());
         assert!(config(r#"["light.kitchen"]"#).is_err());
         assert!(config(r#"["media_player."]"#).is_err());
+        assert!(config(r#"["media_player.kitchen/cast"]"#).is_err());
+        assert!(config(r#"["media_player.Kitchen"]"#).is_err());
         assert!(config(r#"["media_player.kitchen", "media_player.kitchen"]"#).is_err());
         assert!(
             Config::from_toml_str("[home_assistant]\nmedia_players = [\"media_player.kitchen\"]\n")
