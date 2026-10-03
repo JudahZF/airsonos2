@@ -162,19 +162,27 @@ impl Config {
         Self::from_toml_str(&contents)
     }
 
-    /// Replaces the file atomically. The file can hold secrets, so the new file is
-    /// private until it takes the permissions of the file it replaces.
+    /// Replaces the file atomically and durably. The file can hold secrets, so the new
+    /// file is private until it takes the permissions of the file it replaces.
     pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
 
+        // Concurrent writers each get their own temporary file.
+        static WRITES: AtomicU64 = AtomicU64::new(0);
         let path = path.as_ref();
         let contents = toml::to_string(self)?;
-        let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
-        temp_name.push(".tmp");
+        let mut temp_name = std::ffi::OsString::from(".");
+        temp_name.push(path.file_name().unwrap_or_default());
+        temp_name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            WRITES.fetch_add(1, Ordering::Relaxed)
+        ));
         let temp = path.with_file_name(temp_name);
         let write = || -> std::io::Result<()> {
             let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
+            options.write(true).create_new(true);
             #[cfg(unix)]
             std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
             let mut file = options.open(&temp)?;
@@ -183,7 +191,17 @@ impl Config {
             if let Ok(existing) = fs::metadata(path) {
                 fs::set_permissions(&temp, existing.permissions())?;
             }
-            fs::rename(&temp, path)
+            fs::rename(&temp, path)?;
+            // The rename is durable only once the directory entry is on disk.
+            #[cfg(unix)]
+            {
+                let directory = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                fs::File::open(directory)?.sync_all()?;
+            }
+            Ok(())
         };
         write().map_err(|source| {
             let _ = fs::remove_file(&temp);

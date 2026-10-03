@@ -578,6 +578,12 @@ function refresh() {
     document.querySelector(`#nav a[href="#s-${section.id}"]`)
       ?.classList.toggle('dirty', section.fields.some((field) => changed.has(field.path)));
   }
+  const token = document.getElementById('f-home_assistant.token');
+  if (token && view.secrets.home_assistant_token && secrets.home_assistant_token == null) {
+    // The server keeps a stored token only for the URL it belongs to.
+    const urlChanged = draft.home_assistant.url !== original.home_assistant.url;
+    token.placeholder = urlChanged ? 'Required for the new URL' : 'Stored. Type to replace';
+  }
   $('dirty-count').innerHTML = `<b>${changed.size}</b>unsaved change${changed.size === 1 ? '' : 's'}`;
   $('savebar').classList.toggle('show', changed.size > 0 && !view.read_only);
   renderChain();
@@ -1092,15 +1098,38 @@ function overlay(title, text, stuck = false) {
   $('overlay').classList.add('show');
 }
 
+/** The page URL for a listener address. Unspecified hosts keep the current host name. */
+function listenerUrl(addr) {
+  const match = /^\[?(.*?)\]?:(\d+)$/.exec(addr);
+  if (!match) return location.href;
+  const [, host, port] = match;
+  const name = host === '0.0.0.0' || host === '::' ? location.hostname : host.includes(':') ? `[${host}]` : host;
+  return `${location.protocol}//${name}:${port}/`;
+}
+
 async function restart() {
   const before = view.started_at_ms;
+  const saved = view.config.diagnostics.metrics_addr;
+  const moved = saved !== view.listener && listenerUrl(saved);
   restarting = true;
-  overlay('Restarting AirSonos2', 'Active AirPlay sessions stop. Waiting for the bridge to come back.');
+  overlay('Restarting AirSonos2', moved
+    ? `Active AirPlay sessions stop. This page moves to ${moved}`
+    : 'Active AirPlay sessions stop. Waiting for the bridge to come back.');
   try {
     await api('api/restart', { method: 'POST', body: '{}' });
     const deadline = Date.now() + 60_000;
     while (Date.now() < deadline) {
       await sleep(1000);
+      if (moved) {
+        // Another origin: an opaque no-cors response only proves the listener is up.
+        // The old listener is gone by then, so it is the restarted bridge.
+        const up = await fetch(`${moved}healthz`, { mode: 'no-cors', cache: 'no-store' }).then(() => true, () => false);
+        if (up) {
+          location.href = moved;
+          return;
+        }
+        continue;
+      }
       const next = await api('api/config').catch(() => null);
       if (next && next.started_at_ms !== before) {
         load(next);

@@ -324,15 +324,21 @@ async fn serve(
         diagnostics_cancel.clone(),
     ));
     info!("config GUI listening on http://{diagnostics_addr}/");
+    // Also before discovery, so watchdogs on `/healthz` see a live process while it retries.
+    let http_addr = SocketAddr::new(config.server.bind, config.server.http_port);
+    let mut http_task = tokio::spawn(serve_stream_http(
+        http_addr,
+        registry.clone(),
+        config.stream.ffmpeg_path.clone(),
+    ));
+    info!("stream HTTP server listening on {}", http_addr);
     // Created once: it holds the only signal handler for the life of the process.
     let mut exit = Box::pin(async {
         tokio::select! {
             signal = shutdown_signal() => signal.map(|()| ServeExit::Stopped),
             () = restart.cancelled() => Ok(ServeExit::Restart),
-            result = &mut diagnostics_task => match result {
-                Ok(result) => result.map(|()| ServeExit::Stopped).map_err(Into::into),
-                Err(error) => Err(error.into()),
-            },
+            result = &mut diagnostics_task => listener_exit(result),
+            result = &mut http_task => listener_exit(result),
         }
     });
 
@@ -363,6 +369,10 @@ async fn serve(
         Ok(renderers) => renderers,
         Err(result) => {
             drop(exit);
+            if !http_task.is_finished() {
+                http_task.abort();
+                let _ = http_task.await;
+            }
             diagnostics_cancel.cancel();
             if !diagnostics_task.is_finished()
                 && tokio::time::timeout(Duration::from_secs(10), &mut diagnostics_task)
@@ -377,7 +387,6 @@ async fn serve(
 
     info!("starting AirSonos2 for {} renderer(s)", renderers.len());
 
-    let http_addr = SocketAddr::new(config.server.bind, config.server.http_port);
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
     let endpoints = build_endpoints(&renderers, &config)?;
@@ -406,23 +415,11 @@ async fn serve(
         cleanup_tx,
     );
 
-    let mut http_task = tokio::spawn(serve_stream_http(
-        http_addr,
-        registry.clone(),
-        config.stream.ffmpeg_path.clone(),
-    ));
-    info!("stream HTTP server listening on {}", http_addr);
     status_tx.send_replace(BridgeStatus::Running { speakers });
 
     let result = tokio::select! {
         result = runtime.run(events_rx, cleanup_rx) => result.map(|()| ServeExit::Stopped),
         result = &mut exit => result,
-        http_result = &mut http_task => {
-            match http_result {
-                Ok(result) => result.map(|()| ServeExit::Stopped).map_err(Into::into),
-                Err(error) => Err(error.into()),
-            }
-        }
     };
     drop(exit);
 
@@ -450,6 +447,16 @@ async fn serve(
         warn!("shutdown exceeded its 10 second deadline; cancelling remaining work");
     }
     result
+}
+
+/// Maps the end of a listener task to the result of `serve`.
+fn listener_exit<E: Into<anyhow::Error>>(
+    result: Result<Result<(), E>, tokio::task::JoinError>,
+) -> anyhow::Result<ServeExit> {
+    match result {
+        Ok(result) => result.map(|()| ServeExit::Stopped).map_err(Into::into),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Finds the speakers to bridge. Fails when none match, so `serve` can retry.

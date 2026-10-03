@@ -60,6 +60,8 @@ struct ConfigView {
     read_only: bool,
     restart_required: bool,
     started_at_ms: u64,
+    /// Where this page is served now. A saved change moves it after the restart.
+    listener: String,
     status: BridgeStatus,
     /// Secrets are removed. `secrets` tells whether each one is set.
     config: Config,
@@ -129,6 +131,7 @@ struct HomeAssistantPlayer {
 #[derive(Deserialize)]
 struct RestartRequest {}
 
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
@@ -173,6 +176,7 @@ fn view(ui: &ConfigUi, mut config: Config) -> ConfigView {
         read_only: ui.read_only,
         restart_required,
         started_at_ms: ui.started_at_ms,
+        listener: ui.running.diagnostics.metrics_addr.clone(),
         status: ui.status.borrow().clone(),
         config,
         secrets,
@@ -184,11 +188,19 @@ async fn read_config(State(ui): State<Arc<ConfigUi>>) -> Result<Json<ConfigView>
     Ok(Json(view(&ui, config)))
 }
 
+struct Draft {
+    config: Config,
+    /// The Home Assistant URL changed and no token came with it. That URL must not
+    /// receive a stored token, including `SUPERVISOR_TOKEN`, because anyone who can
+    /// reach the GUI could point it at their own server.
+    new_ha_url_without_token: bool,
+}
+
 /// The draft config, with secrets taken from the request or else from the file.
 async fn draft_config(
     ui: &ConfigUi,
     request: Result<Json<DraftRequest>, JsonRejection>,
-) -> Result<Config, ApiError> {
+) -> Result<Draft, ApiError> {
     let Json(DraftRequest {
         mut config,
         secrets,
@@ -197,9 +209,20 @@ async fn draft_config(
     let update = |change: Option<String>, stored: Option<String>| {
         change.map_or(stored, |value| (!value.is_empty()).then_some(value))
     };
-    config.home_assistant.token = update(secrets.home_assistant_token, stored.home_assistant.token);
+    let url_changed = config.home_assistant.url != stored.home_assistant.url;
+    let token_sent = secrets
+        .home_assistant_token
+        .as_ref()
+        .is_some_and(|token| !token.is_empty());
+    let stored_token = (!url_changed)
+        .then_some(stored.home_assistant.token)
+        .flatten();
+    config.home_assistant.token = update(secrets.home_assistant_token, stored_token);
     config.airplay.rtsp_password = update(secrets.rtsp_password, stored.airplay.rtsp_password);
-    Ok(config)
+    Ok(Draft {
+        config,
+        new_ha_url_without_token: url_changed && !token_sent,
+    })
 }
 
 async fn save_config(
@@ -212,7 +235,7 @@ async fn save_config(
             "this config file is read-only; edit its source instead".to_owned(),
         ));
     }
-    let config = draft_config(&ui, request).await?;
+    let config = draft_config(&ui, request).await?.config;
     config
         .validate()
         .map_err(|error| ApiError(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
@@ -231,7 +254,10 @@ async fn discover(
     State(ui): State<Arc<ConfigUi>>,
     request: Result<Json<DraftRequest>, JsonRejection>,
 ) -> Result<Json<Discovery>, ApiError> {
-    let config = draft_config(&ui, request).await?;
+    let Draft {
+        config,
+        new_ha_url_without_token,
+    } = draft_config(&ui, request).await?;
     let sonos = async {
         let zones = discover_sonos_zones_from_sources(
             Duration::from_secs(3),
@@ -253,6 +279,12 @@ async fn discover(
     };
     let home_assistant = async {
         config.home_assistant.url.as_ref()?;
+        if new_ha_url_without_token {
+            return Some(Found {
+                items: Vec::new(),
+                error: Some("enter the access token for the new Home Assistant URL".to_owned()),
+            });
+        }
         let players = match HomeAssistantClient::from_config(&config.home_assistant) {
             Ok(client) => client.media_players().await,
             Err(error) => Err(error),
@@ -288,4 +320,53 @@ async fn restart(
     info!("restart requested from the web GUI");
     ui.restart.cancel();
     Ok(StatusCode::ACCEPTED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Anyone who can reach the GUI can edit the draft, so a changed URL must not
+    /// receive the stored token.
+    #[tokio::test]
+    async fn stored_token_stays_with_its_home_assistant_url() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut stored = Config::default();
+        stored.home_assistant.url = Some("http://ha.local:8123".parse().expect("url"));
+        stored.home_assistant.token = Some("stored".to_owned());
+        stored.write_to_path(&path).expect("write config");
+        let ui = ConfigUi {
+            path,
+            read_only: false,
+            running: stored.clone(),
+            started_at_ms: 0,
+            status: watch::channel(BridgeStatus::Starting).1,
+            restart: CancellationToken::new(),
+        };
+        let draft = |url: &str, token: Option<&str>| {
+            let mut config = stored.clone();
+            config.home_assistant.url = Some(url.parse().expect("url"));
+            config.home_assistant.token = None;
+            let secrets = SecretState {
+                home_assistant_token: token.map(str::to_owned),
+                rtsp_password: None,
+            };
+            draft_config(&ui, Ok(Json(DraftRequest { config, secrets })))
+        };
+
+        let same = draft("http://ha.local:8123", None).await.expect("draft");
+        assert_eq!(same.config.home_assistant.token.as_deref(), Some("stored"));
+        assert!(!same.new_ha_url_without_token);
+
+        let moved = draft("http://attacker.example", None).await.expect("draft");
+        assert_eq!(moved.config.home_assistant.token, None);
+        assert!(moved.new_ha_url_without_token);
+
+        let moved = draft("http://ha2.local:8123", Some("new"))
+            .await
+            .expect("draft");
+        assert_eq!(moved.config.home_assistant.token.as_deref(), Some("new"));
+        assert!(!moved.new_ha_url_without_token);
+    }
 }
