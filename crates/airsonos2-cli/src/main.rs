@@ -12,7 +12,9 @@ use airsonos2_core::{
     StreamSession, VirtualAirPlayEndpoint, ZoneId, configured_delays, filter_zones,
     sonos_volume_to_airplay_db, virtual_endpoint_for_zone,
 };
-use airsonos2_diagnostics::{CheckStatus, run_doctor, serve_diagnostics};
+use airsonos2_diagnostics::{
+    BridgeStatus, CheckStatus, ConfigUi, Speaker, run_doctor, serve_diagnostics,
+};
 use airsonos2_homeassistant::{HomeAssistantClient, MediaPlayer, object_id};
 use airsonos2_sonos::{SonosClient, discover_sonos_zones_from_sources};
 use airsonos2_stream::{
@@ -43,6 +45,11 @@ const FALLBACK_VOLUME_PERCENT: u8 = 20;
 /// No packets are sent to them.
 const DEFAULT_ROUTE_PROBE_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 const DEFAULT_ROUTE_PROBE_V6: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+/// Delay between startup attempts when no speaker can start.
+const SETUP_RETRY: Duration = Duration::from_secs(10);
+/// `serve` exits with this code (EX_TEMPFAIL) when the web GUI asks for a restart, so
+/// systemd `Restart=on-failure` and Docker restart policies start it again.
+const RESTART_EXIT_CODE: i32 = 75;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -60,6 +67,9 @@ enum Command {
     Serve {
         #[arg(long, default_value = "/etc/airsonos2/config.toml")]
         config: PathBuf,
+        /// Show the config read-only in the web GUI, because another tool generates it.
+        #[arg(long)]
+        config_read_only: bool,
     },
     Discover {
         #[arg(long, default_value = "/etc/airsonos2/config.toml")]
@@ -104,10 +114,16 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { config } => {
-            let config = Config::from_path(config)?;
+        Command::Serve {
+            config: path,
+            config_read_only,
+        } => {
+            let config = Config::from_path(&path)?;
             init_tracing(&config);
-            serve(config).await
+            if serve(config, path, config_read_only).await? == ServeExit::Restart {
+                std::process::exit(RESTART_EXIT_CODE);
+            }
+            Ok(())
         }
         Command::Discover { config } => {
             let config = load_config_or_default(&config)?;
@@ -271,42 +287,113 @@ fn calibrate(zones: &[String], config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn serve(config: Config) -> anyhow::Result<()> {
+#[derive(Debug, Eq, PartialEq)]
+enum ServeExit {
+    Stopped,
+    Restart,
+}
+
+async fn serve(
+    config: Config,
+    config_path: PathBuf,
+    config_read_only: bool,
+) -> anyhow::Result<ServeExit> {
     let diagnostics_addr: SocketAddr = config.diagnostics.metrics_addr.parse()?;
     fs::create_dir_all(config.server.state_dir.join("endpoints"))?;
     fs::create_dir_all(config.server.state_dir.join("pairings"))?;
 
-    let discovered = discover_sonos_zones_from_sources(
-        Duration::from_secs(5),
-        &config.sonos.static_ips,
-        config.sonos.auto_discover,
-    )
-    .await?;
-    let zones = filter_zones(&discovered, &config.sonos);
-    if !zones.is_empty() {
-        print_zones(&zones);
-    }
-    let mut renderers = sonos_renderers(zones)?;
-    renderers.extend(home_assistant_renderers(&config.home_assistant).await?);
-    if renderers.is_empty() {
-        anyhow::bail!("no Sonos rooms or Home Assistant players matched the current configuration");
-    }
-
-    info!("starting AirSonos2 for {} renderer(s)", renderers.len());
-
+    // Start the GUI first, so it can fix a config that finds no speakers.
     let registry = StreamRegistry::new();
+    let restart = tokio_util::sync::CancellationToken::new();
+    let (status_tx, status_rx) = tokio::sync::watch::channel(BridgeStatus::Starting);
+    let config_ui = ConfigUi {
+        path: config_path,
+        read_only: config_read_only,
+        running: config.clone(),
+        started_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64),
+        status: status_rx,
+        restart: restart.clone(),
+    };
+    let diagnostics_cancel = tokio_util::sync::CancellationToken::new();
+    let mut diagnostics_task = tokio::spawn(serve_diagnostics(
+        diagnostics_addr,
+        registry.clone(),
+        config_ui,
+        diagnostics_cancel.clone(),
+    ));
+    info!("config GUI listening on http://{diagnostics_addr}/");
+    // Also before discovery, so watchdogs on `/healthz` see a live process while it retries.
     let http_addr = SocketAddr::new(config.server.bind, config.server.http_port);
+    let mut http_task = tokio::spawn(serve_stream_http(
+        http_addr,
+        registry.clone(),
+        config.stream.ffmpeg_path.clone(),
+    ));
+    info!("stream HTTP server listening on {}", http_addr);
+    // Created once: it holds the only signal handler for the life of the process.
+    let mut exit = Box::pin(async {
+        tokio::select! {
+            signal = shutdown_signal() => signal.map(|()| ServeExit::Stopped),
+            () = restart.cancelled() => Ok(ServeExit::Restart),
+            result = &mut diagnostics_task => listener_exit(result),
+            result = &mut http_task => listener_exit(result),
+        }
+    });
+
     let (events_tx, events_rx) = mpsc::unbounded_channel();
+    // `Err` holds the result of an exit before any speaker started.
+    let started = loop {
+        let attempt = tokio::select! {
+            attempt = start_speakers(&config, &events_tx) => attempt,
+            result = &mut exit => break Err(result),
+        };
+        match attempt {
+            Ok(started) => break Ok(started),
+            Err(error) => {
+                error!(
+                    "cannot start any speaker: {error:#}; retrying in {} s",
+                    SETUP_RETRY.as_secs()
+                );
+                status_tx.send_replace(BridgeStatus::Setup {
+                    error: format!("{error:#}"),
+                });
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(SETUP_RETRY) => {}
+            result = &mut exit => break Err(result),
+        }
+    };
+    let StartedSpeakers {
+        speakers,
+        renderers,
+        volume_states,
+        mut runners,
+    } = match started {
+        Ok(started) => started,
+        Err(result) => {
+            drop(exit);
+            if !http_task.is_finished() {
+                http_task.abort();
+                let _ = http_task.await;
+            }
+            diagnostics_cancel.cancel();
+            if !diagnostics_task.is_finished()
+                && tokio::time::timeout(Duration::from_secs(10), &mut diagnostics_task)
+                    .await
+                    .is_err()
+            {
+                warn!("shutdown exceeded its 10 second deadline; cancelling remaining work");
+            }
+            return result;
+        }
+    };
+
+    // The runners hold the remaining senders; the channel closes when they stop.
+    drop(events_tx);
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
-    let endpoints = build_endpoints(&renderers, &config)?;
-    persist_endpoint_identities(&config.server.state_dir, &endpoints)?;
-    let renderers: HashMap<ZoneId, Renderer> = renderers
-        .into_iter()
-        .map(|renderer| (renderer.id().clone(), renderer))
-        .collect();
-    let volume_states = load_volume_states(&renderers).await;
-    let mut runners =
-        start_airplay_endpoints(&endpoints, &config, events_tx, &volume_states).await?;
     let mut runtime = BridgeRuntime::new(
         config.clone(),
         registry.clone(),
@@ -315,35 +402,13 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         cleanup_tx,
     );
 
-    let mut http_task = tokio::spawn(serve_stream_http(
-        http_addr,
-        registry.clone(),
-        config.stream.ffmpeg_path.clone(),
-    ));
-    info!("stream HTTP server listening on {}", http_addr);
-    let diagnostics_cancel = tokio_util::sync::CancellationToken::new();
-    let mut diagnostics_task = tokio::spawn(serve_diagnostics(
-        diagnostics_addr,
-        registry.clone(),
-        diagnostics_cancel.clone(),
-    ));
+    status_tx.send_replace(BridgeStatus::Running { speakers });
 
     let result = tokio::select! {
-        result = runtime.run(events_rx, cleanup_rx) => result,
-        signal = shutdown_signal() => signal,
-        diagnostics_result = &mut diagnostics_task => {
-            match diagnostics_result {
-                Ok(result) => result.map_err(Into::into),
-                Err(error) => Err(error.into()),
-            }
-        }
-        http_result = &mut http_task => {
-            match http_result {
-                Ok(result) => result.map_err(Into::into),
-                Err(error) => Err(error.into()),
-            }
-        }
+        result = runtime.run(events_rx, cleanup_rx) => result.map(|()| ServeExit::Stopped),
+        result = &mut exit => result,
     };
+    drop(exit);
 
     // Stop admission before draining sessions. Errors must pass through cleanup.
     if !http_task.is_finished() {
@@ -369,6 +434,78 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         warn!("shutdown exceeded its 10 second deadline; cancelling remaining work");
     }
     result
+}
+
+/// Maps the end of a listener task to the result of `serve`.
+fn listener_exit<E: Into<anyhow::Error>>(
+    result: Result<Result<(), E>, tokio::task::JoinError>,
+) -> anyhow::Result<ServeExit> {
+    match result {
+        Ok(result) => result.map(|()| ServeExit::Stopped).map_err(Into::into),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Speakers whose AirPlay endpoints are up.
+struct StartedSpeakers {
+    speakers: Vec<Speaker>,
+    renderers: HashMap<ZoneId, Renderer>,
+    volume_states: HashMap<ZoneId, ZoneVolumeState>,
+    runners: Vec<AirPlayEndpointRunner>,
+}
+
+/// Finds the speakers and starts their AirPlay endpoints. Any failure, such as no
+/// matching speaker or an RTSP port in use, lets `serve` keep the GUI up and retry.
+async fn start_speakers(
+    config: &Config,
+    events_tx: &mpsc::UnboundedSender<AirPlayEvent>,
+) -> anyhow::Result<StartedSpeakers> {
+    let renderers = discover_renderers(config).await?;
+    info!("starting AirSonos2 for {} renderer(s)", renderers.len());
+    let endpoints = build_endpoints(&renderers, config)?;
+    persist_endpoint_identities(&config.server.state_dir, &endpoints)?;
+    let speakers = renderers
+        .iter()
+        .zip(&endpoints)
+        .map(|(renderer, endpoint)| Speaker {
+            room: renderer.name().to_owned(),
+            airplay_name: endpoint.display_name.clone(),
+            rtsp_port: endpoint.rtsp_port,
+        })
+        .collect();
+    let renderers: HashMap<ZoneId, Renderer> = renderers
+        .into_iter()
+        .map(|renderer| (renderer.id().clone(), renderer))
+        .collect();
+    let volume_states = load_volume_states(&renderers).await;
+    let runners =
+        start_airplay_endpoints(&endpoints, config, events_tx.clone(), &volume_states).await?;
+    Ok(StartedSpeakers {
+        speakers,
+        renderers,
+        volume_states,
+        runners,
+    })
+}
+
+/// Finds the speakers to bridge. Fails when none match, so `serve` can retry.
+async fn discover_renderers(config: &Config) -> anyhow::Result<Vec<Renderer>> {
+    let discovered = discover_sonos_zones_from_sources(
+        Duration::from_secs(5),
+        &config.sonos.static_ips,
+        config.sonos.auto_discover,
+    )
+    .await?;
+    let zones = filter_zones(&discovered, &config.sonos);
+    if !zones.is_empty() {
+        print_zones(&zones);
+    }
+    let mut renderers = sonos_renderers(zones)?;
+    renderers.extend(home_assistant_renderers(&config.home_assistant).await?);
+    if renderers.is_empty() {
+        anyhow::bail!("no Sonos rooms or Home Assistant players matched the current configuration");
+    }
+    Ok(renderers)
 }
 
 async fn shutdown_signal() -> anyhow::Result<()> {

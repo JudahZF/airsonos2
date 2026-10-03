@@ -5,6 +5,7 @@
 - Expose Home Assistant `media_player` entities, including Music Assistant players, as AirPlay 2 speakers with the `ha_media_players` option.
 - Start after Home Assistant Core and use the Home Assistant API.
 - When AirSonos2 cannot read a speaker's volume, report 20% to AirPlay instead of 100%.
+- Show the rendered config in a read-only web view on the diagnostics listener, with a network scan for Sonos rooms and Home Assistant players.
 
 ## 0.1.0
 

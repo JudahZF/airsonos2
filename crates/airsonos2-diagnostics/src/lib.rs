@@ -10,10 +10,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::time;
 
-/// The service owner must cancel and await this listener during shutdown.
+mod web;
+pub use web::{BridgeStatus, ConfigUi, Speaker};
+
+/// Serves `/healthz`, `/metrics` and the config web GUI. The service owner must cancel
+/// and await this listener during shutdown.
 pub async fn serve_diagnostics(
     addr: SocketAddr,
     registry: airsonos2_stream::StreamRegistry,
+    config_ui: ConfigUi,
     cancel: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<()> {
     use axum::{Router, extract::State, routing::get};
@@ -33,7 +38,8 @@ pub async fn serve_diagnostics(
                 },
             ),
         )
-        .with_state(registry);
+        .with_state(registry)
+        .merge(web::router(config_ui));
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, router)
         .with_graceful_shutdown(cancel.cancelled_owned())
