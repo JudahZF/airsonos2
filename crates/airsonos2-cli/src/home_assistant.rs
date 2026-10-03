@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 
 use airsonos2_core::Config;
 use serde::Deserialize;
+use url::Url;
 
 const HA_BIND: &str = "0.0.0.0";
 const HA_HTTP_PORT: u16 = 7000;
 const HA_STATE_DIR: &str = "/data";
 const HA_FFMPEG_PATH: &str = "/usr/bin/ffmpeg";
 const HA_METRICS_ADDR: &str = "0.0.0.0:9100";
+/// Home Assistant Core API through the Supervisor proxy. Needs `homeassistant_api: true`.
+const HA_CORE_URL: &str = "http://supervisor/core";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -33,6 +36,7 @@ pub(crate) struct HomeAssistantOptions {
     pub(crate) include_rooms: Vec<String>,
     pub(crate) exclude_rooms: Vec<String>,
     pub(crate) force_standalone_on_start: bool,
+    pub(crate) ha_media_players: Vec<String>,
     pub(crate) stream_codec: String,
     pub(crate) mp3_bitrate_kbps: u16,
     pub(crate) prebuffer_ms: u64,
@@ -77,6 +81,7 @@ impl Default for HomeAssistantOptions {
             include_rooms: config.sonos.include_rooms,
             exclude_rooms: config.sonos.exclude_rooms,
             force_standalone_on_start: config.sonos.force_standalone_on_start,
+            ha_media_players: config.home_assistant.media_players,
             stream_codec: config.stream.codec,
             mp3_bitrate_kbps: config.stream.mp3_bitrate_kbps,
             prebuffer_ms: config.stream.prebuffer_ms,
@@ -123,6 +128,9 @@ impl HomeAssistantOptions {
         config.sonos.include_rooms = self.include_rooms.clone();
         config.sonos.exclude_rooms = self.exclude_rooms.clone();
         config.sonos.force_standalone_on_start = self.force_standalone_on_start;
+
+        config.home_assistant.url = Some(Url::parse(HA_CORE_URL)?);
+        config.home_assistant.media_players = self.ha_media_players.clone();
 
         config.stream.codec = validate_stream_codec(&self.stream_codec)?.to_owned();
         config.stream.mp3_bitrate_kbps = self.mp3_bitrate_kbps;
@@ -228,6 +236,15 @@ mod tests {
         assert_eq!(config.server.log_level, defaults.server.log_level);
         assert_eq!(config.server.advertise_addr, defaults.server.advertise_addr);
         assert_eq!(config.server.state_dir, PathBuf::from(HA_STATE_DIR));
+        assert_eq!(
+            config.home_assistant.url.as_ref().map(Url::as_str),
+            Some(HA_CORE_URL)
+        );
+        assert_eq!(config.home_assistant.token, None);
+        assert_eq!(
+            config.home_assistant.media_players,
+            defaults.home_assistant.media_players
+        );
         assert_eq!(config.airplay, defaults.airplay);
         assert_eq!(config.sonos, defaults.sonos);
         assert_eq!(config.stream.codec, defaults.stream.codec);
@@ -245,6 +262,24 @@ mod tests {
         assert_eq!(config.stream.ffmpeg_path, PathBuf::from(HA_FFMPEG_PATH));
         assert_eq!(config.diagnostics.metrics_addr, HA_METRICS_ADDR);
         assert_eq!(config.sync, defaults.sync);
+    }
+
+    #[test]
+    fn ha_media_players_round_trip_without_a_token() {
+        let options = HomeAssistantOptions::from_json_str(
+            r#"{"ha_media_players":["media_player.kitchen_cast"]}"#,
+        )
+        .expect("options");
+
+        let toml = render_config_toml(&options).expect("render");
+        let config = Config::from_toml_str(&toml).expect("config");
+
+        assert_eq!(
+            config.home_assistant.media_players,
+            ["media_player.kitchen_cast"]
+        );
+        // The runtime reads SUPERVISOR_TOKEN, so no token is written to /data.
+        assert!(!toml.contains("token"));
     }
 
     #[test]

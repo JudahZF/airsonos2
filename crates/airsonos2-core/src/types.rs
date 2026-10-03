@@ -99,24 +99,27 @@ pub fn filter_zones(zones: &[SonosZone], config: &SonosConfig) -> Vec<SonosZone>
         .collect()
 }
 
+/// Builds the AirPlay endpoint for one zone. `room` fills the `{room}` name template: a Sonos
+/// room name or a Home Assistant player name.
 pub fn virtual_endpoint_for_zone(
-    zone: &SonosZone,
+    zone_id: &ZoneId,
+    room: &str,
     index: usize,
     airplay: &AirPlayConfig,
     state_dir: impl Into<PathBuf>,
 ) -> Result<VirtualAirPlayEndpoint, PortAllocationError> {
-    let display_name = airplay.name_template.replace("{room}", &zone.room_name);
+    let display_name = airplay.name_template.replace("{room}", room);
     let rtsp_port = allocate_rtsp_port(airplay.base_rtsp_port, index)?;
     let pairing_store_path = state_dir
         .into()
         .join("pairings")
-        .join(format!("{}.json", zone.id.as_str()));
+        .join(format!("{}.json", zone_id.as_str()));
 
     Ok(VirtualAirPlayEndpoint {
-        zone_id: zone.id.clone(),
+        zone_id: zone_id.clone(),
         display_name,
         rtsp_port,
-        persisted_hwaddr: stable_virtual_hwaddr(&zone.id),
+        persisted_hwaddr: stable_virtual_hwaddr(zone_id),
         pairing_store_path,
     })
 }
@@ -170,7 +173,8 @@ mod tests {
         let airplay = AirPlayConfig::default();
 
         let endpoint =
-            virtual_endpoint_for_zone(&zone, 2, &airplay, "/tmp/airsonos2").expect("endpoint");
+            virtual_endpoint_for_zone(&zone.id, &zone.room_name, 2, &airplay, "/tmp/airsonos2")
+                .expect("endpoint");
 
         assert_eq!(endpoint.display_name, "Kitchen AirSonos2");
         assert_eq!(endpoint.rtsp_port, 5002);

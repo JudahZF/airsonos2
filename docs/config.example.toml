@@ -1,8 +1,9 @@
 [server]
 bind = "0.0.0.0"
-# IP address advertised to Sonos in stream URLs. Optional when bind is a specific
+# IP address advertised to speakers in stream URLs. Optional when bind is a specific
 # address or the local IP can be inferred; required if the bridge cannot infer
-# a LAN IP reachable by Sonos (e.g. multi-homed hosts or unusual routing).
+# a LAN IP reachable by the speakers (e.g. multi-homed hosts or unusual routing).
+# Home Assistant players use the default-route address unless this is set.
 # An IPv6 advertise_addr also needs bind = "::".
 # advertise_addr = "192.168.1.10"
 http_port = 7000
@@ -29,6 +30,14 @@ include_rooms = []
 exclude_rooms = []
 force_standalone_on_start = true
 volume_mode = "sonos"
+
+[home_assistant]
+# Home Assistant media_player entities to expose as AirPlay 2 speakers. Music Assistant
+# players are media_player entities too. An empty list disables Home Assistant.
+# url = "http://homeassistant.local:8123"
+# Long-lived access token. When unset, the SUPERVISOR_TOKEN env var is used.
+# token = "..."
+media_players = []
 
 [stream]
 # Use "wav" to bypass MP3 encoding for lower startup latency if your Sonos devices accept it.

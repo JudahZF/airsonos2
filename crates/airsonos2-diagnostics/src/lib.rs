@@ -1,7 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use airsonos2_core::{Config, SonosZone, allocate_rtsp_port, filter_zones};
+use airsonos2_core::{Config, HomeAssistantConfig, SonosZone, allocate_rtsp_port, filter_zones};
+use airsonos2_homeassistant::HomeAssistantClient;
 use airsonos2_sonos::discover_sonos_zones_from_sources;
 use serde::Serialize;
 use thiserror::Error;
@@ -100,6 +101,8 @@ pub async fn run_doctor(config: &Config) -> Result<DoctorReport, DoctorError> {
                 .expect("validated address"),
         ),
     ];
+    // Endpoint names in `serve` order: Sonos rooms, then Home Assistant players.
+    let mut endpoints = Vec::new();
 
     match discover_sonos_zones_from_sources(
         Duration::from_secs(2),
@@ -132,9 +135,7 @@ pub async fn run_doctor(config: &Config) -> Result<DoctorReport, DoctorError> {
                     zones.len()
                 ),
             });
-            let (room_ports, errors) = room_port_plan(config, &zones);
-            ports.extend(room_ports);
-            checks.extend(errors);
+            endpoints.extend(zones.iter().map(|zone| zone.room_name.clone()));
             checks.extend(check_sonos_reachability(&zones).await);
         }
         Err(error) => checks.push(DoctorCheck {
@@ -144,6 +145,13 @@ pub async fn run_doctor(config: &Config) -> Result<DoctorReport, DoctorError> {
         }),
     }
 
+    if !config.home_assistant.media_players.is_empty() {
+        checks.extend(check_home_assistant(&config.home_assistant).await);
+        endpoints.extend(config.home_assistant.media_players.iter().cloned());
+    }
+    let (endpoint_ports, errors) = endpoint_port_plan(config, &endpoints);
+    ports.extend(endpoint_ports);
+    checks.extend(errors);
     checks.extend(check_listener_ports(ports).await);
 
     checks.push(DoctorCheck {
@@ -270,17 +278,17 @@ fn check_state_directory(path: &std::path::Path) -> DoctorCheck {
 
 type PortPlan = Vec<(String, SocketAddr)>;
 
-fn room_port_plan(config: &Config, zones: &[SonosZone]) -> (PortPlan, Vec<DoctorCheck>) {
+fn endpoint_port_plan(config: &Config, endpoints: &[String]) -> (PortPlan, Vec<DoctorCheck>) {
     let mut ports = Vec::new();
     let mut errors = Vec::new();
-    for (index, zone) in zones.iter().enumerate() {
+    for (index, endpoint) in endpoints.iter().enumerate() {
         match allocate_rtsp_port(config.airplay.base_rtsp_port, index) {
             Ok(port) => ports.push((
-                format!("AirPlay RTSP: {}", zone.room_name),
+                format!("AirPlay RTSP: {endpoint}"),
                 SocketAddr::new(config.server.bind, port),
             )),
             Err(error) => errors.push(DoctorCheck {
-                name: format!("AirPlay RTSP: {}", zone.room_name),
+                name: format!("AirPlay RTSP: {endpoint}"),
                 status: CheckStatus::Fail,
                 detail: error.to_string(),
             }),
@@ -321,6 +329,51 @@ async fn check_listener_ports(ports: PortPlan) -> Vec<DoctorCheck> {
             detail,
         });
     }
+    checks
+}
+
+async fn check_home_assistant(config: &HomeAssistantConfig) -> Vec<DoctorCheck> {
+    let api_check = |status, detail| DoctorCheck {
+        name: "Home Assistant API".to_owned(),
+        status,
+        detail,
+    };
+    let players = match HomeAssistantClient::from_config(config) {
+        Ok(client) => client.media_players().await,
+        Err(error) => Err(error),
+    };
+    let players = match players {
+        Ok(players) => players,
+        Err(error) => return vec![api_check(CheckStatus::Fail, error.to_string())],
+    };
+
+    let mut checks = vec![api_check(
+        CheckStatus::Pass,
+        format!("found {} media player(s)", players.len()),
+    )];
+    for entity_id in &config.media_players {
+        let player = players.iter().find(|player| &player.entity_id == entity_id);
+        let (status, detail) = match player {
+            Some(player) if player.supports_play_media() => (
+                CheckStatus::Pass,
+                format!("{} is {}", player.name, player.state),
+            ),
+            Some(player) => (
+                CheckStatus::Fail,
+                format!("{} does not support play_media", player.name),
+            ),
+            None => (
+                CheckStatus::Fail,
+                "entity not found in Home Assistant".to_owned(),
+            ),
+        };
+        checks.push(DoctorCheck {
+            name: format!("Home Assistant player: {entity_id}"),
+            status,
+            detail,
+        });
+    }
+
     checks
 }
 
@@ -382,16 +435,21 @@ mod tests {
             .collect()
     }
 
+    fn names(zones: &[SonosZone]) -> Vec<String> {
+        zones.iter().map(|zone| zone.room_name.clone()).collect()
+    }
+
     #[test]
     fn plans_exactly_the_filtered_rooms_including_more_than_six() {
         let mut config = Config::default();
         let discovered = zones(7);
-        let (ports, errors) = room_port_plan(&config, &discovered);
+        let (ports, errors) = endpoint_port_plan(&config, &names(&discovered));
         assert!(errors.is_empty());
         assert_eq!(ports.len(), 7);
         assert_eq!(ports[6].1.port(), 5006);
         config.sonos.include_rooms.push("Room 6".to_owned());
-        let (ports, errors) = room_port_plan(&config, &filter_zones(&discovered, &config.sonos));
+        let filtered = filter_zones(&discovered, &config.sonos);
+        let (ports, errors) = endpoint_port_plan(&config, &names(&filtered));
         assert!(errors.is_empty());
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].1.port(), 5000);

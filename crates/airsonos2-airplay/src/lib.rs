@@ -45,7 +45,8 @@ pub enum AirPlayEvent {
     Volume {
         zone_id: ZoneId,
         airplay_db: f32,
-        sonos_volume: u8,
+        /// Volume on the 0-100 scale shared by Sonos and Home Assistant renderers.
+        volume_percent: u8,
     },
     SessionStopped {
         session_id: SessionId,
@@ -416,7 +417,7 @@ impl AudioHandler for BridgeAudioHandler {
         let _ = self.events.send(AirPlayEvent::Volume {
             zone_id: self.zone_id.clone(),
             airplay_db: volume,
-            sonos_volume: airplay_db_to_sonos_volume(volume),
+            volume_percent: airplay_db_to_sonos_volume(volume),
         });
     }
 

@@ -52,12 +52,14 @@ dependencies = [
  "airsonos2-airplay",
  "airsonos2-core",
  "airsonos2-diagnostics",
+ "airsonos2-homeassistant",
  "airsonos2-sonos",
  "airsonos2-stream",
  "anyhow",
  "clap",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-util",
  "toml",
@@ -85,6 +87,7 @@ name = "airsonos2-diagnostics"
 version = "0.1.0"
 dependencies = [
  "airsonos2-core",
+ "airsonos2-homeassistant",
  "airsonos2-sonos",
  "airsonos2-stream",
  "axum",
@@ -94,6 +97,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "airsonos2-homeassistant"
+version = "0.1.0"
+dependencies = [
+ "airsonos2-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "url",
 ]
 
 [[package]]

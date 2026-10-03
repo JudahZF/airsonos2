@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -8,11 +8,12 @@ use airsonos2_airplay::{
     AirPlayEndpointRunner, AirPlayEvent, FilePairingStore, PcmFormat, ZoneVolumeState,
 };
 use airsonos2_core::{
-    Config, EncoderState, ServerConfig, SessionId, SonosZone, StreamCodec, StreamSession,
-    VirtualAirPlayEndpoint, ZoneId, configured_delays, filter_zones, sonos_volume_to_airplay_db,
-    virtual_endpoint_for_zone,
+    Config, EncoderState, HomeAssistantConfig, ServerConfig, SessionId, SonosZone, StreamCodec,
+    StreamSession, VirtualAirPlayEndpoint, ZoneId, configured_delays, filter_zones,
+    sonos_volume_to_airplay_db, virtual_endpoint_for_zone,
 };
 use airsonos2_diagnostics::{CheckStatus, run_doctor, serve_diagnostics};
+use airsonos2_homeassistant::{HomeAssistantClient, MediaPlayer, object_id};
 use airsonos2_sonos::{SonosClient, discover_sonos_zones_from_sources};
 use airsonos2_stream::{
     FfmpegEncoder, FfmpegEncoderConfig, LiveStream, StreamRegistry, serve_stream_http,
@@ -26,19 +27,27 @@ use url::Url;
 
 mod bridge;
 mod home_assistant;
+mod renderer;
 use bridge::{TransportCommand, ZoneWorker};
+use renderer::Renderer;
 
 /// How long to keep a bridge session alive after the buffered audio stream
 /// closes while AirPlay playback is paused.
 const PAUSED_SESSION_GRACE_SECS: u64 = 60;
 const DOWNSTREAM_RETRY_BASE_MS: u64 = 500;
 const DOWNSTREAM_RETRY_MAX_MS: u64 = 5_000;
+/// AirPlay volume reported when a renderer cannot read its own. Home Assistant hides the
+/// volume of players that are off, and a maximum default would make the first session loud.
+const FALLBACK_VOLUME_PERCENT: u8 = 20;
+/// Picks the default-route source address for stream URLs when the renderer IP is unknown.
+/// No packets are sent to it.
+const DEFAULT_ROUTE_PROBE: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
 
 #[derive(Debug, Parser)]
 #[command(
     name = "airsonos2",
     version,
-    about = "AirPlay 2 bridge for legacy Sonos rooms"
+    about = "AirPlay 2 bridge for legacy Sonos rooms and Home Assistant media players"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -150,10 +159,18 @@ async fn discover(config: &Config) -> anyhow::Result<()> {
 
     if zones.is_empty() {
         println!("No Sonos rooms discovered.");
-        return Ok(());
+    } else {
+        print_zones(&zones);
     }
 
-    print_zones(&zones);
+    if config.home_assistant.url.is_some() {
+        let players = HomeAssistantClient::from_config(&config.home_assistant)?
+            .media_players()
+            .await?;
+        println!();
+        print_media_players(&players);
+    }
+
     Ok(())
 }
 
@@ -261,27 +278,34 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     )
     .await?;
     let zones = filter_zones(&discovered, &config.sonos);
-    if zones.is_empty() {
-        anyhow::bail!("no visible Sonos rooms matched the current configuration");
+    if !zones.is_empty() {
+        print_zones(&zones);
+    }
+    let mut renderers = sonos_renderers(zones)?;
+    renderers.extend(home_assistant_renderers(&config.home_assistant).await?);
+    if renderers.is_empty() {
+        anyhow::bail!("no Sonos rooms or Home Assistant players matched the current configuration");
     }
 
-    info!("starting AirSonos2 for {} Sonos zone(s)", zones.len());
-    print_zones(&zones);
+    info!("starting AirSonos2 for {} renderer(s)", renderers.len());
 
     let registry = StreamRegistry::new();
     let http_addr = SocketAddr::new(config.server.bind, config.server.http_port);
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
-    let endpoints = build_endpoints(&zones, &config)?;
+    let endpoints = build_endpoints(&renderers, &config)?;
     persist_endpoint_identities(&config.server.state_dir, &endpoints)?;
-    let clients = build_sonos_clients(&zones)?;
-    let volume_states = load_zone_volume_states(&clients).await;
+    let renderers: HashMap<ZoneId, Renderer> = renderers
+        .into_iter()
+        .map(|renderer| (renderer.id().clone(), renderer))
+        .collect();
+    let volume_states = load_volume_states(&renderers).await;
     let mut runners =
         start_airplay_endpoints(&endpoints, &config, events_tx, &volume_states).await?;
     let mut runtime = BridgeRuntime::new(
         config.clone(),
         registry.clone(),
-        clients,
+        renderers,
         volume_states,
         cleanup_tx,
     );
@@ -371,16 +395,98 @@ fn print_zones(zones: &[SonosZone]) {
     }
 }
 
+fn print_media_players(players: &[MediaPlayer]) {
+    let players: Vec<&MediaPlayer> = players
+        .iter()
+        .filter(|player| player.supports_play_media())
+        .collect();
+    if players.is_empty() {
+        println!("No Home Assistant media players support play_media.");
+        return;
+    }
+
+    println!("{:<40} {:<28} State", "Home Assistant entity", "Name");
+    for player in players {
+        println!(
+            "{:<40} {:<28} {}",
+            player.entity_id, player.name, player.state
+        );
+    }
+}
+
+fn sonos_renderers(zones: Vec<SonosZone>) -> anyhow::Result<Vec<Renderer>> {
+    zones
+        .into_iter()
+        .map(|zone| {
+            Ok(Renderer::Sonos {
+                client: SonosClient::new(zone.ip)?,
+                zone,
+            })
+        })
+        .collect()
+}
+
+/// Builds renderers for the configured Home Assistant players. Names come from Home
+/// Assistant. When it does not answer, the entity id is the name, and playback still works
+/// once Home Assistant is up.
+async fn home_assistant_renderers(config: &HomeAssistantConfig) -> anyhow::Result<Vec<Renderer>> {
+    if config.media_players.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let client = HomeAssistantClient::from_config(config)?;
+    let players = client
+        .media_players()
+        .await
+        .inspect_err(|error| {
+            warn!(
+                "cannot read Home Assistant players; using entity ids as AirPlay names: {error:#}"
+            );
+        })
+        .ok();
+
+    Ok(config
+        .media_players
+        .iter()
+        .map(|entity_id| {
+            let player = players
+                .as_deref()
+                .and_then(|players| players.iter().find(|player| &player.entity_id == entity_id));
+            match (&players, player) {
+                (Some(_), None) => warn!(
+                    %entity_id,
+                    "Home Assistant player not found; using its entity id as the AirPlay name"
+                ),
+                (_, Some(player)) if !player.supports_play_media() => {
+                    warn!(%entity_id, "Home Assistant player does not support play_media");
+                }
+                _ => {}
+            }
+            let name = player.map_or_else(
+                || object_id(entity_id).to_owned(),
+                |player| player.name.clone(),
+            );
+            info!(%entity_id, %name, "adding Home Assistant player");
+            Renderer::HomeAssistant {
+                id: ZoneId::new(entity_id.clone()),
+                name,
+                client: client.clone(),
+            }
+        })
+        .collect())
+}
+
 fn build_endpoints(
-    zones: &[SonosZone],
+    renderers: &[Renderer],
     config: &Config,
 ) -> anyhow::Result<Vec<VirtualAirPlayEndpoint>> {
-    zones
+    renderers
         .iter()
         .enumerate()
-        .map(|(index, zone)| {
+        .map(|(index, renderer)| {
             virtual_endpoint_for_zone(
-                zone,
+                renderer.id(),
+                renderer.name(),
                 index,
                 &config.airplay,
                 config.server.state_dir.clone(),
@@ -454,79 +560,64 @@ async fn start_airplay_endpoints(
     Ok(runners)
 }
 
-async fn load_zone_volume_states(
-    clients: &HashMap<ZoneId, (SonosZone, SonosClient)>,
+async fn load_volume_states(
+    renderers: &HashMap<ZoneId, Renderer>,
 ) -> HashMap<ZoneId, ZoneVolumeState> {
     let mut volume_states = HashMap::new();
 
-    for (zone_id, (zone, client)) in clients {
-        match client.get_volume().await {
-            Ok(sonos_volume) => {
-                let volume_db = sonos_volume_to_airplay_db(sonos_volume);
-                info!(
-                    %zone_id,
-                    room = %zone.room_name,
-                    sonos_volume,
-                    volume_db,
-                    "loaded Sonos volume for AirPlay reporting"
-                );
-                volume_states.insert(zone_id.clone(), ZoneVolumeState::new(volume_db));
-            }
+    for (zone_id, renderer) in renderers {
+        let volume_percent = match renderer.volume().await {
+            Ok(volume_percent) => volume_percent,
             Err(error) => {
                 warn!(
                     %zone_id,
-                    room = %zone.room_name,
-                    "failed to read Sonos volume, defaulting AirPlay volume to max: {error:#}"
+                    room = renderer.name(),
+                    fallback_percent = FALLBACK_VOLUME_PERCENT,
+                    "failed to read renderer volume; using fallback AirPlay volume: {error:#}"
                 );
-                volume_states.insert(zone_id.clone(), ZoneVolumeState::new(0.0));
+                FALLBACK_VOLUME_PERCENT
             }
-        }
+        };
+        let volume_db = sonos_volume_to_airplay_db(volume_percent);
+        info!(
+            %zone_id,
+            room = renderer.name(),
+            volume_percent,
+            volume_db,
+            "loaded renderer volume for AirPlay reporting"
+        );
+        volume_states.insert(zone_id.clone(), ZoneVolumeState::new(volume_db));
     }
 
     volume_states
 }
 
-async fn refresh_zone_volume_state(
-    zone_id: &ZoneId,
-    client: &SonosClient,
-    volume_state: &ZoneVolumeState,
-) {
-    match client.get_volume().await {
-        Ok(sonos_volume) => {
-            let volume_db = sonos_volume_to_airplay_db(sonos_volume);
+async fn refresh_volume_state(renderer: &Renderer, volume_state: &ZoneVolumeState) {
+    let zone_id = renderer.id();
+    match renderer.volume().await {
+        Ok(volume_percent) => {
+            let volume_db = sonos_volume_to_airplay_db(volume_percent);
             volume_state.set_volume_db(volume_db);
             info!(
                 %zone_id,
-                sonos_volume,
+                volume_percent,
                 volume_db,
-                "refreshed Sonos volume for AirPlay reporting"
+                "refreshed renderer volume for AirPlay reporting"
             );
         }
         Err(error) => {
             warn!(
                 %zone_id,
-                "failed to refresh Sonos volume for AirPlay reporting: {error:#}"
+                "failed to refresh renderer volume for AirPlay reporting: {error:#}"
             );
         }
     }
 }
 
-fn build_sonos_clients(
-    zones: &[SonosZone],
-) -> anyhow::Result<HashMap<ZoneId, (SonosZone, SonosClient)>> {
-    zones
-        .iter()
-        .map(|zone| {
-            let client = SonosClient::new(zone.ip)?;
-            Ok((zone.id.clone(), (zone.clone(), client)))
-        })
-        .collect()
-}
-
 struct BridgeRuntime {
     config: Config,
     registry: StreamRegistry,
-    sonos: HashMap<ZoneId, (SonosZone, SonosClient)>,
+    renderers: HashMap<ZoneId, Renderer>,
     volume_states: HashMap<ZoneId, ZoneVolumeState>,
     sessions: HashMap<SessionId, SessionRuntime>,
     zone_workers: HashMap<ZoneId, ZoneWorker>,
@@ -599,12 +690,11 @@ impl Drop for SessionRuntime {
 }
 
 #[derive(Clone)]
-struct SonosStreamPrepare {
+struct StreamPrepare {
     session_id: SessionId,
     zone_id: ZoneId,
     generation: u64,
-    zone: SonosZone,
-    client: SonosClient,
+    renderer: Renderer,
     live_stream: LiveStream,
     local_url: Url,
     force_standalone_on_start: bool,
@@ -644,8 +734,7 @@ struct PreparedDownstream {
     session_id: SessionId,
     zone_id: ZoneId,
     generation: u64,
-    zone_room_name: String,
-    client: SonosClient,
+    renderer: Renderer,
     live_stream: LiveStream,
 }
 
@@ -660,7 +749,7 @@ impl BridgeRuntime {
     fn new(
         config: Config,
         registry: StreamRegistry,
-        sonos: HashMap<ZoneId, (SonosZone, SonosClient)>,
+        renderers: HashMap<ZoneId, Renderer>,
         volume_states: HashMap<ZoneId, ZoneVolumeState>,
         cleanup_tx: mpsc::UnboundedSender<SessionId>,
     ) -> Self {
@@ -671,7 +760,7 @@ impl BridgeRuntime {
         Self {
             config,
             registry,
-            sonos,
+            renderers,
             volume_states,
             sessions: HashMap::new(),
             zone_workers: HashMap::new(),
@@ -751,9 +840,9 @@ impl BridgeRuntime {
 
     fn worker(&mut self, zone_id: &ZoneId) -> Option<&ZoneWorker> {
         if !self.zone_workers.contains_key(zone_id) {
-            let client = self.sonos.get(zone_id)?.1.clone();
+            let renderer = self.renderers.get(zone_id)?.clone();
             let worker = ZoneWorker::new(
-                client,
+                renderer,
                 self.downstream_result_tx.clone(),
                 Duration::from_millis(self.config.stream.startup_wait_ms()),
                 Duration::from_millis(self.config.stream.prebuffer_ms),
@@ -850,7 +939,7 @@ impl BridgeRuntime {
                 session.observed = ObservedPlayback::Unknown;
                 session.reset_needed = true;
                 session.retry_attempts = 6;
-                error!(session_id = %result.session_id, "permanent Sonos error; automatic retries stopped");
+                error!(session_id = %result.session_id, "permanent renderer error; automatic retries stopped");
                 self.cancel_downstream_retry(result.session_id);
             }
             _ => {
@@ -994,11 +1083,11 @@ impl BridgeRuntime {
             }
             AirPlayEvent::Volume {
                 zone_id,
-                sonos_volume,
+                volume_percent,
                 ..
             } => {
                 if let Some(worker) = self.worker(&zone_id) {
-                    worker.set_volume(sonos_volume);
+                    worker.set_volume(volume_percent);
                 }
                 Ok(())
             }
@@ -1008,14 +1097,14 @@ impl BridgeRuntime {
             } => self.stop_session(session_id, Some(zone_id)).await,
             AirPlayEvent::ClientConnected { zone_id, addr } => {
                 info!(%zone_id, %addr, "AirPlay client connected");
-                if let (Some((_, client)), Some(volume_state)) =
-                    (self.sonos.get(&zone_id), self.volume_states.get(&zone_id))
-                {
-                    let client = client.clone();
+                if let (Some(renderer), Some(volume_state)) = (
+                    self.renderers.get(&zone_id),
+                    self.volume_states.get(&zone_id),
+                ) {
+                    let renderer = renderer.clone();
                     let volume_state = volume_state.clone();
-                    let zone_id = zone_id.clone();
                     self.tasks.spawn(async move {
-                        refresh_zone_volume_state(&zone_id, &client, &volume_state).await;
+                        refresh_volume_state(&renderer, &volume_state).await;
                     });
                 }
                 Ok(())
@@ -1035,14 +1124,19 @@ impl BridgeRuntime {
         &self,
         session_id: SessionId,
         zone_id: ZoneId,
-        zone_ip: IpAddr,
+        renderer_ip: Option<IpAddr>,
         format: PcmFormat,
         generation: u64,
     ) -> anyhow::Result<(LiveStream, FfmpegEncoder, Url)> {
         let stream_codec = stream_codec(&self.config.stream.codec)?;
-        let local_url =
-            stream_url_for_zone(&self.config, zone_ip, session_id, stream_codec, generation)
-                .await?;
+        let local_url = stream_url_for_zone(
+            &self.config,
+            renderer_ip,
+            session_id,
+            stream_codec,
+            generation,
+        )
+        .await?;
         let stream_session = StreamSession {
             session_id,
             zone_id,
@@ -1199,7 +1293,7 @@ impl BridgeRuntime {
     fn apply_sync_anchors(&self, prepared: &[PreparedDownstream]) {
         let rooms = prepared
             .iter()
-            .map(|stream| (stream.zone_id.clone(), stream.zone_room_name.clone()))
+            .map(|stream| (stream.zone_id.clone(), stream.renderer.name().to_owned()))
             .collect::<Vec<_>>();
         let delays = configured_delays(
             &rooms,
@@ -1250,8 +1344,8 @@ impl BridgeRuntime {
             self.stop_session(old_id, None).await?;
         }
         anyhow::ensure!(
-            self.sonos.contains_key(&zone_id),
-            "no Sonos client for zone {zone_id}"
+            self.renderers.contains_key(&zone_id),
+            "no renderer for zone {zone_id}"
         );
         self.sessions
             .insert(session_id, SessionRuntime::new(zone_id.clone(), format));
@@ -1286,7 +1380,7 @@ impl BridgeRuntime {
         self.registry.remove(&session_id).await;
         self.retire_encoder(encoder);
         let generation = self.next_downstream_generation(session_id);
-        let Some((zone, client)) = self.sonos.get(&zone_id).cloned() else {
+        let Some(renderer) = self.renderers.get(&zone_id).cloned() else {
             return Ok(());
         };
         // Invalidate queued/in-flight preparation before attempting encoder construction.
@@ -1298,7 +1392,13 @@ impl BridgeRuntime {
             });
         }
         let (live_stream, encoder, local_url) = match self
-            .create_downstream_stream(session_id, zone_id.clone(), zone.ip, format, generation)
+            .create_downstream_stream(
+                session_id,
+                zone_id.clone(),
+                renderer.ip(),
+                format,
+                generation,
+            )
             .await
         {
             Ok(created) => created,
@@ -1313,14 +1413,13 @@ impl BridgeRuntime {
             .expect("session exists")
             .encoder = Some(encoder);
         self.add_session_to_sync_cohort(session_id);
-        let start = SonosStreamPrepare {
+        let start = StreamPrepare {
             session_id,
             zone_id: zone_id.clone(),
             generation,
             force_standalone_on_start: self.config.sonos.force_standalone_on_start
-                && !zone.is_group_coordinator,
-            zone,
-            client,
+                && matches!(&renderer, Renderer::Sonos { zone, .. } if !zone.is_group_coordinator),
+            renderer,
             live_stream,
             local_url,
             prepared_tx: self.prepared_tx.clone(),
@@ -1409,19 +1508,21 @@ impl BridgeRuntime {
 
 async fn stream_url_for_zone(
     config: &Config,
-    zone_ip: IpAddr,
+    renderer_ip: Option<IpAddr>,
     session_id: SessionId,
     codec: StreamCodec,
     generation: u64,
 ) -> anyhow::Result<Url> {
     let needs_inference =
         config.server.advertise_addr.is_none() && config.server.bind.is_unspecified();
+    // Without a renderer IP, use the default route. Inside the Home Assistant app, the
+    // route to Home Assistant itself is an internal Docker network LAN players cannot reach.
     let inferred_local_ip = if needs_inference {
-        local_ip_for_remote(zone_ip).await
+        local_ip_for_remote(renderer_ip.unwrap_or(DEFAULT_ROUTE_PROBE)).await
     } else {
         None
     };
-    let host = resolve_stream_host(&config.server, zone_ip, inferred_local_ip)?;
+    let host = resolve_stream_host(&config.server, renderer_ip, inferred_local_ip)?;
     let extension = match codec {
         StreamCodec::Mp3 => "mp3",
         StreamCodec::Aac => "aac",
@@ -1470,7 +1571,7 @@ fn stream_codec(codec: &str) -> anyhow::Result<StreamCodec> {
 /// addresses the stream listener cannot accept.
 fn resolve_stream_host(
     server: &ServerConfig,
-    zone_ip: IpAddr,
+    renderer_ip: Option<IpAddr>,
     inferred_local_ip: Option<IpAddr>,
 ) -> anyhow::Result<IpAddr> {
     if let Some(advertise_addr) = server.advertise_addr {
@@ -1480,9 +1581,13 @@ fn resolve_stream_host(
         return Ok(server.bind);
     }
     inferred_local_ip.ok_or_else(|| {
+        let target = renderer_ip.map_or_else(
+            || "the default route".to_owned(),
+            |ip| format!("the renderer at {ip}"),
+        );
         anyhow::anyhow!(
-            "cannot advertise stream to Sonos zone at {zone_ip}: server.bind is unspecified and \
-             no local address routes to the zone; set server.advertise_addr to this host's LAN IP"
+            "cannot advertise stream: server.bind is unspecified and no local address routes \
+             to {target}; set server.advertise_addr to this host's LAN IP"
         )
     })
 }
@@ -1544,12 +1649,19 @@ mod tests {
             session_id,
             zone_id: zone_id.clone(),
             generation: 1,
-            zone_room_name: "Kitchen".to_owned(),
-            client: SonosClient::from_base_url(
-                Url::parse("http://127.0.0.1:1400").expect("sonos url"),
-            )
-            .expect("client"),
+            renderer: sonos(
+                zone_id.clone(),
+                SonosClient::from_base_url(Url::parse("http://127.0.0.1:1400").expect("sonos url"))
+                    .expect("client"),
+            ),
             live_stream: live_stream_for(session_id, zone_id, codec),
+        }
+    }
+
+    pub(crate) fn sonos(id: ZoneId, client: SonosClient) -> Renderer {
+        Renderer::Sonos {
+            zone: zone(id),
+            client,
         }
     }
 
@@ -1589,7 +1701,13 @@ mod tests {
         assert!(runtime.registry.is_empty().await);
         assert_eq!(runtime.sessions[&id].playback_epoch, 1);
         let (new, encoder, _) = runtime
-            .create_downstream_stream(id, zone.clone(), "127.0.0.1".parse().unwrap(), format(), 2)
+            .create_downstream_stream(
+                id,
+                zone.clone(),
+                Some("127.0.0.1".parse().unwrap()),
+                format(),
+                2,
+            )
             .await
             .unwrap();
         let (header, mut output) = new.attach_subscriber();
@@ -1637,11 +1755,11 @@ mod tests {
         let a = zone_id();
         let b = ZoneId::new("ROOM_B");
         runtime
-            .sonos
-            .insert(a.clone(), (zone(a.clone()), fake.client.clone()));
+            .renderers
+            .insert(a.clone(), sonos(a.clone(), fake.client.clone()));
         let session_a = SessionId::new();
         let mut prepared = prepared_downstream(session_a, a.clone(), StreamCodec::Mp3);
-        prepared.client = fake.client.clone();
+        prepared.renderer = sonos(a.clone(), fake.client.clone());
         runtime.play_prepared_downstreams(vec![prepared]).await;
         let (request, hold_play) = fake.request().await;
         assert!(request.contains("#Play"));
@@ -1738,8 +1856,8 @@ mod tests {
         let b = SessionId::new();
         let room_b = ZoneId::new("ROOM_B");
         runtime
-            .sonos
-            .insert(room_b.clone(), (zone(room_b.clone()), fake.client.clone()));
+            .renderers
+            .insert(room_b.clone(), sonos(room_b.clone(), fake.client.clone()));
         runtime
             .sessions
             .insert(a, SessionRuntime::new(zone_id(), format()));
@@ -1749,8 +1867,8 @@ mod tests {
         runtime.add_session_to_sync_cohort(a);
         runtime.sync_cohort.as_mut().unwrap().window_deadline = Instant::now();
         runtime.add_session_to_sync_cohort(b);
-        let mut prepared = prepared_downstream(b, room_b, StreamCodec::Mp3);
-        prepared.client = fake.client.clone();
+        let mut prepared = prepared_downstream(b, room_b.clone(), StreamCodec::Mp3);
+        prepared.renderer = sonos(room_b, fake.client.clone());
         let pending = runtime.pending_cohorts.front_mut().unwrap();
         pending.start_deadline = Instant::now();
         pending.prepared.insert(b, prepared);
@@ -1768,10 +1886,10 @@ mod tests {
         runtime.config.stream.ffmpeg_path = PathBuf::from("/nonexistent/ffmpeg");
         runtime.config.server.bind = "127.0.0.1".parse().unwrap();
         let id = zone_id();
-        runtime.sonos.insert(
+        runtime.renderers.insert(
             id.clone(),
-            (
-                zone(id.clone()),
+            sonos(
+                id.clone(),
                 SonosClient::new("127.0.0.1".parse().unwrap()).unwrap(),
             ),
         );
@@ -1849,7 +1967,7 @@ mod tests {
             .create_downstream_stream(
                 SessionId::new(),
                 ZoneId::new("TEST"),
-                "127.0.0.1".parse().unwrap(),
+                Some("127.0.0.1".parse().unwrap()),
                 format(),
                 1,
             )
@@ -1887,7 +2005,7 @@ mod tests {
 
         let url = stream_url_for_zone(
             &config,
-            ip("192.0.2.50"),
+            Some(ip("192.0.2.50")),
             SessionId::new(),
             StreamCodec::Mp3,
             7,
@@ -1909,7 +2027,7 @@ mod tests {
 
         let url = stream_url_for_zone(
             &config,
-            ip("2001:db8::50"),
+            Some(ip("2001:db8::50")),
             SessionId::new(),
             StreamCodec::Wav,
             11,
@@ -1934,8 +2052,8 @@ mod tests {
             ..ServerConfig::default()
         };
 
-        let host =
-            resolve_stream_host(&server, ip("192.0.2.50"), Some(ip("192.0.2.1"))).expect("host");
+        let host = resolve_stream_host(&server, Some(ip("192.0.2.50")), Some(ip("192.0.2.1")))
+            .expect("host");
 
         assert_eq!(host, ip("192.0.2.5"));
     }
@@ -1947,7 +2065,7 @@ mod tests {
             ..ServerConfig::default()
         };
 
-        let host = resolve_stream_host(&server, ip("192.0.2.50"), None).expect("host");
+        let host = resolve_stream_host(&server, Some(ip("192.0.2.50")), None).expect("host");
 
         assert_eq!(host, ip("192.0.2.7"));
     }
@@ -1956,8 +2074,8 @@ mod tests {
     fn resolve_stream_host_uses_inferred_local_ip_when_bind_is_unspecified() {
         let server = ServerConfig::default();
 
-        let host =
-            resolve_stream_host(&server, ip("192.0.2.50"), Some(ip("192.0.2.1"))).expect("host");
+        let host = resolve_stream_host(&server, Some(ip("192.0.2.50")), Some(ip("192.0.2.1")))
+            .expect("host");
 
         assert_eq!(host, ip("192.0.2.1"));
     }
@@ -1966,10 +2084,11 @@ mod tests {
     fn resolve_stream_host_fails_when_bind_is_unspecified_and_inference_fails() {
         let server = ServerConfig::default();
 
-        let error = resolve_stream_host(&server, ip("192.0.2.50"), None).expect_err("must fail");
+        let error =
+            resolve_stream_host(&server, Some(ip("192.0.2.50")), None).expect_err("must fail");
 
         let message = error.to_string();
-        assert!(message.contains("Sonos zone at 192.0.2.50"));
+        assert!(message.contains("renderer at 192.0.2.50"));
         assert!(message.contains("server.advertise_addr"));
     }
 

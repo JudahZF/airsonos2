@@ -48,6 +48,14 @@ record unsupported or unavailable combinations explicitly.
 | MP3 | Unverified | Unverified | Unverified | Unverified |
 | WAV | Unverified | Unverified | Unverified | Unverified |
 
+Home Assistant players are not sample-aligned with Sonos rooms. Record their
+play, volume, pause, and disconnect behavior separately:
+
+| Player | Play | Volume | Pause and disconnect stop | Grouped with a Sonos room |
+| --- | --- | --- | --- | --- |
+| Home Assistant Cast entity | Unverified | Unverified | Unverified | Unverified |
+| Music Assistant entity | Unverified | Unverified | Unverified | Unverified |
+
 For each available combination, check endpoint discovery, correct room volume,
 pause/resume, seek/FLUSH, sender reconnect, session replacement, and stopping the
 correct room. Confirm that an unrelated room continues playing during another
