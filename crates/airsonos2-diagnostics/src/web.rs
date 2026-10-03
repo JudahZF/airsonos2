@@ -1,9 +1,13 @@
 //! Config web GUI. It edits the config file; changes apply after a restart.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use airsonos2_core::Config;
+use airsonos2_homeassistant::HomeAssistantClient;
+use airsonos2_sonos::discover_sonos_zones_from_sources;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
@@ -70,12 +74,55 @@ struct SecretState<T> {
     rtsp_password: T,
 }
 
+/// The page's unsaved state. Save writes it; discover scans with it.
 #[derive(Deserialize)]
-struct SaveRequest {
+struct DraftRequest {
     /// Secret fields in here are ignored.
     config: Config,
     #[serde(default)]
     secrets: SecretState<Option<String>>,
+}
+
+/// Speakers that the draft settings can reach, whether or not they are bridged.
+#[derive(Serialize)]
+struct Discovery {
+    sonos: Found<SonosRoom>,
+    /// `None` when no Home Assistant URL is set.
+    home_assistant: Option<Found<HomeAssistantPlayer>>,
+}
+
+#[derive(Serialize)]
+struct Found<T> {
+    items: Vec<T>,
+    error: Option<String>,
+}
+
+impl<T> Found<T> {
+    fn from_result<E: std::fmt::Display>(result: Result<Vec<T>, E>) -> Self {
+        match result {
+            Ok(items) => Self { items, error: None },
+            Err(error) => Self {
+                items: Vec::new(),
+                error: Some(error.to_string()),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SonosRoom {
+    room: String,
+    ip: IpAddr,
+    model: String,
+}
+
+/// Only players that support `play_media`, because AirSonos2 cannot use the others.
+#[derive(Serialize)]
+struct HomeAssistantPlayer {
+    entity_id: String,
+    name: String,
+    state: String,
+    unsupported: Vec<&'static str>,
 }
 
 /// A JSON body forces a CORS preflight, so other web pages cannot restart the bridge.
@@ -99,6 +146,7 @@ pub fn router(ui: ConfigUi) -> Router {
     Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         .route("/api/config", get(read_config).put(save_config))
+        .route("/api/discover", post(discover))
         .route("/api/restart", post(restart))
         .with_state(Arc::new(ui))
 }
@@ -136,9 +184,27 @@ async fn read_config(State(ui): State<Arc<ConfigUi>>) -> Result<Json<ConfigView>
     Ok(Json(view(&ui, config)))
 }
 
+/// The draft config, with secrets taken from the request or else from the file.
+async fn draft_config(
+    ui: &ConfigUi,
+    request: Result<Json<DraftRequest>, JsonRejection>,
+) -> Result<Config, ApiError> {
+    let Json(DraftRequest {
+        mut config,
+        secrets,
+    }) = request.map_err(|rejection| ApiError(rejection.status(), rejection.body_text()))?;
+    let stored = load_file(ui).await?;
+    let update = |change: Option<String>, stored: Option<String>| {
+        change.map_or(stored, |value| (!value.is_empty()).then_some(value))
+    };
+    config.home_assistant.token = update(secrets.home_assistant_token, stored.home_assistant.token);
+    config.airplay.rtsp_password = update(secrets.rtsp_password, stored.airplay.rtsp_password);
+    Ok(config)
+}
+
 async fn save_config(
     State(ui): State<Arc<ConfigUi>>,
-    request: Result<Json<SaveRequest>, JsonRejection>,
+    request: Result<Json<DraftRequest>, JsonRejection>,
 ) -> Result<Json<ConfigView>, ApiError> {
     if ui.read_only {
         return Err(ApiError(
@@ -146,16 +212,7 @@ async fn save_config(
             "this config file is read-only; edit its source instead".to_owned(),
         ));
     }
-    let Json(SaveRequest {
-        mut config,
-        secrets,
-    }) = request.map_err(|rejection| ApiError(rejection.status(), rejection.body_text()))?;
-    let stored = load_file(&ui).await?;
-    let update = |change: Option<String>, stored: Option<String>| {
-        change.map_or(stored, |value| (!value.is_empty()).then_some(value))
-    };
-    config.home_assistant.token = update(secrets.home_assistant_token, stored.home_assistant.token);
-    config.airplay.rtsp_password = update(secrets.rtsp_password, stored.airplay.rtsp_password);
+    let config = draft_config(&ui, request).await?;
     config
         .validate()
         .map_err(|error| ApiError(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
@@ -168,6 +225,58 @@ async fn save_config(
         .map_err(internal)?;
     info!(path = %ui.path.display(), "config saved from the web GUI");
     Ok(Json(view(&ui, config)))
+}
+
+async fn discover(
+    State(ui): State<Arc<ConfigUi>>,
+    request: Result<Json<DraftRequest>, JsonRejection>,
+) -> Result<Json<Discovery>, ApiError> {
+    let config = draft_config(&ui, request).await?;
+    let sonos = async {
+        let zones = discover_sonos_zones_from_sources(
+            Duration::from_secs(3),
+            &config.sonos.static_ips,
+            config.sonos.auto_discover,
+        )
+        .await?;
+        let mut rooms: Vec<SonosRoom> = zones
+            .into_iter()
+            .filter(|zone| zone.is_visible_room)
+            .map(|zone| SonosRoom {
+                room: zone.room_name,
+                ip: zone.ip,
+                model: zone.model,
+            })
+            .collect();
+        rooms.sort_by(|a, b| a.room.cmp(&b.room));
+        Ok::<_, airsonos2_sonos::DiscoveryError>(rooms)
+    };
+    let home_assistant = async {
+        config.home_assistant.url.as_ref()?;
+        let players = match HomeAssistantClient::from_config(&config.home_assistant) {
+            Ok(client) => client.media_players().await,
+            Err(error) => Err(error),
+        };
+        Some(Found::from_result(players.map(|players| {
+            let mut players: Vec<HomeAssistantPlayer> = players
+                .into_iter()
+                .filter(|player| player.supports_play_media())
+                .map(|player| HomeAssistantPlayer {
+                    unsupported: player.unsupported_services(),
+                    entity_id: player.entity_id,
+                    name: player.name,
+                    state: player.state,
+                })
+                .collect();
+            players.sort_by(|a, b| a.name.cmp(&b.name));
+            players
+        })))
+    };
+    let (sonos, home_assistant) = tokio::join!(sonos, home_assistant);
+    Ok(Json(Discovery {
+        sonos: Found::from_result(sonos),
+        home_assistant,
+    }))
 }
 
 async fn restart(

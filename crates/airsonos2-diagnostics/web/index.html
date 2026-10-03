@@ -146,7 +146,7 @@ main { padding: 24px 28px 140px 12px; min-width: 0; }
 
 /* Signal chain: AirPlay -> bridge -> speakers */
 .chain {
-  display: grid; grid-template-columns: auto 56px auto 56px minmax(0, 1fr); align-items: center;
+  display: grid; grid-template-columns: auto 56px auto 56px minmax(0, 1fr) auto; align-items: center; column-gap: 0;
   padding: 18px 20px; margin-bottom: 30px;
   border: 1px solid var(--line); border-radius: 14px;
   background:
@@ -175,7 +175,38 @@ main { padding: 24px 28px 140px 12px; min-width: 0; }
 .speakers li .port { color: var(--faint); font: 12px var(--mono); }
 .speakers li.empty { color: var(--muted); }
 .speakers li.empty::before { background: var(--warn); }
+.chain .scan { margin-left: 12px; }
+.chain .scan.busy svg { animation: spin 0.9s linear infinite; }
 @keyframes draw { from { transform: scaleX(0); } }
+
+/* Discovery results */
+.discovery {
+  margin: -18px 0 30px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface);
+  overflow: hidden; animation: drop 0.35s var(--ease);
+}
+.discovery > header { display: flex; align-items: center; gap: 12px; padding: 10px 10px 10px 18px; border-bottom: 1px solid var(--line); }
+.discovery > header h2 { margin: 0; font-size: 13.5px; font-weight: 620; }
+.discovery > header p { margin: 0; flex: 1; color: var(--faint); font-size: 12.5px; }
+.found { display: grid; grid-template-columns: 1fr 1fr; }
+.found > div { min-width: 0; padding-bottom: 8px; }
+.found > div + div { border-left: 1px solid var(--line); }
+.found h3 {
+  display: flex; align-items: center; gap: 8px; margin: 0; padding: 12px 18px 6px;
+  color: var(--muted); font-size: 11.5px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.09em;
+}
+.found h3 .count { font: 12px var(--mono); color: var(--faint); letter-spacing: 0; }
+.found ul { list-style: none; margin: 0; padding: 0 8px; max-height: 336px; overflow: auto; }
+.found li { display: flex; align-items: center; gap: 12px; padding: 7px 10px; border-radius: 8px; transition: background 0.15s; }
+.found li:hover { background: var(--surface-2); }
+.found li.enter { animation: rise 0.35s var(--ease) both; animation-delay: calc(min(var(--i), 12) * 30ms); }
+.found .who { flex: 1; min-width: 0; }
+.found .who b, .found .who small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.found .who b { font-weight: 560; }
+.found .who small { color: var(--muted); font: 12px var(--mono); }
+.found .who .warn { color: var(--warn); font-family: var(--sans); }
+.found .note { margin: 0; padding: 4px 18px 10px; color: var(--muted); font-size: 12.5px; }
+.found .note.err { color: var(--err); }
+.found .filter { display: block; width: calc(100% - 36px); height: 30px; margin: 2px 18px 6px; }
 @keyframes rise { from { opacity: 0; transform: translateX(-6px); } }
 
 /* Sections and fields */
@@ -325,7 +356,10 @@ select { appearance: none; padding-right: 30px; cursor: pointer;
   .field { grid-template-columns: minmax(0, 1fr) 28px; }
   .field .meta { grid-column: 1 / -1; }
   .chain { grid-template-columns: auto 24px auto; row-gap: 14px; }
-  .chain .speakers { grid-column: 1 / -1; }
+  .chain .speakers, .chain .scan { grid-column: 1 / -1; }
+  .chain .scan { justify-self: start; margin: 0; }
+  .found { grid-template-columns: 1fr; }
+  .found > div + div { border-left: 0; border-top: 1px solid var(--line); }
   .chain .w2 { display: none; }
   .uptime, .version { display: none; }
 }
@@ -358,6 +392,7 @@ select { appearance: none; padding-right: 30px; cursor: pointer;
   <main id="main">
     <div id="banners"></div>
     <section class="chain" id="chain" aria-label="Signal path"></section>
+    <section class="discovery" id="discovery" aria-label="Speakers on the network" hidden></section>
     <form id="form" autocomplete="off" novalidate><fieldset id="fields"></fieldset></form>
   </main>
 </div>
@@ -379,6 +414,7 @@ select { appearance: none; padding-right: 30px; cursor: pointer;
 const ICON = {
   revert: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h7a3.5 3.5 0 0 1 0 7H6M5.5 3.5 3 6l2.5 2.5"/></svg>',
   airplay: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M5.5 14H4a1.5 1.5 0 0 1-1.5-1.5v-8A1.5 1.5 0 0 1 4 3h12a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 16 14h-1.5"/><path d="m10 11.5 4 5H6z" fill="currentColor"/></svg>',
+  scan: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M13.5 8A5.5 5.5 0 1 1 8 2.5"/><path d="M10.6 8A2.6 2.6 0 1 1 8 5.4"/><circle cx="8" cy="8" r="0.9" fill="currentColor" stroke="none"/></svg>',
   bridge: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4.5 12.5a5.5 5.5 0 0 1 11 0M7.5 12.5a2.5 2.5 0 0 1 5 0"/><circle cx="10" cy="13.5" r="1.3" fill="currentColor" stroke="none"/></svg>',
 };
 
@@ -469,6 +505,9 @@ let draft = null;
 /** `null` keeps the stored secret, `''` removes it, any other string replaces it. */
 let secrets = {};
 let restarting = false;
+/** Last scan: rows keep their switches, so edits update them in place. */
+let discovery = null;
+let scanning = false;
 
 const $ = (id) => document.getElementById(id);
 const clone = (value) => structuredClone(value);
@@ -485,6 +524,7 @@ const canonical = (value) => JSON.stringify(value, (_, inner) =>
     : inner);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const speakerRooms = () => view?.status.state === 'running' ? view.status.speakers.map((speaker) => speaker.room) : [];
+const fieldByPath = (path) => FIELDS.find((field) => field.path === path);
 
 function h(tag, props = {}, ...children) {
   const element = document.createElement(tag);
@@ -541,6 +581,7 @@ function refresh() {
   $('dirty-count').innerHTML = `<b>${changed.size}</b>unsaved change${changed.size === 1 ? '' : 's'}`;
   $('savebar').classList.toggle('show', changed.size > 0 && !view.read_only);
   renderChain();
+  updateDiscovery();
 }
 
 function onEdit(field) {
@@ -807,7 +848,7 @@ function renderChain() {
       h('span', { class: 'room' }, speaker.airplay_name),
       h('span', { class: 'port' }, `rtsp :${speaker.rtsp_port}`)))
     : [h('li', { class: 'empty', style: '--i:0' }, status.state === 'starting' ? 'Looking for speakers…' : 'No speakers running')];
-  const key = canonical([codec, draft.server.http_port, status]);
+  const key = canonical([codec, draft.server.http_port, status, scanning]);
   if (renderChain.key === key) return;
   renderChain.key = key;
   $('chain').replaceChildren(
@@ -815,7 +856,126 @@ function renderChain() {
     h('div', { class: 'wire w1' }),
     h('div', { class: 'node hub' }, h('span', { class: 'icon', html: ICON.bridge }), h('div', {}, h('b', {}, `Bridge :${draft.server.http_port}`), h('small', {}, codec))),
     h('div', { class: 'wire w2' }),
-    h('ul', { class: 'speakers' }, speakers));
+    h('ul', { class: 'speakers' }, speakers),
+    h('button', {
+      type: 'button', class: `btn scan${scanning ? ' busy' : ''}`, disabled: scanning, onclick: scan,
+      title: 'List the Sonos rooms and Home Assistant players that the current settings reach',
+    }, h('span', { html: ICON.scan, style: 'display:contents' }), scanning ? 'Scanning…' : 'Scan network'));
+}
+
+// ---- Discovery ----
+
+const sameName = (a, b) => a.toLowerCase() === b.toLowerCase();
+const listHas = (list, name) => list.some((item) => sameName(item, name));
+const listWithout = (list, name) => list.filter((item) => !sameName(item, name));
+
+/** Mirrors `filter_zones`: include list (when not empty), then exclude list, ignoring case. */
+function roomBridged(room) {
+  const { include_rooms: include, exclude_rooms: exclude } = draft.sonos;
+  return (include.length === 0 || listHas(include, room)) && !listHas(exclude, room);
+}
+
+function setRoomBridged(room, on) {
+  const sonos = draft.sonos;
+  if (on) {
+    sonos.exclude_rooms = listWithout(sonos.exclude_rooms, room);
+    if (sonos.include_rooms.length && !listHas(sonos.include_rooms, room)) sonos.include_rooms = [...sonos.include_rooms, room];
+  } else if (listHas(sonos.include_rooms, room) && sonos.include_rooms.length > 1) {
+    sonos.include_rooms = listWithout(sonos.include_rooms, room);
+  } else {
+    // Emptying the include list would bridge every room, so exclude this one instead.
+    sonos.exclude_rooms = [...sonos.exclude_rooms, room];
+  }
+  return ['sonos.include_rooms', 'sonos.exclude_rooms'];
+}
+
+function setPlayerExposed(entityId, on) {
+  const players = draft.home_assistant.media_players.filter((player) => player !== entityId);
+  draft.home_assistant.media_players = on ? [...players, entityId] : players;
+  return ['home_assistant.media_players'];
+}
+
+function foundRow(index, title, detail, warning, isOn, setOn) {
+  const input = h('input', { type: 'checkbox', role: 'switch', 'aria-label': `Bridge ${title}`, disabled: view.read_only });
+  input.addEventListener('change', () => {
+    const paths = setOn(input.checked);
+    for (const path of paths) replaceField(fieldByPath(path));
+    onEdit(fieldByPath(paths[0]));
+  });
+  const element = h('li', { class: 'enter', style: `--i:${index}` },
+    h('div', { class: 'who' }, h('b', {}, title), h('small', {}, detail, warning && h('span', { class: 'warn' }, ` · ${warning}`))),
+    h('label', { class: 'switch' }, input, h('span')));
+  return { element, input, isOn, text: `${title} ${detail}`.toLowerCase() };
+}
+
+function foundColumn(heading, found, emptyNote, buildRows) {
+  const column = h('div', {}, h('h3', {}, heading, found && !found.error && h('span', { class: 'count' }, String(found.items.length))));
+  if (!found) {
+    column.append(h('p', { class: 'note' }, emptyNote));
+    return { column, rows: [] };
+  }
+  if (found.error) {
+    column.append(h('p', { class: 'note err' }, found.error));
+    return { column, rows: [] };
+  }
+  if (found.items.length === 0) {
+    column.append(h('p', { class: 'note' }, 'Nothing found.'));
+    return { column, rows: [] };
+  }
+  const rows = buildRows(found.items);
+  if (rows.length > 8) {
+    const filter = h('input', { type: 'text', class: 'filter', placeholder: 'Filter', 'aria-label': `Filter ${heading}`, spellcheck: 'false' });
+    filter.addEventListener('input', () => {
+      const text = filter.value.trim().toLowerCase();
+      for (const row of rows) row.element.hidden = !row.text.includes(text);
+    });
+    column.append(filter);
+  }
+  column.append(h('ul', {}, rows.map((row) => row.element)));
+  return { column, rows };
+}
+
+function renderDiscovery(result) {
+  const sonos = foundColumn('Sonos rooms', result.sonos, '', (rooms) => rooms.map((room, index) =>
+    foundRow(index, room.room, `${room.ip} · ${room.model}`, null,
+      () => roomBridged(room.room), (on) => setRoomBridged(room.room, on))));
+  const players = foundColumn('Home Assistant players', result.home_assistant,
+    'Set a Home Assistant URL to list its players.', (items) => items.map((player, index) =>
+      foundRow(index, player.name, `${player.entity_id} · ${player.state}`,
+        player.unsupported.length ? `no ${player.unsupported.join(', ')}` : null,
+        () => draft.home_assistant.media_players.includes(player.entity_id),
+        (on) => setPlayerExposed(player.entity_id, on))));
+  discovery = { rows: [...sonos.rows, ...players.rows], rooms: result.sonos.items.map((room) => room.room) };
+  const panel = $('discovery');
+  panel.replaceChildren(
+    h('header', {}, h('h2', {}, 'On your network'), h('p', {}, 'Found with the settings on this page, saved or not.'),
+      h('button', { type: 'button', class: 'btn quiet', onclick: () => { discovery = null; panel.hidden = true; } }, 'Close')),
+    h('div', { class: 'found' }, sonos.column, players.column));
+  panel.hidden = false;
+  updateDiscovery();
+  updateRoomSuggestions();
+}
+
+function updateDiscovery() {
+  for (const row of discovery?.rows ?? []) row.input.checked = row.isOn();
+}
+
+function updateRoomSuggestions() {
+  const rooms = new Set([...speakerRooms(), ...(discovery?.rooms ?? [])]);
+  $('rooms').replaceChildren(...[...rooms].map((room) => h('option', { value: room })));
+}
+
+async function scan() {
+  scanning = true;
+  renderChain();
+  try {
+    renderDiscovery(await api('api/discover', { method: 'POST', body: JSON.stringify({ config: draft, secrets }) }));
+  } catch (error) {
+    toast(`Scan failed: ${error.message}`, 'err');
+  } finally {
+    scanning = false;
+    renderChain();
+  }
 }
 
 function renderStatus() {
@@ -832,7 +992,7 @@ function renderStatus() {
   $('restart').hidden = false;
   const minutes = Math.floor((Date.now() - view.started_at_ms) / 60000);
   $('uptime').textContent = minutes < 0 ? '' : minutes < 60 ? `up ${minutes}m` : `up ${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-  $('rooms').replaceChildren(...speakerRooms().map((room) => h('option', { value: room })));
+  updateRoomSuggestions();
 
   const banners = [];
   if (view.read_only) {
