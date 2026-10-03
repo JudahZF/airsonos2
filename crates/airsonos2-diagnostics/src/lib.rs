@@ -1,7 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use airsonos2_core::{Config, SonosZone, allocate_rtsp_port};
+use airsonos2_core::{Config, HomeAssistantConfig, SonosZone, allocate_rtsp_port};
+use airsonos2_homeassistant::HomeAssistantClient;
 use airsonos2_sonos::discover_sonos_zones_from_sources;
 use serde::Serialize;
 use thiserror::Error;
@@ -98,6 +99,10 @@ pub async fn run_doctor(config: &Config) -> Result<DoctorReport, DoctorError> {
         }),
     }
 
+    if !config.home_assistant.media_players.is_empty() {
+        checks.extend(check_home_assistant(&config.home_assistant).await);
+    }
+
     checks.push(DoctorCheck {
         name: "mDNS AirPlay visibility".to_owned(),
         status: CheckStatus::Warn,
@@ -183,6 +188,51 @@ async fn check_sonos_reachability(zones: &[SonosZone]) -> Vec<DoctorCheck> {
                 detail: "timed out connecting to port 1400".to_owned(),
             }),
         }
+    }
+
+    checks
+}
+
+async fn check_home_assistant(config: &HomeAssistantConfig) -> Vec<DoctorCheck> {
+    let api_check = |status, detail| DoctorCheck {
+        name: "Home Assistant API".to_owned(),
+        status,
+        detail,
+    };
+    let players = match HomeAssistantClient::from_config(config) {
+        Ok(client) => client.media_players().await,
+        Err(error) => Err(error),
+    };
+    let players = match players {
+        Ok(players) => players,
+        Err(error) => return vec![api_check(CheckStatus::Fail, error.to_string())],
+    };
+
+    let mut checks = vec![api_check(
+        CheckStatus::Pass,
+        format!("found {} media player(s)", players.len()),
+    )];
+    for entity_id in &config.media_players {
+        let player = players.iter().find(|player| &player.entity_id == entity_id);
+        let (status, detail) = match player {
+            Some(player) if player.supports_play_media() => (
+                CheckStatus::Pass,
+                format!("{} is {}", player.name, player.state),
+            ),
+            Some(player) => (
+                CheckStatus::Fail,
+                format!("{} does not support play_media", player.name),
+            ),
+            None => (
+                CheckStatus::Fail,
+                "entity not found in Home Assistant".to_owned(),
+            ),
+        };
+        checks.push(DoctorCheck {
+            name: format!("Home Assistant player: {entity_id}"),
+            status,
+            detail,
+        });
     }
 
     checks

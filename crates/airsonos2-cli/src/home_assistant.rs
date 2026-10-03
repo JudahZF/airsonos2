@@ -5,18 +5,22 @@ use std::path::{Path, PathBuf};
 
 use airsonos2_core::Config;
 use serde::Deserialize;
+use url::Url;
 
 const HA_BIND: &str = "0.0.0.0";
 const HA_HTTP_PORT: u16 = 7000;
 const HA_STATE_DIR: &str = "/data";
 const HA_FFMPEG_PATH: &str = "/usr/bin/ffmpeg";
 const HA_METRICS_ADDR: &str = "0.0.0.0:9100";
+/// Home Assistant Core API through the Supervisor proxy. Needs `homeassistant_api: true`.
+const HA_CORE_URL: &str = "http://supervisor/core";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub(crate) struct HomeAssistantOptions {
     pub(crate) log_level: String,
     pub(crate) run_doctor_on_start: bool,
+    pub(crate) advertise_ip: Option<String>,
     pub(crate) name_template: String,
     pub(crate) advertised_model: String,
     pub(crate) pin: String,
@@ -31,6 +35,7 @@ pub(crate) struct HomeAssistantOptions {
     pub(crate) exclude_rooms: Vec<String>,
     pub(crate) force_standalone_on_start: bool,
     pub(crate) stop_on_disconnect: bool,
+    pub(crate) ha_media_players: Vec<String>,
     pub(crate) stream_codec: String,
     pub(crate) mp3_bitrate_kbps: u16,
     pub(crate) prebuffer_ms: u64,
@@ -58,6 +63,7 @@ impl Default for HomeAssistantOptions {
         Self {
             log_level: config.server.log_level,
             run_doctor_on_start: false,
+            advertise_ip: config.server.advertise_ip.map(|ip| ip.to_string()),
             name_template: config.airplay.name_template,
             advertised_model: config.airplay.advertised_model,
             pin: config.airplay.pin,
@@ -77,6 +83,7 @@ impl Default for HomeAssistantOptions {
             exclude_rooms: config.sonos.exclude_rooms,
             force_standalone_on_start: config.sonos.force_standalone_on_start,
             stop_on_disconnect: config.sonos.stop_on_disconnect,
+            ha_media_players: config.home_assistant.media_players,
             stream_codec: config.stream.codec,
             mp3_bitrate_kbps: config.stream.mp3_bitrate_kbps,
             prebuffer_ms: config.stream.prebuffer_ms,
@@ -109,6 +116,7 @@ impl HomeAssistantOptions {
 
         config.server.bind = HA_BIND.parse()?;
         config.server.http_port = HA_HTTP_PORT;
+        config.server.advertise_ip = parse_advertise_ip(self.advertise_ip.as_deref())?;
         config.server.state_dir = PathBuf::from(HA_STATE_DIR);
         config.server.log_level = self.log_level.clone();
 
@@ -127,6 +135,9 @@ impl HomeAssistantOptions {
         config.sonos.exclude_rooms = self.exclude_rooms.clone();
         config.sonos.force_standalone_on_start = self.force_standalone_on_start;
         config.sonos.stop_on_disconnect = self.stop_on_disconnect;
+
+        config.home_assistant.url = Some(Url::parse(HA_CORE_URL)?);
+        config.home_assistant.media_players = self.ha_media_players.clone();
 
         config.stream.codec = validate_stream_codec(&self.stream_codec)?.to_owned();
         config.stream.mp3_bitrate_kbps = self.mp3_bitrate_kbps;
@@ -190,6 +201,17 @@ fn parse_static_ips(values: &[String]) -> anyhow::Result<Vec<IpAddr>> {
         .collect()
 }
 
+fn parse_advertise_ip(value: Option<&str>) -> anyhow::Result<Option<IpAddr>> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .map_err(|error| anyhow::anyhow!("invalid advertise_ip {value:?}: {error}"))
+        })
+        .transpose()
+}
+
 fn validate_stream_codec(codec: &str) -> anyhow::Result<&str> {
     match codec {
         "mp3" | "wav" => Ok(codec),
@@ -223,6 +245,16 @@ mod tests {
         assert_eq!(config.server.http_port, defaults.server.http_port);
         assert_eq!(config.server.log_level, defaults.server.log_level);
         assert_eq!(config.server.state_dir, PathBuf::from(HA_STATE_DIR));
+        assert_eq!(config.server.advertise_ip, defaults.server.advertise_ip);
+        assert_eq!(
+            config.home_assistant.url.as_ref().map(Url::as_str),
+            Some("http://supervisor/core")
+        );
+        assert_eq!(config.home_assistant.token, None);
+        assert_eq!(
+            config.home_assistant.media_players,
+            defaults.home_assistant.media_players
+        );
         assert_eq!(config.airplay, defaults.airplay);
         assert_eq!(config.sonos, defaults.sonos);
         assert_eq!(config.stream.codec, defaults.stream.codec);
@@ -279,6 +311,32 @@ mod tests {
             ..HomeAssistantOptions::default()
         };
 
+        assert!(options.to_config().is_err());
+    }
+
+    #[test]
+    fn ha_media_players_and_advertise_ip_render() {
+        let options = HomeAssistantOptions {
+            advertise_ip: Some("192.0.2.5".to_owned()),
+            ha_media_players: vec!["media_player.kitchen".to_owned()],
+            ..HomeAssistantOptions::default()
+        };
+
+        let config = options.to_config().expect("config");
+
+        assert_eq!(
+            config.server.advertise_ip,
+            Some("192.0.2.5".parse::<IpAddr>().expect("ip"))
+        );
+        assert_eq!(
+            config.home_assistant.media_players,
+            ["media_player.kitchen"]
+        );
+
+        let options = HomeAssistantOptions {
+            advertise_ip: Some("not an ip".to_owned()),
+            ..HomeAssistantOptions::default()
+        };
         assert!(options.to_config().is_err());
     }
 

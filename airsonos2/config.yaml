@@ -1,22 +1,24 @@
 name: AirSonos2
 slug: airsonos2
 version: "0.1.0"
-description: AirPlay 2 bridge for legacy Sonos rooms
+description: AirPlay 2 bridge for legacy Sonos rooms and Home Assistant media players
 url: https://github.com/judahfuller/airsonos2
 image: ghcr.io/judahfuller/airsonos2
 arch:
   - amd64
   - aarch64
-startup: services
+startup: application
 boot: auto
 init: false
 host_network: true
+homeassistant_api: true
 stage: experimental
 backup: cold
 watchdog: http://[HOST]:7000/healthz
 options:
   log_level: info
   run_doctor_on_start: false
+  advertise_ip: null
   name_template: "{room} AirSonos2"
   advertised_model: AudioAccessory5,1
   pin: "3939"
@@ -31,6 +33,7 @@ options:
   exclude_rooms: []
   force_standalone_on_start: true
   stop_on_disconnect: true
+  ha_media_players: []
   stream_codec: mp3
   mp3_bitrate_kbps: 320
   prebuffer_ms: 500
@@ -47,6 +50,7 @@ options:
 schema:
   log_level: list(trace|debug|info|warn|error)
   run_doctor_on_start: bool
+  advertise_ip: str?
   name_template: str(1,)
   advertised_model: str(1,)
   pin: str(0,)
@@ -64,6 +68,8 @@ schema:
     - str
   force_standalone_on_start: bool
   stop_on_disconnect: bool
+  ha_media_players:
+    - match(^media_player\.[a-z0-9_]+$)
   stream_codec: list(mp3|wav)
   mp3_bitrate_kbps: int(32,320)
   prebuffer_ms: int(0,)

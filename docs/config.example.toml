@@ -1,6 +1,9 @@
 [server]
 bind = "0.0.0.0"
 http_port = 7000
+# Optional IP address that speakers use to fetch streams. Leave unset to use the address
+# that routes to each Sonos room, or the default-route address for Home Assistant players.
+# advertise_ip = "192.168.1.20"
 state_dir = "/var/lib/airsonos2"
 log_level = "info"
 
@@ -25,6 +28,14 @@ exclude_rooms = []
 force_standalone_on_start = true
 stop_on_disconnect = true
 volume_mode = "sonos"
+
+[home_assistant]
+# Home Assistant media_player entities to expose as AirPlay 2 speakers. Music Assistant
+# players are media_player entities too. An empty list disables Home Assistant.
+# url = "http://homeassistant.local:8123"
+# Long-lived access token. When unset, the SUPERVISOR_TOKEN env var is used.
+# token = "..."
+media_players = []
 
 [stream]
 # Use "wav" to bypass MP3 encoding for lower startup latency if your Sonos devices accept it.

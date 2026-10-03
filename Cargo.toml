@@ -4,6 +4,7 @@ members = [
   "crates/airsonos2-cli",
   "crates/airsonos2-core",
   "crates/airsonos2-diagnostics",
+  "crates/airsonos2-homeassistant",
   "crates/airsonos2-sonos",
   "crates/airsonos2-stream",
 ]
@@ -21,6 +22,7 @@ repository = "https://github.com/judahfuller/airsonos2"
 airsonos2-airplay = { path = "crates/airsonos2-airplay" }
 airsonos2-core = { path = "crates/airsonos2-core" }
 airsonos2-diagnostics = { path = "crates/airsonos2-diagnostics" }
+airsonos2-homeassistant = { path = "crates/airsonos2-homeassistant" }
 airsonos2-sonos = { path = "crates/airsonos2-sonos" }
 airsonos2-stream = { path = "crates/airsonos2-stream" }
 anyhow = "1.0"

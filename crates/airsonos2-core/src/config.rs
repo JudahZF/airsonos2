@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -22,6 +23,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub airplay: AirPlayConfig,
     pub sonos: SonosConfig,
+    pub home_assistant: HomeAssistantConfig,
     pub stream: StreamConfig,
     pub diagnostics: DiagnosticsConfig,
     pub sync: SyncConfig,
@@ -47,6 +49,10 @@ impl Config {
 pub struct ServerConfig {
     pub bind: IpAddr,
     pub http_port: u16,
+    /// IP address that players use to fetch streams. When unset, AirSonos2 picks the local
+    /// address that routes to each Sonos room, or the default-route address for Home
+    /// Assistant players.
+    pub advertise_ip: Option<IpAddr>,
     pub state_dir: PathBuf,
     pub log_level: String,
 }
@@ -56,6 +62,7 @@ impl Default for ServerConfig {
         Self {
             bind: "0.0.0.0".parse().expect("valid default bind address"),
             http_port: 7000,
+            advertise_ip: None,
             state_dir: PathBuf::from("/var/lib/airsonos2"),
             log_level: "info".to_owned(),
         }
@@ -126,6 +133,19 @@ impl Default for SonosConfig {
             volume_mode: VolumeMode::Sonos,
         }
     }
+}
+
+/// Home Assistant `media_player` entities to expose as AirPlay endpoints. Music Assistant
+/// players are `media_player` entities too.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct HomeAssistantConfig {
+    /// Base URL, such as `http://homeassistant.local:8123`.
+    pub url: Option<Url>,
+    /// Long-lived access token. When unset, the `SUPERVISOR_TOKEN` env var is used.
+    pub token: Option<String>,
+    /// Entity ids such as `media_player.kitchen`. An empty list disables Home Assistant.
+    pub media_players: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -259,6 +279,35 @@ mod tests {
                 "192.0.2.10".parse::<IpAddr>().expect("ipv4"),
                 "2001:db8::10".parse::<IpAddr>().expect("ipv6"),
             ]
+        );
+    }
+
+    #[test]
+    fn home_assistant_players_can_be_configured() {
+        let config = Config::from_toml_str(
+            r#"
+            [server]
+            advertise_ip = "192.0.2.5"
+
+            [home_assistant]
+            url = "http://homeassistant.local:8123"
+            media_players = ["media_player.kitchen"]
+            "#,
+        )
+        .expect("valid config");
+
+        assert_eq!(
+            config.server.advertise_ip,
+            Some("192.0.2.5".parse::<IpAddr>().expect("ip"))
+        );
+        assert_eq!(
+            config.home_assistant.url.as_ref().map(Url::as_str),
+            Some("http://homeassistant.local:8123/")
+        );
+        assert_eq!(config.home_assistant.token, None);
+        assert_eq!(
+            config.home_assistant.media_players,
+            ["media_player.kitchen"]
         );
     }
 

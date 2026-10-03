@@ -12,6 +12,9 @@ Use this checklist before treating a build as release-worthy.
 - iPhone groups six virtual Sonos endpoints.
 - Volume changes affect the correct Sonos room.
 - Disconnect stops the correct Sonos room.
+- A Home Assistant Cast player plays, changes volume, and stops on disconnect.
+- A Music Assistant player plays, changes volume, and stops on disconnect.
+- iPhone groups a virtual Sonos endpoint with a virtual Home Assistant endpoint.
 - Daemon restart recovers cleanly.
 - `airsonos2 doctor` passes on the Proxmox LXC network.
 

@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 airsonos2-core.workspace = true
+airsonos2-homeassistant.workspace = true
 airsonos2-sonos.workspace = true
 reqwest.workspace = true
 serde.workspace = true
