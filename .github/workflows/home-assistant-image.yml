@@ -13,7 +13,7 @@ on:
 env:
   ARCHITECTURES: '["amd64", "aarch64"]'
   IMAGE_NAME: airsonos2
-  REGISTRY_PREFIX: ghcr.io/judahfuller
+  REGISTRY_PREFIX: ghcr.io/judahzf
 
 jobs:
   init:
@@ -77,7 +77,7 @@ jobs:
             io.hass.type=app
             io.hass.name=AirSonos2
             io.hass.description=AirPlay 2 bridge for legacy Sonos rooms
-            io.hass.url=https://github.com/judahfuller/airsonos2
+            io.hass.url=https://github.com/JudahZF/airsonos2
           push: "true"
           version: ${{ needs.init.outputs.version }}
 

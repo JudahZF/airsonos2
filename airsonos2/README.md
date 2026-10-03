@@ -9,13 +9,13 @@ Pairing stores, generated endpoint identities, and the rendered runtime configur
 Add this repository to the Home Assistant app store:
 
 ```text
-https://github.com/judahfuller/airsonos2
+https://github.com/JudahZF/airsonos2
 ```
 
 Install the AirSonos2 app and start it. The app pulls the published multi-architecture image from:
 
 ```text
-ghcr.io/judahfuller/airsonos2
+ghcr.io/judahzf/airsonos2
 ```
 
 ## Runtime

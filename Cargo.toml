@@ -12,11 +12,11 @@ exclude = ["vendor/shairplay"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/judahfuller/airsonos2"
+repository = "https://github.com/JudahZF/airsonos2"
 
 [workspace.dependencies]
 airsonos2-airplay = { path = "crates/airsonos2-airplay" }

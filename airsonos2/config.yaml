@@ -1,9 +1,9 @@
 name: AirSonos2
 slug: airsonos2
-version: "0.2.0"
+version: "0.2.1"
 description: AirPlay 2 bridge for legacy Sonos rooms and Home Assistant media players
-url: https://github.com/judahfuller/airsonos2
-image: ghcr.io/judahfuller/airsonos2
+url: https://github.com/JudahZF/airsonos2
+image: ghcr.io/judahzf/airsonos2
 arch:
   - amd64
   - aarch64

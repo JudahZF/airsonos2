@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Publish Home Assistant images under the repository owner, `ghcr.io/judahzf`. The v0.2.0 image build failed because `ghcr.io/judahfuller` does not exist.
+
 ## 0.2.0
 
 - Expose Home Assistant `media_player` entities, including Music Assistant players, as AirPlay 2 speakers with the `ha_media_players` option.
