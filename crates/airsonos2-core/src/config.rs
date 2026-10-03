@@ -18,6 +18,13 @@ pub enum ConfigError {
     Invalid(String),
     #[error("failed to parse config TOML: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("failed to serialize config TOML: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("failed to write config at {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -153,6 +160,56 @@ impl Config {
             source,
         })?;
         Self::from_toml_str(&contents)
+    }
+
+    /// Replaces the file atomically and durably. The file can hold secrets, so the new
+    /// file is private until it takes the permissions of the file it replaces.
+    pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Concurrent writers each get their own temporary file.
+        static WRITES: AtomicU64 = AtomicU64::new(0);
+        let path = path.as_ref();
+        let contents = toml::to_string(self)?;
+        let mut temp_name = std::ffi::OsString::from(".");
+        temp_name.push(path.file_name().unwrap_or_default());
+        temp_name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            WRITES.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temp = path.with_file_name(temp_name);
+        let write = || -> std::io::Result<()> {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let mut file = options.open(&temp)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+            if let Ok(existing) = fs::metadata(path) {
+                fs::set_permissions(&temp, existing.permissions())?;
+            }
+            fs::rename(&temp, path)?;
+            // The rename is durable only once the directory entry is on disk.
+            #[cfg(unix)]
+            {
+                let directory = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                fs::File::open(directory)?.sync_all()?;
+            }
+            Ok(())
+        };
+        write().map_err(|source| {
+            let _ = fs::remove_file(&temp);
+            ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
     }
 }
 
@@ -302,12 +359,16 @@ impl StreamConfig {
 #[serde(default)]
 pub struct DiagnosticsConfig {
     pub metrics_addr: String,
+    /// Extra host names for the web GUI. IP addresses and local names, such as
+    /// `airsonos.lan`, are always allowed.
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
             metrics_addr: "0.0.0.0:9100".to_owned(),
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -601,5 +662,39 @@ mod tests {
         let config = Config::from_path(&path).expect("config loads");
 
         assert_eq!(config.stream.mp3_bitrate_kbps, 192);
+    }
+
+    /// The web GUI saves through `write_to_path`; every option must survive it.
+    #[test]
+    fn written_config_round_trips_and_keeps_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "").expect("write config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("chmod");
+        }
+        let mut config = Config::default();
+        config.server.advertise_addr = Some("192.0.2.20".parse().expect("ip"));
+        config.airplay.rtsp_password = Some("secret".to_owned());
+        config.home_assistant.url = Some(Url::parse("http://ha.local:8123").expect("url"));
+        config.home_assistant.media_players = vec!["media_player.kitchen".to_owned()];
+        config.stream.startup_wait_ms = Some(100);
+        config
+            .sync
+            .zone_offsets_ms
+            .insert("Living Room".to_owned(), -40);
+
+        config.write_to_path(&path).expect("config writes");
+
+        assert_eq!(Config::from_path(&path).expect("config loads"), config);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+            assert_eq!(mode & 0o777, 0o640);
+        }
+        assert_eq!(fs::read_dir(dir.path()).expect("read dir").count(), 1);
     }
 }
