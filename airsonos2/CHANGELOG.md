@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Expose Home Assistant `media_player` entities, including Music Assistant players, as AirPlay 2 speakers with the `ha_media_players` option.
 - Start after Home Assistant Core and use the Home Assistant API.
