@@ -8,9 +8,11 @@ use std::time::Duration;
 use airsonos2_core::Config;
 use airsonos2_homeassistant::HomeAssistantClient;
 use airsonos2_sonos::discover_sonos_zones_from_sources;
-use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::http::StatusCode;
+use axum::extract::{Request, State};
+use axum::http::uri::Authority;
+use axum::http::{StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -146,12 +148,68 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
 }
 
 pub fn router(ui: ConfigUi) -> Router {
+    let ui = Arc::new(ui);
     Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         .route("/api/config", get(read_config).put(save_config))
         .route("/api/discover", post(discover))
         .route("/api/restart", post(restart))
-        .with_state(Arc::new(ui))
+        .route("/api/instance", get(instance))
+        .layer(axum::middleware::from_fn_with_state(ui.clone(), check_host))
+        .with_state(ui)
+}
+
+/// Blocks DNS rebinding. A page on another domain can make that domain resolve to this
+/// host and then call the GUI as its own origin, which CORS allows. Its requests still
+/// carry that domain in `Host`.
+async fn check_host(State(ui): State<Arc<ConfigUi>>, request: Request, next: Next) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .or_else(|| request.uri().authority().map(Authority::as_str));
+    if host.is_some_and(|host| host_allowed(host, &ui.running.diagnostics.allowed_hosts)) {
+        return next.run(request).await;
+    }
+    ApiError(
+        StatusCode::FORBIDDEN,
+        format!(
+            "host {:?} is not allowed; add it to diagnostics.allowed_hosts",
+            host.unwrap_or_default()
+        ),
+    )
+    .into_response()
+}
+
+/// IP addresses, single-label names and local suffixes cannot point at a public
+/// attacker's domain. Other names must be listed in `allowed_hosts`.
+fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
+    const LOCAL_SUFFIXES: [&str; 5] = [".local", ".lan", ".home.arpa", ".internal", ".localhost"];
+    let Ok(authority) = host.parse::<Authority>() else {
+        return false;
+    };
+    let name = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if name.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    !name.contains('.')
+        || LOCAL_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+        || allowed_hosts
+            .iter()
+            .any(|allowed| allowed.trim_end_matches('.').eq_ignore_ascii_case(&name))
+}
+
+/// Identifies this process to a page that waits for a restart on a moved listener. It
+/// reveals only the start time, so any origin may read it.
+async fn instance(State(ui): State<Arc<ConfigUi>>) -> impl IntoResponse {
+    (
+        [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+        Json(serde_json::json!({ "started_at_ms": ui.started_at_ms })),
+    )
 }
 
 async fn load_file(ui: &ConfigUi) -> Result<Config, ApiError> {
@@ -334,6 +392,30 @@ async fn restart(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_local_hosts_and_listed_names_reach_the_gui() {
+        let allowed = ["airsonos.example.com".to_owned()];
+        for host in [
+            "192.168.1.5:9100",
+            "[::1]:9100",
+            "localhost:9100",
+            "airsonos",
+            "airsonos.lan:9100",
+            "Speaker.LOCAL.",
+            "airsonos.example.com:9100",
+        ] {
+            assert!(host_allowed(host, &allowed), "{host} should be allowed");
+        }
+        for host in [
+            "rebind.attacker.example:9100",
+            "lan.attacker.example",
+            "",
+            "a b",
+        ] {
+            assert!(!host_allowed(host, &allowed), "{host} should be rejected");
+        }
+    }
 
     /// Anyone who can reach the GUI can edit the draft, so a changed URL must not
     /// receive the stored token.

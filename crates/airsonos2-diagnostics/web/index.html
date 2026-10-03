@@ -495,6 +495,8 @@ const SECTIONS = [
   { id: 'diagnostics', title: 'Diagnostics', blurb: 'This page and metrics', fields: [
     { path: 'diagnostics.metrics_addr', label: 'Listener', type: 'text', mono: true, required: true,
       help: 'Serves this page, <code>/healthz</code> and <code>/metrics</code>. A change moves this page after the restart.' },
+    { path: 'diagnostics.allowed_hosts', label: 'Extra host names', type: 'list', mono: true, placeholder: 'airsonos.example.com',
+      help: 'This page answers IP addresses and local names such as <code>airsonos.lan</code>. Add other names that you use to open it.' },
   ] },
 ];
 const FIELDS = SECTIONS.flatMap((section) => section.fields.map((field) => ({ ...field, section: section.id })));
@@ -874,7 +876,9 @@ function renderChain() {
 
 // ---- Discovery ----
 
-const sameName = (a, b) => a.toLowerCase() === b.toLowerCase();
+// ASCII-only, like Rust's `to_ascii_lowercase` in `filter_zones`.
+const asciiLower = (text) => text.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+const sameName = (a, b) => asciiLower(a) === asciiLower(b);
 const listHas = (list, name) => list.some((item) => sameName(item, name));
 const listWithout = (list, name) => list.filter((item) => !sameName(item, name));
 
@@ -1136,10 +1140,10 @@ async function restart() {
     while (Date.now() < deadline) {
       await sleep(1000);
       if (moved) {
-        // Another origin: an opaque no-cors response only proves the listener is up.
-        // The old listener is gone by then, so it is the restarted bridge.
-        const up = await fetch(`${moved}healthz`, { mode: 'no-cors', cache: 'no-store' }).then(() => true, () => false);
-        if (up) {
+        // Another origin: `api/instance` allows cross-origin reads and proves it is this bridge.
+        const instance = await fetch(`${moved}api/instance`, { cache: 'no-store' })
+          .then((response) => response.json(), () => null).catch(() => null);
+        if (instance && instance.started_at_ms !== before) {
           location.href = moved;
           return;
         }
@@ -1192,6 +1196,8 @@ window.addEventListener('beforeunload', (event) => {
 document.addEventListener('keydown', (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key === 's') {
     event.preventDefault();
+    // Blur commits text typed into a list but not yet added.
+    if (document.activeElement instanceof HTMLInputElement) document.activeElement.blur();
     if (changedFields().length && !view.read_only) save();
   }
 });

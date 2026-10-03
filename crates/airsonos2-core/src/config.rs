@@ -359,12 +359,16 @@ impl StreamConfig {
 #[serde(default)]
 pub struct DiagnosticsConfig {
     pub metrics_addr: String,
+    /// Extra host names for the web GUI. IP addresses and local names, such as
+    /// `airsonos.lan`, are always allowed.
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
         Self {
             metrics_addr: "0.0.0.0:9100".to_owned(),
+            allowed_hosts: Vec::new(),
         }
     }
 }

@@ -93,7 +93,7 @@ For normal AirPlay 2 pairing, keep `[airplay].pin` set to the HomeKit pairing PI
 
 `serve` hosts a config editor at `http://<host>:9100/`, on `[diagnostics].metrics_addr`. It validates changes with the same rules as the file, then replaces the config file atomically. Changes apply after a restart. **Scan network** lists the Sonos rooms and Home Assistant players that the settings on the page reach, saved or not, with a switch to bridge each one. The **Restart** button stops the bridge cleanly and exits with code 75, so systemd `Restart=on-failure` or a Docker restart policy starts it again. Saving rewrites the file as plain TOML, so comments in it are lost.
 
-The GUI has no authentication. Anyone who can reach the diagnostics listener can change settings and restart the bridge. Set `metrics_addr` to a loopback or management address if the LAN is not trusted. The GUI never sends the Home Assistant token or the RTSP password to the browser; it only shows whether each one is set.
+The GUI has no authentication. Anyone who can reach the diagnostics listener can change settings and restart the bridge. Set `metrics_addr` to a loopback or management address if the LAN is not trusted. To block DNS rebinding, the GUI answers only requests addressed to an IP address or a local name (single-label, `.local`, `.lan`, `.home.arpa`, `.internal`). List any other host name in `[diagnostics].allowed_hosts`. The GUI never sends the Home Assistant token or the RTSP password to the browser; it only shows whether each one is set.
 
 The service user must be able to write the config file and create files in its directory. For the systemd unit, for example: `sudo chown airsonos2:airsonos2 /etc/airsonos2 /etc/airsonos2/config.toml`.
 

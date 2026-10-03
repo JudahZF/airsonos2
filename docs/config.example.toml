@@ -52,7 +52,11 @@ icy_metadata = true
 ffmpeg_path = "ffmpeg"
 
 [diagnostics]
+# Also serves the config web GUI.
 metrics_addr = "0.0.0.0:9100"
+# The GUI answers IP addresses and local names (single-label, .local, .lan, .home.arpa,
+# .internal). Add any other host name you use to open it.
+allowed_hosts = []
 
 [sync]
 # Fallback measured latency for rooms without explicit entries, not an added delay.
