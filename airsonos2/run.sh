@@ -29,4 +29,5 @@ if [[ "${run_doctor_on_start}" == "true" ]]; then
 fi
 
 echo "[airsonos2] Starting bridge"
-exec airsonos2 serve --config "${CONFIG_PATH}"
+# Options regenerate the config on each start, so the web GUI must not edit it.
+exec airsonos2 serve --config "${CONFIG_PATH}" --config-read-only

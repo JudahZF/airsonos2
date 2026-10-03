@@ -78,7 +78,7 @@ The stream HTTP port (7000) serves:
 /streams/<session>
 ```
 
-The diagnostics listener (`diagnostics_addr`) serves `/healthz` and `/metrics`.
+The diagnostics listener (`diagnostics_addr`) serves `/healthz`, `/metrics`, and a read-only web view of the rendered config at `http://<host>:9100/`. Change settings in the app options; the web view can restart the bridge.
 
 ## Listener addresses and diagnostics
 

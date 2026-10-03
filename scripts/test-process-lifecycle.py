@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux process acceptance: fake Sonos discovery, SIGTERM, and failed listeners.
+"""Linux process acceptance: fake Sonos discovery, SIGTERM, GUI restart, and failed listeners.
 
 Uses temporary state and private loopback listeners. CI suppresses mDNS advertising;
 no physical Sonos device or sender is used. Socket and subprocess waits are bounded.
@@ -26,10 +26,10 @@ def free_port():
         return listener.getsockname()[1]
 
 
-def get(port, path):
+def get(port, path, method="GET", body=None, headers=None):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.2)
     try:
-        connection.request("GET", path)
+        connection.request(method, path, body, headers or {})
         response = connection.getresponse()
         return response.status, response.read()
     finally:
@@ -77,7 +77,7 @@ class FakeSonos(BaseHTTPRequestHandler):
                    f'<s:Body><{action}Response>{payload}</{action}Response></s:Body></s:Envelope>')
 
 
-def check(binary, ip, failure):
+def check(binary, ip, failure, restart=False):
     with tempfile.TemporaryDirectory(prefix="airsonos2-process-") as directory, contextlib.ExitStack() as resources:
         ports = set()
         while len(ports) < 3:
@@ -128,20 +128,29 @@ metrics_addr = "127.0.0.1:{diagnostics_port}"
                         time.sleep(0.02)
                     assert get(http_port, "/metrics")[0] == 404
                     assert get(diagnostics_port, "/metrics")[0] == 200
+                    assert get(diagnostics_port, "/")[0] == 200
+                    assert b'"state":"running"' in get(diagnostics_port, "/api/config")[1]
                     idle = resources.enter_context(socket.create_connection(("127.0.0.1", rtsp_port), timeout=1))
                     started = time.monotonic()
-                    process.send_signal(signal.SIGTERM)
-                    assert process.wait(timeout=12) == 0
+                    if restart:
+                        status, _ = get(diagnostics_port, "/api/restart", "POST", "{}",
+                                        {"Content-Type": "application/json"})
+                        assert status == 202
+                        assert process.wait(timeout=12) == 75, "GUI restart must exit with code 75"
+                    else:
+                        process.send_signal(signal.SIGTERM)
+                        assert process.wait(timeout=12) == 0
                     assert idle.recv(1) == b"", "idle RTSP connection must close"
                     log.flush()
                     log.seek(0)
                     assert "shutdown exceeded" not in log.read().lower(), "cleanup exceeded its deadline"
-                    print(f"SIGTERM to process exit: {(time.monotonic() - started) * 1000:.1f} ms")
+                    print(f"{'restart' if restart else 'SIGTERM'} to process exit: "
+                          f"{(time.monotonic() - started) * 1000:.1f} ms")
                 for port in [rtsp_port] + ([] if failure == "http" else [http_port]) + ([] if failure == "diagnostics" else [diagnostics_port]):
                     with socket.socket() as probe:
                         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                         probe.bind(("127.0.0.1", port))
-                print(f"PASS: {failure or 'SIGTERM'} cleanup released listeners")
+                print(f"PASS: {failure or ('restart' if restart else 'SIGTERM')} cleanup released listeners")
             except BaseException:
                 log.seek(0)
                 print(log.read())
@@ -174,6 +183,7 @@ def main():
             print(f"Process lifecycle cycle {cycle}/{args.cycles}")
             for failure in [None, "http", "diagnostics"]:
                 check(args.binary.resolve(), ip, failure)
+            check(args.binary.resolve(), ip, None, restart=True)
     finally:
         server.shutdown()
         server.server_close()

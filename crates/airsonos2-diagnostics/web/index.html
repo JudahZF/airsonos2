@@ -1,0 +1,1003 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AirSonos2</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%236e8bff'/%3E%3Cpath d='M9 19a7 7 0 0 1 14 0M12.5 19a3.5 3.5 0 0 1 7 0' fill='none' stroke='%23fff' stroke-width='2.4' stroke-linecap='round'/%3E%3Ccircle cx='16' cy='20' r='1.8' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0e0f11;
+  --surface: #16181c;
+  --surface-2: #1c1f24;
+  --line: #25292f;
+  --line-2: #323840;
+  --text: #ecebe8;
+  --muted: #8f959d;
+  --faint: #5f656d;
+  --accent: #6e8bff;
+  --accent-ink: #0a0c12;
+  --accent-soft: rgb(110 139 255 / 0.14);
+  --ok: #4fd18b;
+  --warn: #f0b44c;
+  --err: #f26d6d;
+  --radius: 10px;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, monospace;
+  --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #f3f2ef;
+    --surface: #ffffff;
+    --surface-2: #f7f6f3;
+    --line: #e4e1db;
+    --line-2: #d3cfc7;
+    --text: #1a1b1e;
+    --muted: #666b72;
+    --faint: #9b9fa5;
+    --accent: #3557e0;
+    --accent-ink: #ffffff;
+    --accent-soft: rgb(53 87 224 / 0.1);
+    --ok: #1d9a59;
+    --warn: #b7791f;
+    --err: #d64545;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select { font: inherit; color: inherit; }
+.mono { font-family: var(--mono); font-size: 13px; }
+
+/* Header */
+.top {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 14px;
+  height: 56px; padding: 0 20px;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -0.01em; }
+.brand svg { width: 26px; height: 26px; }
+.version { color: var(--faint); font: 12px var(--mono); }
+.pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 11px 4px 9px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--surface);
+  font-size: 12.5px; color: var(--muted); white-space: nowrap;
+  transition: border-color 0.3s, color 0.3s;
+}
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); transition: background 0.3s, box-shadow 0.3s; }
+.pill[data-tone="ok"] .dot { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
+.pill[data-tone="warn"] .dot { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 20%, transparent); }
+.pill[data-tone="err"] .dot { background: var(--err); box-shadow: 0 0 0 3px color-mix(in srgb, var(--err) 20%, transparent); }
+.pill[data-tone="info"] .dot { background: var(--accent); }
+.spacer { flex: 1; }
+.uptime { color: var(--faint); font-size: 12.5px; }
+
+/* Buttons */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 13px; border-radius: 8px;
+  border: 1px solid var(--line-2); background: var(--surface);
+  cursor: pointer; font-size: 13px; font-weight: 550;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s, color 0.15s;
+}
+.btn:hover { background: var(--surface-2); border-color: var(--faint); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover { background: color-mix(in srgb, var(--accent) 88%, var(--text)); }
+.btn.danger, .btn.confirm { border-color: var(--err); color: var(--err); }
+.btn.confirm { background: color-mix(in srgb, var(--err) 12%, var(--surface)); }
+.btn.quiet { border-color: transparent; background: transparent; color: var(--muted); }
+.btn.quiet:hover { color: var(--text); background: var(--surface-2); }
+.btn svg { width: 14px; height: 14px; }
+
+/* Layout */
+.layout { display: grid; grid-template-columns: 210px minmax(0, 1fr); max-width: 1180px; margin: 0 auto; }
+.rail { position: sticky; top: 56px; align-self: start; height: calc(100vh - 56px); padding: 26px 14px 20px 20px; display: flex; flex-direction: column; }
+.rail ul { position: relative; list-style: none; margin: 0; padding: 0; }
+.rail .indicator {
+  position: absolute; left: 0; top: 0; width: 100%; height: 32px; border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--line);
+  transition: transform 0.35s var(--ease), height 0.35s var(--ease), opacity 0.2s;
+  opacity: 0;
+}
+.rail a {
+  position: relative; display: flex; align-items: center; justify-content: space-between;
+  height: 32px; padding: 0 11px; border-radius: 8px;
+  color: var(--muted); text-decoration: none; font-weight: 520;
+  transition: color 0.2s;
+}
+.rail a:hover, .rail a.active { color: var(--text); }
+.rail a .mark { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); transform: scale(0); transition: transform 0.25s var(--ease); }
+.rail a.dirty .mark { transform: scale(1); }
+.rail .path { margin-top: auto; padding: 0 11px; color: var(--faint); font: 11.5px/1.5 var(--mono); word-break: break-all; }
+.rail .path span { display: block; font-family: var(--sans); text-transform: uppercase; letter-spacing: 0.08em; font-size: 10.5px; margin-bottom: 3px; }
+main { padding: 24px 28px 140px 12px; min-width: 0; }
+
+/* Banners */
+.banner {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 12px 14px; margin-bottom: 14px; border-radius: var(--radius);
+  border: 1px solid; font-size: 13.5px;
+  animation: drop 0.35s var(--ease);
+}
+.banner p { margin: 0; flex: 1; }
+.banner strong { font-weight: 620; }
+.banner code { display: block; margin: 4px 0; font: 12.5px var(--mono); }
+.banner.warn { border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 9%, var(--surface)); }
+.banner.err { border-color: color-mix(in srgb, var(--err) 45%, transparent); background: color-mix(in srgb, var(--err) 9%, var(--surface)); }
+.banner.info { border-color: color-mix(in srgb, var(--accent) 40%, transparent); background: var(--accent-soft); }
+.banner .btn { margin: -4px 0; }
+@keyframes drop { from { opacity: 0; transform: translateY(-6px); } }
+
+/* Signal chain: AirPlay -> bridge -> speakers */
+.chain {
+  display: grid; grid-template-columns: auto 56px auto 56px minmax(0, 1fr); align-items: center;
+  padding: 18px 20px; margin-bottom: 30px;
+  border: 1px solid var(--line); border-radius: 14px;
+  background:
+    radial-gradient(120% 140% at 0% 0%, var(--accent-soft), transparent 55%),
+    var(--surface);
+}
+.node { display: flex; align-items: center; gap: 10px; }
+.node .icon {
+  display: grid; place-items: center; width: 38px; height: 38px; border-radius: 10px;
+  background: var(--surface-2); border: 1px solid var(--line); color: var(--muted);
+}
+.node .icon svg { width: 20px; height: 20px; }
+.node.hub .icon { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.node b { display: block; font-weight: 620; font-size: 13.5px; }
+.node small { display: block; color: var(--muted); font: 12px var(--mono); }
+.wire { height: 1px; background: var(--line-2); transform-origin: left; animation: draw 0.6s var(--ease) both; }
+.wire.w2 { animation-delay: 0.25s; }
+.speakers { list-style: none; margin: 0; padding: 0 0 0 18px; position: relative; display: flex; flex-direction: column; gap: 6px; }
+.speakers::before { content: ""; position: absolute; left: 0; top: 14px; bottom: 14px; width: 1px; background: var(--line-2); }
+.speakers li {
+  position: relative; display: flex; align-items: center; gap: 10px; min-height: 28px;
+  animation: rise 0.45s var(--ease) both; animation-delay: calc(0.45s + var(--i) * 0.06s);
+}
+.speakers li::before { content: ""; position: absolute; left: -18px; top: 50%; width: 12px; height: 1px; background: var(--line-2); }
+.speakers li .room { font-weight: 560; }
+.speakers li .port { color: var(--faint); font: 12px var(--mono); }
+.speakers li.empty { color: var(--muted); }
+.speakers li.empty::before { background: var(--warn); }
+@keyframes draw { from { transform: scaleX(0); } }
+@keyframes rise { from { opacity: 0; transform: translateX(-6px); } }
+
+/* Sections and fields */
+.section { margin-bottom: 34px; }
+.section > header { display: flex; align-items: baseline; gap: 12px; margin: 0 0 10px 2px; }
+.section h2 { margin: 0; font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.09em; }
+.section > header p { margin: 0; color: var(--faint); font-size: 12.5px; }
+.card { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); overflow: hidden; }
+fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.field {
+  position: relative;
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr) 28px; gap: 4px 22px; align-items: center;
+  padding: 13px 12px 13px 18px;
+  transition: background 0.2s;
+}
+.field + .field { border-top: 1px solid var(--line); }
+.field::before {
+  content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px; border-radius: 0 3px 3px 0;
+  background: var(--accent); transform: scaleY(0); transition: transform 0.25s var(--ease), background 0.2s;
+}
+.field.changed::before { transform: scaleY(1); }
+.field.error { background: color-mix(in srgb, var(--err) 7%, transparent); }
+.field.error::before { background: var(--err); transform: scaleY(1); }
+.field label, .field .label { font-weight: 560; }
+.field .help { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
+.field .help code { font: 12px var(--mono); color: var(--text); }
+.field.inactive .control { opacity: 0.45; }
+.field .revert {
+  width: 28px; height: 28px; border-radius: 7px; border: 0; background: transparent; color: var(--faint);
+  cursor: pointer; display: grid; place-items: center;
+  opacity: 0; transform: scale(0.8); pointer-events: none;
+  transition: opacity 0.2s, transform 0.2s var(--ease), color 0.15s, background 0.15s;
+}
+.field.changed .revert { opacity: 1; transform: none; pointer-events: auto; }
+.field .revert:hover { color: var(--text); background: var(--surface-2); }
+.field .revert svg { width: 15px; height: 15px; }
+.preview { margin: 6px 0 0; color: var(--muted); font-size: 12.5px; }
+.preview b { color: var(--text); font-weight: 560; }
+
+input[type="text"], input[type="number"], input[type="password"], input[type="url"], select {
+  width: 100%; height: 34px; padding: 0 10px; border-radius: 8px;
+  border: 1px solid var(--line-2); background: var(--bg);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+input::placeholder { color: var(--faint); }
+input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+input:user-invalid { border-color: var(--err); box-shadow: 0 0 0 3px color-mix(in srgb, var(--err) 15%, transparent); }
+input[type="number"] { font-family: var(--mono); font-size: 13px; }
+select { appearance: none; padding-right: 30px; cursor: pointer;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%), linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 15px, calc(100% - 10px) 15px; background-size: 5px 5px; background-repeat: no-repeat; }
+.with-unit { position: relative; }
+.with-unit input { padding-right: 44px; }
+.with-unit span { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); color: var(--faint); font: 12px var(--mono); pointer-events: none; }
+
+.switch { position: relative; display: inline-block; width: 38px; height: 22px; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.switch span { position: absolute; inset: 0; border-radius: 999px; background: var(--line-2); transition: background 0.2s; }
+.switch span::after {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 2px rgb(0 0 0 / 0.3); transition: transform 0.25s var(--ease);
+}
+.switch input:checked + span { background: var(--accent); }
+.switch input:checked + span::after { transform: translateX(16px); }
+.switch input:focus-visible + span { box-shadow: 0 0 0 3px var(--accent-soft); }
+
+.segmented { display: inline-flex; padding: 3px; border-radius: 9px; background: var(--bg); border: 1px solid var(--line-2); position: relative; }
+.segmented label { position: relative; padding: 4px 16px; border-radius: 6px; cursor: pointer; font: 600 12.5px var(--mono); color: var(--muted); transition: color 0.2s, background 0.2s; }
+.segmented input { position: absolute; opacity: 0; pointer-events: none; }
+.segmented label:has(input:checked) { background: var(--surface-2); color: var(--text); box-shadow: 0 0 0 1px var(--line-2); }
+.segmented label:has(input:focus-visible) { box-shadow: 0 0 0 3px var(--accent-soft); }
+
+.chips {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  min-height: 34px; padding: 4px; border-radius: 8px; border: 1px solid var(--line-2); background: var(--bg);
+  cursor: text; transition: border-color 0.15s, box-shadow 0.15s;
+}
+.chips:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.chip {
+  display: inline-flex; align-items: center; gap: 2px; height: 24px; padding: 0 2px 0 9px; border-radius: 6px;
+  background: var(--surface-2); border: 1px solid var(--line-2); font-size: 12.5px;
+}
+.chip.mono { font: 12px var(--mono); }
+.chip.enter { animation: pop 0.25s var(--ease); }
+.chip button { width: 20px; height: 20px; border: 0; background: none; border-radius: 4px; color: var(--faint); cursor: pointer; line-height: 1; font-size: 15px; }
+.chip button:hover { color: var(--err); background: color-mix(in srgb, var(--err) 12%, transparent); }
+.chips input { flex: 1; min-width: 120px; height: 24px; border: 0; background: none; padding: 0 6px; outline: none; box-shadow: none; }
+@keyframes pop { from { opacity: 0; transform: scale(0.85); } }
+
+.offsets { display: flex; flex-direction: column; gap: 6px; }
+.offset-row { display: grid; grid-template-columns: minmax(0, 1fr) 120px 28px; gap: 6px; animation: rise 0.25s var(--ease); }
+.offset-row .x { width: 28px; height: 34px; border: 0; background: none; border-radius: 7px; color: var(--faint); cursor: pointer; font-size: 16px; }
+.offset-row .x:hover { color: var(--err); background: color-mix(in srgb, var(--err) 12%, transparent); }
+.offsets .add { align-self: flex-start; }
+
+.secret { display: flex; gap: 6px; }
+.secret .btn { flex: none; height: 34px; }
+
+/* Save bar */
+.savebar {
+  position: fixed; left: 50%; bottom: 22px; z-index: 30;
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 8px 8px 16px; border-radius: 12px;
+  background: var(--surface); border: 1px solid var(--line-2);
+  box-shadow: 0 12px 40px rgb(0 0 0 / 0.35);
+  transform: translate(-50%, calc(100% + 40px)); opacity: 0;
+  transition: transform 0.35s var(--ease), opacity 0.25s;
+}
+.savebar.show { transform: translate(-50%, 0); opacity: 1; }
+.savebar .count { font-weight: 560; white-space: nowrap; }
+.savebar .count b { display: inline-grid; place-items: center; min-width: 20px; height: 20px; margin-right: 6px; padding: 0 6px; border-radius: 999px; background: var(--accent); color: var(--accent-ink); font-size: 11.5px; }
+.savebar .error { color: var(--err); font-size: 12.5px; max-width: 420px; }
+.savebar .error:empty { display: none; }
+
+.toast {
+  position: fixed; right: 20px; top: 68px; z-index: 40;
+  padding: 10px 14px; border-radius: 10px; max-width: 380px;
+  background: var(--surface); border: 1px solid var(--line-2); box-shadow: 0 10px 30px rgb(0 0 0 / 0.3);
+  font-size: 13px; transform: translateY(-8px); opacity: 0; pointer-events: none;
+  transition: transform 0.3s var(--ease), opacity 0.2s;
+}
+.toast.show { transform: none; opacity: 1; }
+.toast.ok { border-color: color-mix(in srgb, var(--ok) 50%, transparent); }
+.toast.err { border-color: color-mix(in srgb, var(--err) 50%, transparent); }
+
+.overlay {
+  position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+  background: color-mix(in srgb, var(--bg) 70%, transparent); backdrop-filter: blur(6px);
+  opacity: 0; pointer-events: none; transition: opacity 0.25s;
+}
+.overlay.show { opacity: 1; pointer-events: auto; }
+.overlay .box { display: flex; flex-direction: column; align-items: center; gap: 12px; max-width: 420px; padding: 28px; text-align: center; }
+.overlay h3 { margin: 0; font-size: 16px; }
+.overlay p { margin: 0; color: var(--muted); }
+.spinner { width: 28px; height: 28px; border-radius: 50%; border: 2.5px solid var(--line-2); border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+.overlay.stuck .spinner { display: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.load-error { margin: 60px auto; max-width: 520px; text-align: center; color: var(--muted); }
+.load-error h2 { color: var(--text); font-size: 16px; }
+.load-error code { font: 12.5px var(--mono); color: var(--err); }
+
+@media (max-width: 860px) {
+  .layout { grid-template-columns: 1fr; }
+  .rail { display: none; }
+  main { padding: 18px 14px 140px; }
+  .field { grid-template-columns: minmax(0, 1fr) 28px; }
+  .field .meta { grid-column: 1 / -1; }
+  .chain { grid-template-columns: auto 24px auto; row-gap: 14px; }
+  .chain .speakers { grid-column: 1 / -1; }
+  .chain .w2 { display: none; }
+  .uptime, .version { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-delay: 0ms !important; transition-duration: 0.01ms !important; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="var(--accent)"/><path d="M9 19a7 7 0 0 1 14 0M12.5 19a3.5 3.5 0 0 1 7 0" fill="none" stroke="var(--accent-ink)" stroke-width="2.4" stroke-linecap="round"/><circle cx="16" cy="20" r="1.8" fill="var(--accent-ink)"/></svg>
+    AirSonos2 <span class="version" id="version"></span>
+  </div>
+  <span class="pill" id="status"><span class="dot"></span><span id="status-text">Connecting</span></span>
+  <span class="spacer"></span>
+  <span class="uptime" id="uptime"></span>
+  <button class="btn" id="restart" type="button" hidden>
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v3h-3"/></svg>
+    <span>Restart</span>
+  </button>
+</header>
+
+<div class="layout">
+  <nav class="rail" aria-label="Sections">
+    <ul id="nav"><li class="indicator" aria-hidden="true"></li></ul>
+    <div class="path" id="path"></div>
+  </nav>
+  <main id="main">
+    <div id="banners"></div>
+    <section class="chain" id="chain" aria-label="Signal path"></section>
+    <form id="form" autocomplete="off" novalidate><fieldset id="fields"></fieldset></form>
+  </main>
+</div>
+
+<datalist id="rooms"></datalist>
+
+<div class="savebar" id="savebar" role="region" aria-label="Unsaved changes">
+  <span class="count" id="dirty-count"></span>
+  <span class="error" id="save-error"></span>
+  <button class="btn quiet" id="discard" type="button">Discard</button>
+  <button class="btn primary" id="save" type="button">Save changes</button>
+</div>
+<div class="toast" id="toast" role="status"></div>
+<div class="overlay" id="overlay" aria-live="polite">
+  <div class="box"><div class="spinner"></div><h3 id="overlay-title"></h3><p id="overlay-text"></p><button class="btn" id="overlay-close" type="button" hidden>Close</button></div>
+</div>
+
+<script type="module">
+const ICON = {
+  revert: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h7a3.5 3.5 0 0 1 0 7H6M5.5 3.5 3 6l2.5 2.5"/></svg>',
+  airplay: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M5.5 14H4a1.5 1.5 0 0 1-1.5-1.5v-8A1.5 1.5 0 0 1 4 3h12a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 16 14h-1.5"/><path d="m10 11.5 4 5H6z" fill="currentColor"/></svg>',
+  bridge: '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4.5 12.5a5.5 5.5 0 0 1 11 0M7.5 12.5a2.5 2.5 0 0 1 5 0"/><circle cx="10" cy="13.5" r="1.3" fill="currentColor" stroke="none"/></svg>',
+};
+
+/** Field schema. Paths match the Rust `Config` struct. Options without a field keep their value. */
+const SECTIONS = [
+  { id: 'server', title: 'Server', blurb: 'Listeners and storage', fields: [
+    { path: 'server.bind', label: 'Bind address', type: 'text', mono: true, required: true,
+      help: 'Local IP for the stream and AirPlay listeners. <code>0.0.0.0</code> is every IPv4 interface; <code>::</code> also accepts IPv6.' },
+    { path: 'server.advertise_addr', label: 'Advertise address', type: 'text', mono: true, optional: true, placeholder: 'Automatic',
+      help: 'IP that speakers use to pull audio. Set it when the host has several networks or the automatic address is wrong.' },
+    { path: 'server.http_port', label: 'Stream port', type: 'number', min: 1, max: 65535,
+      help: 'Speakers pull the audio stream from this port.' },
+    { path: 'server.state_dir', label: 'State directory', type: 'text', mono: true, required: true,
+      help: 'Stores pairings and speaker identities.' },
+    { path: 'server.log_level', label: 'Log level', type: 'select', options: ['error', 'warn', 'info', 'debug', 'trace'],
+      help: 'The <code>RUST_LOG</code> environment variable overrides this.' },
+  ] },
+  { id: 'airplay', title: 'AirPlay', blurb: 'How speakers appear to Apple devices', fields: [
+    { path: 'airplay.name_template', label: 'Speaker name', type: 'text', required: true,
+      help: '<code>{room}</code> becomes the room or player name.',
+      preview: (value) => value.replaceAll('{room}', speakerRooms()[0] ?? 'Kitchen') },
+    { path: 'airplay.advertised_model', label: 'Advertised model', type: 'text', mono: true, required: true,
+      help: 'Hardware model shown to Apple clients. <code>AudioAccessory5,1</code> is a HomePod mini.' },
+    { path: 'airplay.pin', label: 'Pairing PIN', type: 'text', mono: true },
+    { path: 'airplay.rtsp_password', secret: 'rtsp_password', label: 'AirPlay 1 password', type: 'secret',
+      help: 'Enables legacy AirPlay 1 with this password. AirPlay 2 uses pairing and ignores it.' },
+    { path: 'airplay.base_rtsp_port', label: 'First RTSP port', type: 'number', min: 1, max: 65535,
+      help: 'Each speaker takes the next port, starting here.' },
+    { path: 'airplay.output_sample_rate', label: 'Sample rate', type: 'number', min: 8000, max: 192000, unit: 'Hz' },
+    { path: 'airplay.output_channels', label: 'Channels', type: 'select', numeric: true,
+      options: [{ value: 2, label: 'Stereo' }, { value: 1, label: 'Mono' }] },
+    { path: 'airplay.max_clients_per_zone', label: 'Connections per speaker', type: 'number', min: 1,
+      help: 'AirPlay 2 opens several connections per session. Raise this if clients report "Max connections reached".' },
+  ] },
+  { id: 'sonos', title: 'Sonos', blurb: 'Room discovery and control', fields: [
+    { path: 'sonos.auto_discover', label: 'Discover rooms', type: 'toggle',
+      help: 'Find rooms with SSDP multicast.' },
+    { path: 'sonos.static_ips', label: 'Speaker IPs', type: 'list', mono: true, placeholder: 'Add IP and press Enter',
+      help: 'Query these speakers directly when multicast does not reach them.' },
+    { path: 'sonos.include_rooms', label: 'Only these rooms', type: 'list', suggest: true, placeholder: 'All rooms',
+      help: 'Leave empty to bridge every visible room.' },
+    { path: 'sonos.exclude_rooms', label: 'Skip these rooms', type: 'list', suggest: true, placeholder: 'None' },
+    { path: 'sonos.force_standalone_on_start', label: 'Ungroup on play', type: 'toggle',
+      help: 'A room leaves its Sonos group when AirPlay starts. Group members reject playback commands.' },
+  ] },
+  { id: 'home_assistant', title: 'Home Assistant', blurb: 'Media players, including Music Assistant', fields: [
+    { path: 'home_assistant.url', label: 'URL', type: 'text', mono: true, optional: true, placeholder: 'http://homeassistant.local:8123',
+      help: 'Required when you add media players.' },
+    { path: 'home_assistant.token', secret: 'home_assistant_token', label: 'Access token', type: 'secret',
+      help: 'Long-lived access token. When empty, the <code>SUPERVISOR_TOKEN</code> environment variable is used.' },
+    { path: 'home_assistant.media_players', label: 'Media players', type: 'list', mono: true, placeholder: 'media_player.kitchen',
+      pattern: 'media_player\\.[a-z0-9_]+', patternHint: 'Use an entity id such as media_player.kitchen',
+      help: 'Each entity becomes its own AirPlay speaker.' },
+  ] },
+  { id: 'stream', title: 'Stream', blurb: 'Audio sent to the speakers', fields: [
+    { path: 'stream.codec', label: 'Codec', type: 'segmented', options: ['mp3', 'wav'],
+      help: 'MP3 works everywhere. WAV skips encoding, starts faster, and supports sync offsets.' },
+    { path: 'stream.mp3_bitrate_kbps', label: 'MP3 bitrate', type: 'number', min: 32, max: 320, unit: 'kbps',
+      inactive: (config) => config.stream.codec !== 'mp3', inactiveHelp: 'Not used with WAV.' },
+    { path: 'stream.prebuffer_ms', label: 'Prebuffer', type: 'number', min: 0, unit: 'ms' },
+    { path: 'stream.startup_wait_ms', label: 'Startup wait', type: 'number', min: 0, unit: 'ms', optional: true,
+      placeholder: 'Automatic', help: 'Sonos startup wait. Automatic uses the smaller of the prebuffer and 250 ms.' },
+    { path: 'stream.ffmpeg_path', label: 'FFmpeg path', type: 'text', mono: true, required: true,
+      inactive: (config) => config.stream.codec !== 'mp3', inactiveHelp: 'Not used with WAV.' },
+  ] },
+  { id: 'sync', title: 'Sync', blurb: 'Multi-room timing', fields: [
+    { path: 'sync.zone_offsets_ms', label: 'Room offsets', type: 'offsets',
+      help: 'Measured latency per room. Positive means the room plays late. Applies to WAV only.' },
+    { path: 'sync.default_offset_ms', label: 'Default offset', type: 'number', min: -10000, max: 10000, unit: 'ms',
+      help: 'For rooms without their own offset.' },
+    { path: 'sync.multi_select_window_ms', label: 'Group window', type: 'number', min: 0, max: 60000, unit: 'ms',
+      help: 'Sessions that start within this window play as one group.' },
+    { path: 'sync.start_deadline_ms', label: 'Start deadline', type: 'number', min: 0, max: 60000, unit: 'ms',
+      help: 'Longest wait for a group before playback starts anyway.' },
+    { path: 'sync.play_command_spread_warn_ms', label: 'Spread warning', type: 'number', min: 0, unit: 'ms',
+      help: 'Log a warning when play commands to a group spread further than this.' },
+  ] },
+  { id: 'diagnostics', title: 'Diagnostics', blurb: 'This page and metrics', fields: [
+    { path: 'diagnostics.metrics_addr', label: 'Listener', type: 'text', mono: true, required: true,
+      help: 'Serves this page, <code>/healthz</code> and <code>/metrics</code>. A change moves this page after the restart.' },
+  ] },
+];
+const FIELDS = SECTIONS.flatMap((section) => section.fields.map((field) => ({ ...field, section: section.id })));
+
+let view = null;
+let original = null;
+let draft = null;
+/** `null` keeps the stored secret, `''` removes it, any other string replaces it. */
+let secrets = {};
+let restarting = false;
+
+const $ = (id) => document.getElementById(id);
+const clone = (value) => structuredClone(value);
+const getPath = (object, path) => path.split('.').reduce((value, key) => value?.[key], object);
+const setPath = (object, path, value) => {
+  const keys = path.split('.');
+  const last = keys.pop();
+  keys.reduce((value, key) => value[key], object)[last] = value;
+};
+/** JSON with sorted object keys, so maps compare by content. */
+const canonical = (value) => JSON.stringify(value, (_, inner) =>
+  inner && typeof inner === 'object' && !Array.isArray(inner)
+    ? Object.fromEntries(Object.entries(inner).sort(([a], [b]) => a.localeCompare(b)))
+    : inner);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const speakerRooms = () => view?.status.state === 'running' ? view.status.speakers.map((speaker) => speaker.room) : [];
+
+function h(tag, props = {}, ...children) {
+  const element = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (value == null || value === false) continue;
+    if (key === 'class') element.className = value;
+    else if (key === 'html') element.innerHTML = value;
+    else if (key.startsWith('on')) element.addEventListener(key.slice(2), value);
+    else if (key in element && typeof value !== 'string') element[key] = value;
+    else element.setAttribute(key, value === true ? '' : value);
+  }
+  element.append(...children.flat().filter((child) => child != null && child !== false));
+  return element;
+}
+
+async function api(path, init = {}) {
+  const response = await fetch(path, { ...init, headers: { 'content-type': 'application/json' }, cache: 'no-store' });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error ?? `${response.status} ${response.statusText}`);
+  return body;
+}
+
+function toast(message, tone = 'ok') {
+  const element = $('toast');
+  element.textContent = message;
+  element.className = `toast show ${tone}`;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => element.classList.remove('show'), 3200);
+}
+
+// ---- Change tracking ----
+
+const fieldChanged = (field) => field.type === 'secret'
+  ? secrets[field.secret] != null
+  : canonical(getPath(draft, field.path)) !== canonical(getPath(original, field.path));
+const changedFields = () => draft ? FIELDS.filter(fieldChanged) : [];
+
+function refresh() {
+  const changed = new Set(changedFields().map((field) => field.path));
+  for (const field of FIELDS) {
+    const row = document.querySelector(`.field[data-path="${field.path}"]`);
+    if (!row) continue;
+    row.classList.toggle('changed', changed.has(field.path));
+    if (field.inactive) {
+      const inactive = field.inactive(draft);
+      row.classList.toggle('inactive', inactive);
+      row.querySelector('.help').innerHTML = inactive ? field.inactiveHelp : (field.help ?? '');
+    }
+  }
+  for (const section of SECTIONS) {
+    document.querySelector(`#nav a[href="#s-${section.id}"]`)
+      ?.classList.toggle('dirty', section.fields.some((field) => changed.has(field.path)));
+  }
+  $('dirty-count').innerHTML = `<b>${changed.size}</b>unsaved change${changed.size === 1 ? '' : 's'}`;
+  $('savebar').classList.toggle('show', changed.size > 0 && !view.read_only);
+  renderChain();
+}
+
+function onEdit(field) {
+  document.querySelector(`.field[data-path="${field.path}"]`)?.classList.remove('error');
+  $('save-error').textContent = '';
+  refresh();
+}
+
+// ---- Controls ----
+
+function textControl(field, id) {
+  const value = getPath(draft, field.path);
+  const input = h('input', {
+    id, type: 'text', value: value ?? '', class: field.mono ? 'mono' : null,
+    placeholder: field.placeholder, required: field.required, spellcheck: 'false',
+  });
+  const preview = field.preview && h('p', { class: 'preview' });
+  const showPreview = () => preview && preview.replaceChildren('Shows as ', h('b', {}, field.preview(input.value)));
+  input.addEventListener('input', () => {
+    const text = input.value.trim();
+    setPath(draft, field.path, field.optional && text === '' ? null : input.value);
+    showPreview();
+    onEdit(field);
+  });
+  showPreview();
+  return [input, preview];
+}
+
+function numberControl(field, id) {
+  const value = getPath(draft, field.path);
+  const input = h('input', {
+    id, type: 'number', step: 1, value: value ?? '', placeholder: field.placeholder,
+    min: field.min, max: field.max, required: !field.optional,
+  });
+  input.addEventListener('input', () => {
+    const number = input.valueAsNumber;
+    if (Number.isNaN(number)) {
+      if (field.optional && input.value === '') setPath(draft, field.path, null);
+    } else {
+      setPath(draft, field.path, number);
+    }
+    onEdit(field);
+  });
+  return field.unit ? h('div', { class: 'with-unit' }, input, h('span', {}, field.unit)) : input;
+}
+
+function selectControl(field, id) {
+  const value = getPath(draft, field.path);
+  const select = h('select', { id },
+    field.options.map((option) => {
+      const { value: optionValue, label } = typeof option === 'object' ? option : { value: option, label: option };
+      return h('option', { value: String(optionValue), selected: optionValue === value }, label);
+    }));
+  select.addEventListener('change', () => {
+    setPath(draft, field.path, field.numeric ? Number(select.value) : select.value);
+    onEdit(field);
+  });
+  return select;
+}
+
+function toggleControl(field, id) {
+  const input = h('input', { id, type: 'checkbox', role: 'switch', checked: getPath(draft, field.path) });
+  input.addEventListener('change', () => {
+    setPath(draft, field.path, input.checked);
+    onEdit(field);
+  });
+  return h('label', { class: 'switch' }, input, h('span'));
+}
+
+function segmentedControl(field, id) {
+  const value = getPath(draft, field.path);
+  return h('div', { class: 'segmented', role: 'radiogroup', id },
+    field.options.map((option) => {
+      const input = h('input', { type: 'radio', name: field.path, value: option, checked: option === value });
+      input.addEventListener('change', () => {
+        setPath(draft, field.path, option);
+        onEdit(field);
+      });
+      return h('label', {}, input, option.toUpperCase());
+    }));
+}
+
+function listControl(field, id) {
+  const input = h('input', {
+    id, type: 'text', placeholder: field.placeholder, spellcheck: 'false',
+    class: field.mono ? 'mono' : null, list: field.suggest ? 'rooms' : null,
+  });
+  const wrap = h('div', { class: 'chips', onclick: (event) => event.target === wrap && input.focus() });
+  const render = (added) => {
+    wrap.querySelectorAll('.chip').forEach((chip) => chip.remove());
+    getPath(draft, field.path).forEach((item, index) => {
+      const remove = () => {
+        setPath(draft, field.path, getPath(draft, field.path).filter((_, other) => other !== index));
+        render();
+        onEdit(field);
+      };
+      wrap.insertBefore(h('span', { class: `chip${field.mono ? ' mono' : ''}${index === added ? ' enter' : ''}` },
+        item, h('button', { type: 'button', 'aria-label': `Remove ${item}`, onclick: remove }, '×')), input);
+    });
+  };
+  const commit = () => {
+    const item = input.value.trim().replace(/,$/, '');
+    input.setCustomValidity('');
+    if (!item) return;
+    if (field.pattern && !new RegExp(`^(?:${field.pattern})$`).test(item)) {
+      input.setCustomValidity(field.patternHint);
+      input.reportValidity();
+      return;
+    }
+    const list = getPath(draft, field.path);
+    if (!list.includes(item)) {
+      setPath(draft, field.path, [...list, item]);
+      render(list.length);
+      onEdit(field);
+    }
+    input.value = '';
+  };
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ',') {
+      event.preventDefault();
+      commit();
+    } else if (event.key === 'Backspace' && input.value === '' && getPath(draft, field.path).length) {
+      setPath(draft, field.path, getPath(draft, field.path).slice(0, -1));
+      render();
+      onEdit(field);
+    }
+  });
+  input.addEventListener('input', () => input.setCustomValidity(''));
+  input.addEventListener('blur', commit);
+  // Picking a datalist suggestion fires `input` without a key press.
+  input.addEventListener('change', commit);
+  wrap.append(input);
+  render();
+  return wrap;
+}
+
+function offsetsControl(field) {
+  const rows = Object.entries(getPath(draft, field.path)).map(([room, offset]) => ({ room, offset }));
+  const list = h('div', { class: 'offsets' });
+  const sync = () => {
+    const seen = new Set();
+    const map = {};
+    for (const row of rows) {
+      const room = row.room.trim();
+      row.roomInput.setCustomValidity(seen.has(room) ? 'This room already has an offset' : '');
+      seen.add(room);
+      if (room && Number.isInteger(row.offset)) map[room] = row.offset;
+    }
+    setPath(draft, field.path, map);
+    onEdit(field);
+  };
+  const addRow = (row, focus) => {
+    row.roomInput = h('input', { type: 'text', value: row.room, placeholder: 'Room or entity id', list: 'rooms', required: true, 'aria-label': 'Room' });
+    const offsetInput = h('input', { type: 'number', step: 1, min: -10000, max: 10000, value: row.offset ?? '', required: true, placeholder: '0', 'aria-label': 'Offset in ms' });
+    row.roomInput.addEventListener('input', () => { row.room = row.roomInput.value; sync(); });
+    offsetInput.addEventListener('input', () => { row.offset = offsetInput.valueAsNumber; sync(); });
+    const element = h('div', { class: 'offset-row' },
+      row.roomInput,
+      h('div', { class: 'with-unit' }, offsetInput, h('span', {}, 'ms')),
+      h('button', {
+        type: 'button', class: 'x', 'aria-label': 'Remove offset',
+        onclick: () => { rows.splice(rows.indexOf(row), 1); element.remove(); sync(); },
+      }, '×'));
+    list.insertBefore(element, addButton);
+    if (focus) row.roomInput.focus();
+  };
+  const addButton = h('button', {
+    type: 'button', class: 'btn quiet add',
+    onclick: () => { const row = { room: '', offset: 0 }; rows.push(row); addRow(row, true); sync(); },
+  }, '+ Add room');
+  list.append(addButton);
+  rows.forEach((row) => addRow(row, false));
+  return list;
+}
+
+function secretControl(field, id) {
+  const isSet = view.secrets[field.secret];
+  const state = secrets[field.secret];
+  const input = h('input', {
+    id, type: 'password', autocomplete: 'new-password', value: state ?? '',
+    placeholder: state === '' ? 'Removed on save' : isSet ? 'Stored. Type to replace' : 'Not set',
+  });
+  input.addEventListener('input', () => {
+    secrets[field.secret] = input.value === '' ? null : input.value;
+    onEdit(field);
+  });
+  const remove = isSet && h('button', {
+    type: 'button', class: `btn ${state === '' ? '' : 'quiet'}`,
+    onclick: () => {
+      secrets[field.secret] = state === '' ? null : '';
+      replaceField(field);
+      refresh();
+    },
+  }, state === '' ? 'Undo' : 'Remove');
+  return h('div', { class: 'secret' }, input, remove);
+}
+
+const CONTROLS = {
+  text: textControl, number: numberControl, select: selectControl, toggle: toggleControl,
+  segmented: segmentedControl, list: listControl, offsets: offsetsControl, secret: secretControl,
+};
+
+function buildField(field) {
+  const id = `f-${field.path}`;
+  const labelTag = ['list', 'offsets', 'segmented'].includes(field.type) ? 'span' : 'label';
+  return h('div', { class: 'field', 'data-path': field.path },
+    h('div', { class: 'meta' },
+      h(labelTag, { for: labelTag === 'label' ? id : null, class: labelTag === 'span' ? 'label' : null }, field.label),
+      h('p', { class: 'help', html: field.help ?? '' })),
+    h('div', { class: 'control' }, CONTROLS[field.type](field, id)),
+    h('button', {
+      type: 'button', class: 'revert', title: 'Revert', 'aria-label': `Revert ${field.label}`, html: ICON.revert,
+      onclick: () => {
+        if (field.type === 'secret') secrets[field.secret] = null;
+        else setPath(draft, field.path, clone(getPath(original, field.path)));
+        replaceField(field);
+        onEdit(field);
+      },
+    }));
+}
+
+function replaceField(field) {
+  document.querySelector(`.field[data-path="${field.path}"]`).replaceWith(buildField(field));
+}
+
+// ---- Page rendering ----
+
+function renderForm() {
+  $('fields').replaceChildren(...SECTIONS.map((section) =>
+    h('section', { class: 'section', id: `s-${section.id}` },
+      h('header', {}, h('h2', {}, section.title), h('p', {}, section.blurb)),
+      h('div', { class: 'card' }, section.fields.map((field) => buildField({ ...field, section: section.id }))))));
+  $('fields').disabled = view.read_only;
+  refresh();
+}
+
+function renderNav() {
+  const nav = $('nav');
+  nav.querySelectorAll('li:not(.indicator)').forEach((item) => item.remove());
+  nav.append(...SECTIONS.map((section) =>
+    h('li', {}, h('a', { href: `#s-${section.id}` }, section.title, h('span', { class: 'mark' })))));
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) if (entry.isIntersecting) setActive(entry.target.id);
+  }, { rootMargin: '-30% 0px -60% 0px' });
+  document.querySelectorAll('.section').forEach((section) => observer.observe(section));
+  setActive('s-server');
+}
+
+function setActive(sectionId) {
+  const link = document.querySelector(`#nav a[href="#${sectionId}"]`);
+  if (!link) return;
+  document.querySelectorAll('#nav a').forEach((other) => other.classList.toggle('active', other === link));
+  const indicator = document.querySelector('#nav .indicator');
+  indicator.style.transform = `translateY(${link.parentElement.offsetTop}px)`;
+  indicator.style.height = `${link.offsetHeight}px`;
+  indicator.style.opacity = '1';
+}
+
+function renderChain() {
+  const codec = draft.stream.codec === 'mp3' ? `mp3 · ${draft.stream.mp3_bitrate_kbps}k` : 'wav · pcm';
+  const status = view.status;
+  const speakers = status.state === 'running'
+    ? status.speakers.map((speaker, index) => h('li', { style: `--i:${index}` },
+      h('span', { class: 'room' }, speaker.airplay_name),
+      h('span', { class: 'port' }, `rtsp :${speaker.rtsp_port}`)))
+    : [h('li', { class: 'empty', style: '--i:0' }, status.state === 'starting' ? 'Looking for speakers…' : 'No speakers running')];
+  const key = canonical([codec, draft.server.http_port, status]);
+  if (renderChain.key === key) return;
+  renderChain.key = key;
+  $('chain').replaceChildren(
+    h('div', { class: 'node' }, h('span', { class: 'icon', html: ICON.airplay }), h('div', {}, h('b', {}, 'AirPlay'), h('small', {}, 'iPhone, Mac'))),
+    h('div', { class: 'wire w1' }),
+    h('div', { class: 'node hub' }, h('span', { class: 'icon', html: ICON.bridge }), h('div', {}, h('b', {}, `Bridge :${draft.server.http_port}`), h('small', {}, codec))),
+    h('div', { class: 'wire w2' }),
+    h('ul', { class: 'speakers' }, speakers));
+}
+
+function renderStatus() {
+  const pill = $('status');
+  const status = view?.status;
+  const [tone, text] = !view ? ['err', 'Offline']
+    : status.state === 'running' ? ['ok', `Running · ${status.speakers.length} speaker${status.speakers.length === 1 ? '' : 's'}`]
+    : status.state === 'starting' ? ['info', 'Starting']
+    : ['warn', 'Waiting for speakers'];
+  pill.dataset.tone = tone;
+  $('status-text').textContent = text;
+  if (!view) return;
+  $('version').textContent = `v${view.version}`;
+  $('restart').hidden = false;
+  const minutes = Math.floor((Date.now() - view.started_at_ms) / 60000);
+  $('uptime').textContent = minutes < 0 ? '' : minutes < 60 ? `up ${minutes}m` : `up ${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  $('rooms').replaceChildren(...speakerRooms().map((room) => h('option', { value: room })));
+
+  const banners = [];
+  if (view.read_only) {
+    banners.push(h('div', { class: 'banner info' }, h('p', {},
+      h('strong', {}, 'Read-only. '), 'Another tool generates this file, such as the Home Assistant app options. Change the settings there.')));
+  }
+  if (status.state === 'setup') {
+    banners.push(h('div', { class: 'banner err' }, h('p', {},
+      h('strong', {}, 'No speaker started. '), h('code', {}, status.error),
+      ' AirSonos2 retries every 10 seconds. Fix the settings, save, then restart.')));
+  }
+  if (view.restart_required) {
+    const button = h('button', { type: 'button', class: 'btn primary' }, 'Restart now');
+    armRestart(button, 'Restart now');
+    banners.push(h('div', { class: 'banner warn' }, h('p', {},
+      h('strong', {}, 'Saved changes are not active. '), 'Restart AirSonos2 to apply them.'), button));
+  }
+  const key = canonical([view.read_only, status, view.restart_required]);
+  if (renderStatus.key !== key) {
+    renderStatus.key = key;
+    $('banners').replaceChildren(...banners);
+  }
+}
+
+function load(next) {
+  view = next;
+  original = clone(next.config);
+  draft = clone(next.config);
+  secrets = { home_assistant_token: null, rtsp_password: null };
+  $('path').replaceChildren(h('span', {}, 'Config file'), next.path);
+  renderStatus();
+  renderForm();
+}
+
+// ---- Actions ----
+
+async function save() {
+  const invalid = [...$('form').querySelectorAll('input, select')].find((input) => !input.checkValidity());
+  if (invalid) {
+    invalid.reportValidity();
+    return;
+  }
+  const button = $('save');
+  button.disabled = true;
+  button.textContent = 'Saving…';
+  try {
+    const next = await api('api/config', { method: 'PUT', body: JSON.stringify({ config: draft, secrets }) });
+    load(next);
+    toast(next.restart_required ? 'Saved. Restart to apply.' : 'Saved.');
+  } catch (error) {
+    $('save-error').textContent = error.message;
+    const field = FIELDS.find((candidate) => error.message.includes(candidate.path));
+    const row = field && document.querySelector(`.field[data-path="${field.path}"]`);
+    if (row) {
+      row.classList.add('error');
+      row.scrollIntoView({ block: 'center' });
+    }
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Save changes';
+  }
+}
+
+function discard() {
+  draft = clone(original);
+  secrets = { home_assistant_token: null, rtsp_password: null };
+  $('save-error').textContent = '';
+  renderForm();
+}
+
+/** Two clicks: the first arms the button, the second restarts. */
+function armRestart(button, idleLabel) {
+  const label = button.querySelector('span') ?? button;
+  let timer;
+  const reset = () => {
+    clearTimeout(timer);
+    button.classList.remove('confirm');
+    label.textContent = idleLabel;
+  };
+  button.addEventListener('click', () => {
+    if (!button.classList.contains('confirm')) {
+      button.classList.add('confirm');
+      label.textContent = changedFields().length ? 'Discard edits and restart?' : 'Confirm restart';
+      timer = setTimeout(reset, 4000);
+      return;
+    }
+    reset();
+    restart();
+  });
+}
+
+function overlay(title, text, stuck = false) {
+  $('overlay-title').textContent = title;
+  $('overlay-text').textContent = text;
+  $('overlay').classList.toggle('stuck', stuck);
+  $('overlay-close').hidden = !stuck;
+  $('overlay').classList.add('show');
+}
+
+async function restart() {
+  const before = view.started_at_ms;
+  restarting = true;
+  overlay('Restarting AirSonos2', 'Active AirPlay sessions stop. Waiting for the bridge to come back.');
+  try {
+    await api('api/restart', { method: 'POST', body: '{}' });
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      await sleep(1000);
+      const next = await api('api/config').catch(() => null);
+      if (next && next.started_at_ms !== before) {
+        load(next);
+        $('overlay').classList.remove('show');
+        toast('AirSonos2 restarted.');
+        return;
+      }
+    }
+    overlay('AirSonos2 did not come back',
+      'It exits with code 75 to restart. Run it under systemd or Docker with a restart policy, or start it again by hand.', true);
+  } catch (error) {
+    overlay('Restart failed', error.message, true);
+  } finally {
+    restarting = false;
+  }
+}
+
+async function poll() {
+  if (document.hidden || restarting || !view) return;
+  try {
+    const next = await api('api/config');
+    if (next.started_at_ms !== view.started_at_ms && changedFields().length === 0) {
+      load(next);
+    } else {
+      view = { ...view, status: next.status, restart_required: next.restart_required, started_at_ms: next.started_at_ms };
+      renderStatus();
+      refresh();
+    }
+  } catch {
+    $('status').dataset.tone = 'err';
+    $('status-text').textContent = 'Offline';
+  }
+}
+
+$('save').addEventListener('click', save);
+$('discard').addEventListener('click', discard);
+$('overlay-close').addEventListener('click', () => $('overlay').classList.remove('show'));
+armRestart($('restart'), 'Restart');
+window.addEventListener('beforeunload', (event) => {
+  if (changedFields().length && !view.read_only) event.preventDefault();
+});
+document.addEventListener('keydown', (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === 's') {
+    event.preventDefault();
+    if (changedFields().length && !view.read_only) save();
+  }
+});
+
+try {
+  load(await api('api/config'));
+  renderNav();
+  setInterval(poll, 5000);
+} catch (error) {
+  renderStatus();
+  $('main').replaceChildren(h('div', { class: 'load-error' },
+    h('h2', {}, 'Cannot load the configuration'), h('code', {}, error.message)));
+}
+</script>
+</body>
+</html>
