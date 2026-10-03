@@ -235,7 +235,16 @@ async fn save_config(
             "this config file is read-only; edit its source instead".to_owned(),
         ));
     }
-    let config = draft_config(&ui, request).await?.config;
+    let draft = draft_config(&ui, request).await?;
+    // Without a token, the bridge would send `SUPERVISOR_TOKEN` to the new URL.
+    if draft.new_ha_url_without_token && draft.config.home_assistant.url.is_some() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "home_assistant.token: enter the access token for the new Home Assistant URL"
+                .to_owned(),
+        ));
+    }
+    let config = draft.config;
     config
         .validate()
         .map_err(|error| ApiError(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
@@ -336,15 +345,15 @@ mod tests {
         stored.home_assistant.url = Some("http://ha.local:8123".parse().expect("url"));
         stored.home_assistant.token = Some("stored".to_owned());
         stored.write_to_path(&path).expect("write config");
-        let ui = ConfigUi {
+        let ui = Arc::new(ConfigUi {
             path,
             read_only: false,
             running: stored.clone(),
             started_at_ms: 0,
             status: watch::channel(BridgeStatus::Starting).1,
             restart: CancellationToken::new(),
-        };
-        let draft = |url: &str, token: Option<&str>| {
+        });
+        let request = |url: &str, token: Option<&str>| {
             let mut config = stored.clone();
             config.home_assistant.url = Some(url.parse().expect("url"));
             config.home_assistant.token = None;
@@ -352,8 +361,9 @@ mod tests {
                 home_assistant_token: token.map(str::to_owned),
                 rtsp_password: None,
             };
-            draft_config(&ui, Ok(Json(DraftRequest { config, secrets })))
+            Ok(Json(DraftRequest { config, secrets }))
         };
+        let draft = |url: &str, token: Option<&str>| draft_config(&ui, request(url, token));
 
         let same = draft("http://ha.local:8123", None).await.expect("draft");
         assert_eq!(same.config.home_assistant.token.as_deref(), Some("stored"));
@@ -368,5 +378,12 @@ mod tests {
             .expect("draft");
         assert_eq!(moved.config.home_assistant.token.as_deref(), Some("new"));
         assert!(!moved.new_ha_url_without_token);
+
+        // A saved URL without a token would get `SUPERVISOR_TOKEN` after the restart.
+        let saved = save_config(State(ui.clone()), request("http://attacker.example", None)).await;
+        assert_eq!(
+            saved.err().map(|error| error.0),
+            Some(StatusCode::UNPROCESSABLE_ENTITY)
+        );
     }
 }

@@ -508,6 +508,9 @@ let restarting = false;
 /** Last scan: rows keep their switches, so edits update them in place. */
 let discovery = null;
 let scanning = false;
+/** A newer file that another window saved while this page had edits. */
+let staleFile = null;
+let overwriteArmed = false;
 
 const $ = (id) => document.getElementById(id);
 const clone = (value) => structuredClone(value);
@@ -1010,13 +1013,18 @@ function renderStatus() {
       h('strong', {}, 'No speaker started. '), h('code', {}, status.error),
       ' AirSonos2 retries every 10 seconds. Fix the settings, save, then restart.')));
   }
+  if (staleFile) {
+    banners.push(h('div', { class: 'banner warn' }, h('p', {},
+      h('strong', {}, 'The file changed in another window. '), 'Saving your edits would overwrite those changes.'),
+      h('button', { type: 'button', class: 'btn', onclick: () => load(staleFile) }, 'Load saved version')));
+  }
   if (view.restart_required) {
     const button = h('button', { type: 'button', class: 'btn primary' }, 'Restart now');
     armRestart(button, 'Restart now');
     banners.push(h('div', { class: 'banner warn' }, h('p', {},
       h('strong', {}, 'Saved changes are not active. '), 'Restart AirSonos2 to apply them.'), button));
   }
-  const key = canonical([view.read_only, status, view.restart_required]);
+  const key = canonical([view.read_only, status, view.restart_required, Boolean(staleFile)]);
   if (renderStatus.key !== key) {
     renderStatus.key = key;
     $('banners').replaceChildren(...banners);
@@ -1028,6 +1036,8 @@ function load(next) {
   original = clone(next.config);
   draft = clone(next.config);
   secrets = { home_assistant_token: null, rtsp_password: null };
+  staleFile = null;
+  overwriteArmed = false;
   $('path').replaceChildren(h('span', {}, 'Config file'), next.path);
   renderStatus();
   renderForm();
@@ -1039,6 +1049,11 @@ async function save() {
   const invalid = [...$('form').querySelectorAll('input, select')].find((input) => !input.checkValidity());
   if (invalid) {
     invalid.reportValidity();
+    return;
+  }
+  if (staleFile && !overwriteArmed) {
+    overwriteArmed = true;
+    $('save-error').textContent = 'The file changed in another window. Save again to overwrite it.';
     return;
   }
   const button = $('save');
@@ -1151,9 +1166,12 @@ async function poll() {
   if (document.hidden || restarting || !view) return;
   try {
     const next = await api('api/config');
-    if (next.started_at_ms !== view.started_at_ms && changedFields().length === 0) {
+    const fileChanged = canonical([next.config, next.secrets]) !== canonical([view.config, view.secrets]);
+    if ((fileChanged || next.started_at_ms !== view.started_at_ms) && changedFields().length === 0) {
       load(next);
     } else {
+      // Keep the edits, and warn before they overwrite what another window saved.
+      if (fileChanged) staleFile = next;
       view = { ...view, status: next.status, restart_required: next.restart_required, started_at_ms: next.started_at_ms };
       renderStatus();
       refresh();

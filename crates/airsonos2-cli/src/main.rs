@@ -342,14 +342,15 @@ async fn serve(
         }
     });
 
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
     // `Err` holds the result of an exit before any speaker started.
-    let renderers = loop {
+    let started = loop {
         let attempt = tokio::select! {
-            attempt = discover_renderers(&config) => attempt,
+            attempt = start_speakers(&config, &events_tx) => attempt,
             result = &mut exit => break Err(result),
         };
         match attempt {
-            Ok(renderers) => break Ok(renderers),
+            Ok(started) => break Ok(started),
             Err(error) => {
                 error!(
                     "cannot start any speaker: {error:#}; retrying in {} s",
@@ -365,8 +366,13 @@ async fn serve(
             result = &mut exit => break Err(result),
         }
     };
-    let renderers = match renderers {
-        Ok(renderers) => renderers,
+    let StartedSpeakers {
+        speakers,
+        renderers,
+        volume_states,
+        mut runners,
+    } = match started {
+        Ok(started) => started,
         Err(result) => {
             drop(exit);
             if !http_task.is_finished() {
@@ -385,28 +391,9 @@ async fn serve(
         }
     };
 
-    info!("starting AirSonos2 for {} renderer(s)", renderers.len());
-
-    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    // The runners hold the remaining senders; the channel closes when they stop.
+    drop(events_tx);
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
-    let endpoints = build_endpoints(&renderers, &config)?;
-    persist_endpoint_identities(&config.server.state_dir, &endpoints)?;
-    let speakers = renderers
-        .iter()
-        .zip(&endpoints)
-        .map(|(renderer, endpoint)| Speaker {
-            room: renderer.name().to_owned(),
-            airplay_name: endpoint.display_name.clone(),
-            rtsp_port: endpoint.rtsp_port,
-        })
-        .collect();
-    let renderers: HashMap<ZoneId, Renderer> = renderers
-        .into_iter()
-        .map(|renderer| (renderer.id().clone(), renderer))
-        .collect();
-    let volume_states = load_volume_states(&renderers).await;
-    let mut runners =
-        start_airplay_endpoints(&endpoints, &config, events_tx, &volume_states).await?;
     let mut runtime = BridgeRuntime::new(
         config.clone(),
         registry.clone(),
@@ -457,6 +444,48 @@ fn listener_exit<E: Into<anyhow::Error>>(
         Ok(result) => result.map(|()| ServeExit::Stopped).map_err(Into::into),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Speakers whose AirPlay endpoints are up.
+struct StartedSpeakers {
+    speakers: Vec<Speaker>,
+    renderers: HashMap<ZoneId, Renderer>,
+    volume_states: HashMap<ZoneId, ZoneVolumeState>,
+    runners: Vec<AirPlayEndpointRunner>,
+}
+
+/// Finds the speakers and starts their AirPlay endpoints. Any failure, such as no
+/// matching speaker or an RTSP port in use, lets `serve` keep the GUI up and retry.
+async fn start_speakers(
+    config: &Config,
+    events_tx: &mpsc::UnboundedSender<AirPlayEvent>,
+) -> anyhow::Result<StartedSpeakers> {
+    let renderers = discover_renderers(config).await?;
+    info!("starting AirSonos2 for {} renderer(s)", renderers.len());
+    let endpoints = build_endpoints(&renderers, config)?;
+    persist_endpoint_identities(&config.server.state_dir, &endpoints)?;
+    let speakers = renderers
+        .iter()
+        .zip(&endpoints)
+        .map(|(renderer, endpoint)| Speaker {
+            room: renderer.name().to_owned(),
+            airplay_name: endpoint.display_name.clone(),
+            rtsp_port: endpoint.rtsp_port,
+        })
+        .collect();
+    let renderers: HashMap<ZoneId, Renderer> = renderers
+        .into_iter()
+        .map(|renderer| (renderer.id().clone(), renderer))
+        .collect();
+    let volume_states = load_volume_states(&renderers).await;
+    let runners =
+        start_airplay_endpoints(&endpoints, config, events_tx.clone(), &volume_states).await?;
+    Ok(StartedSpeakers {
+        speakers,
+        renderers,
+        volume_states,
+        runners,
+    })
 }
 
 /// Finds the speakers to bridge. Fails when none match, so `serve` can retry.
