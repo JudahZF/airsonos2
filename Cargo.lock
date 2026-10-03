@@ -104,6 +104,7 @@ name = "airsonos2-homeassistant"
 version = "0.1.0"
 dependencies = [
  "airsonos2-core",
+ "http",
  "reqwest",
  "serde",
  "serde_json",

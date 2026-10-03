@@ -161,14 +161,8 @@ impl HomeAssistantClient {
     }
 
     async fn get(&self, url: Url) -> Result<String, HomeAssistantError> {
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(&self.token)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(response.text().await?)
+        let response = self.http.get(url).bearer_auth(&self.token).send().await?;
+        Ok(check_status(response)?.text().await?)
     }
 
     async fn call_media_player(
@@ -176,7 +170,8 @@ impl HomeAssistantClient {
         service: &str,
         data: serde_json::Value,
     ) -> Result<(), HomeAssistantError> {
-        self.http
+        let response = self
+            .http
             .post(
                 self.api_url
                     .join(&format!("services/media_player/{service}"))?,
@@ -184,8 +179,8 @@ impl HomeAssistantClient {
             .bearer_auth(&self.token)
             .json(&data)
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
+        check_status(response)?;
         Ok(())
     }
 }
@@ -204,6 +199,10 @@ pub enum HomeAssistantError {
     Json(#[from] serde_json::Error),
     #[error("{entity_id} does not report a volume level; it may be off")]
     MissingVolumeLevel { entity_id: String },
+    #[error(
+        "Home Assistant answered with redirect {0}; set home_assistant.url to the address it serves"
+    )]
+    Redirect(reqwest::StatusCode),
 }
 
 impl HomeAssistantError {
@@ -243,6 +242,15 @@ struct MediaPlayerAttributes {
     volume_level: Option<f32>,
     #[serde(default)]
     supported_features: u32,
+}
+
+/// Redirects are not followed, so a 3xx response means the call did not happen.
+/// `error_for_status` only rejects 4xx and 5xx.
+fn check_status(response: reqwest::Response) -> Result<reqwest::Response, HomeAssistantError> {
+    if response.status().is_redirection() {
+        return Err(HomeAssistantError::Redirect(response.status()));
+    }
+    Ok(response.error_for_status()?)
 }
 
 /// Joins `api/` onto the base URL, keeping a path prefix such as the Supervisor's `/core`.
@@ -293,6 +301,26 @@ mod tests {
             api_url(&direct).expect("api url").as_str(),
             "http://homeassistant.local:8123/api/"
         );
+    }
+
+    #[test]
+    fn redirects_are_errors_not_success() {
+        let response = |status: u16| {
+            reqwest::Response::from(
+                http::Response::builder()
+                    .status(status)
+                    .body("")
+                    .expect("response"),
+            )
+        };
+
+        assert!(matches!(
+            check_status(response(307)),
+            Err(HomeAssistantError::Redirect(_))
+        ));
+        assert!(check_status(response(200)).is_ok());
+        assert!(check_status(response(503)).unwrap_err().is_retryable());
+        assert!(!check_status(response(401)).unwrap_err().is_retryable());
     }
 
     #[test]
