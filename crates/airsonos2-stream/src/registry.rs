@@ -183,6 +183,22 @@ enum PlaybackAnchorState {
     NextTimedPcm,
 }
 
+/// When a stream's output was released, and its output delay.
+#[derive(Clone, Copy, Debug)]
+pub struct PlaybackRelease {
+    pub at: Instant,
+    pub delay: Duration,
+}
+
+impl PlaybackRelease {
+    fn now(delay: Duration) -> Self {
+        Self {
+            at: Instant::now(),
+            delay,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LiveStream {
     pub session: StreamSession,
@@ -196,8 +212,8 @@ pub struct LiveStream {
     ready: watch::Sender<bool>,
     subscriber: watch::Sender<bool>,
     closed: watch::Sender<bool>,
-    /// Output delay once playback is released; `None` holds output back.
-    playback_release: watch::Sender<Option<Duration>>,
+    /// Set once playback is released; `None` holds output back.
+    playback_release: watch::Sender<Option<PlaybackRelease>>,
     playback_epoch: Arc<AtomicU64>,
     subscriber_count: Arc<AtomicU64>,
     playback_anchor: Arc<std::sync::Mutex<PlaybackAnchorState>>,
@@ -488,7 +504,8 @@ impl LiveStream {
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::At(anchor);
         }
-        self.playback_release.send_replace(Some(Duration::ZERO));
+        self.playback_release
+            .send_replace(Some(PlaybackRelease::now(Duration::ZERO)));
         let timing = self.timing();
         info!(
             session_id = %self.session.session_id,
@@ -503,7 +520,8 @@ impl LiveStream {
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::NextTimedPcm;
         }
-        self.playback_release.send_replace(Some(Duration::ZERO));
+        self.playback_release
+            .send_replace(Some(PlaybackRelease::now(Duration::ZERO)));
         let timing = self.timing();
         info!(
             session_id = %self.session.session_id,
@@ -520,17 +538,18 @@ impl LiveStream {
         if let Ok(mut anchor) = self.playback_anchor.lock() {
             *anchor = PlaybackAnchorState::At(source_cutoff);
         }
-        self.playback_release.send_replace(Some(delay));
+        self.playback_release
+            .send_replace(Some(PlaybackRelease::now(delay)));
     }
 
-    /// Waits until playback is released and returns the output delay, or `None`
-    /// when the stream closes first.
-    pub async fn wait_for_playback_release(&self) -> Option<Duration> {
+    /// Waits until playback is released, or returns `None` when the stream
+    /// closes first.
+    pub async fn wait_for_playback_release(&self) -> Option<PlaybackRelease> {
         let mut release = self.playback_release.subscribe();
         tokio::select! {
             biased;
             _ = self.closed() => None,
-            released = release.wait_for(Option::is_some) => released.ok().and_then(|delay| *delay),
+            released = release.wait_for(Option::is_some) => released.ok().and_then(|release| *release),
         }
     }
 

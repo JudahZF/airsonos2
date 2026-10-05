@@ -166,7 +166,7 @@ impl FfmpegEncoder {
                 config.sample_rate,
                 config.channels,
             )));
-            let Some(delay) = stream.wait_for_playback_release().await else {
+            let Some(release) = stream.wait_for_playback_release().await else {
                 return Ok(());
             };
             let mut first_pcm = false;
@@ -176,6 +176,11 @@ impl FfmpegEncoder {
                 frame = rx.recv() => frame,
             } {
                 if !stream.accepts_epoch(frame.playback_epoch) {
+                    continue;
+                }
+                // Untimed frames have no source cutoff. Drop the backlog from before
+                // the release, so the stream starts at the live edge.
+                if frame.presentation_time.is_none() && arrived < release.at {
                     continue;
                 }
                 if !first_pcm {
@@ -192,8 +197,8 @@ impl FfmpegEncoder {
                 // edge. A delayed start only sends a burst of backlog, and the
                 // renderer's start buffer absorbs that burst. Untimed frames use
                 // their arrival time.
-                if !delay.is_zero() {
-                    let due = frame.presentation_time.unwrap_or(arrived) + delay;
+                if !release.delay.is_zero() {
+                    let due = frame.presentation_time.unwrap_or(arrived) + release.delay;
                     tokio::select! {
                         _ = stream.closed() => break,
                         _ = time::sleep_until(due.into()) => {}

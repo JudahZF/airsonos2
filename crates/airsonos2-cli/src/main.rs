@@ -813,6 +813,9 @@ struct SessionRuntime {
     format: PcmFormat,
     /// AirPlay sender. Sessions from one sender play the same audio.
     sender: Option<IpAddr>,
+    /// WAV delay from this session's last cohort. A room that joins this one
+    /// later and falls back to its own stream reuses it.
+    sync_delay: Duration,
     generation: u64,
     playback_epoch: u64,
     desired_playback: bool,
@@ -834,6 +837,7 @@ impl SessionRuntime {
             zone_id,
             format,
             sender: None,
+            sync_delay: Duration::ZERO,
             generation: 0,
             playback_epoch: 0,
             desired_playback: true,
@@ -1618,46 +1622,37 @@ impl BridgeRuntime {
                 .map(|member| member.coordinator)
         };
         // Sonos plays members in step with their coordinator, so offsets apply
-        // only to the rooms that play their own stream. That includes a playing
-        // coordinator that a late room joins.
-        let mut rooms = prepared
+        // only to the rooms that play their own stream.
+        let rooms = prepared
             .iter()
             .filter(|stream| coordinator_of(stream).is_none())
             .map(|stream| (stream.zone_id.clone(), stream.renderer.name().to_owned()))
             .collect::<Vec<_>>();
-        for coordinator in prepared.iter().filter_map(coordinator_of) {
-            if let Some(renderer) = self
-                .sessions
-                .get(&coordinator)
-                .and_then(|session| self.renderers.get(&session.zone_id))
-                && !rooms.iter().any(|(zone_id, _)| zone_id == renderer.id())
-            {
-                rooms.push((renderer.id().clone(), renderer.name().to_owned()));
-            }
-        }
         let delays = configured_delays(
             &rooms,
             &self.config.sync.zone_offsets_ms,
             self.config.sync.default_offset_ms,
         );
+        let cohort_delay = |zone_id: &ZoneId| {
+            delays
+                .iter()
+                .find(|delay| &delay.zone_id == zone_id)
+                .map(|delay| Duration::from_millis(delay.delay_ms))
+        };
         let mut stream_delays = HashMap::new();
         for stream in prepared {
             let coordinator = coordinator_of(stream);
             if stream.live_stream.session.codec == StreamCodec::Wav {
                 // A member's own stream plays only if its join fails. It then keeps
-                // the coordinator's delay.
-                let zone_id = match coordinator {
-                    Some(coordinator) => self
-                        .sessions
-                        .get(&coordinator)
-                        .map(|session| &session.zone_id),
-                    None => Some(&stream.zone_id),
+                // the coordinator's delay: from this cohort, or the delay that an
+                // already playing coordinator uses.
+                let delay = match coordinator {
+                    Some(coordinator) => self.sessions.get(&coordinator).map(|session| {
+                        cohort_delay(&session.zone_id).unwrap_or(session.sync_delay)
+                    }),
+                    None => cohort_delay(&stream.zone_id),
                 };
-                let delay = delays
-                    .iter()
-                    .find(|delay| Some(&delay.zone_id) == zone_id)
-                    .map_or(0, |delay| delay.delay_ms);
-                stream_delays.insert(stream.session_id, Duration::from_millis(delay));
+                stream_delays.insert(stream.session_id, delay.unwrap_or_default());
             } else if coordinator.is_none()
                 && (rooms.len() > 1
                     || self.config.sync.default_offset_ms != 0
@@ -1680,10 +1675,15 @@ impl BridgeRuntime {
         for stream in prepared {
             let zone_id = stream.zone_id.clone();
             let delay = delays.get(&stream.session_id).copied();
+            if let (Some(delay), Some(session)) = (delay, self.sessions.get_mut(&stream.session_id))
+            {
+                session.sync_delay = delay;
+            }
             let command = match (members.remove(&stream.session_id), &stream.renderer, &joins) {
                 (Some(member), Renderer::Sonos { client, .. }, Some(joins)) => {
-                    // A member's own stream plays only if its join fails. Holding it
-                    // until then keeps a subscribed Sonos from buffering it.
+                    // A member's own stream plays only if its join fails. Holding a
+                    // WAV stream until then keeps a subscribed Sonos from buffering
+                    // it. MP3 has no playback plan, so it is not held.
                     if let Some(prepared) = self
                         .sessions
                         .get_mut(&stream.session_id)
