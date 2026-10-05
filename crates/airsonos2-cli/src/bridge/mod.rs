@@ -348,6 +348,7 @@ async fn prepare(
         generation: start.generation,
         renderer: start.renderer,
         live_stream: start.live_stream,
+        held_delay: None,
     });
 }
 

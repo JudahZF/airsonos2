@@ -912,6 +912,9 @@ struct PreparedDownstream {
     generation: u64,
     renderer: Renderer,
     live_stream: LiveStream,
+    /// WAV delay of a native group member's own stream. The stream stays held
+    /// until a failed join falls back to Play.
+    held_delay: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -1065,16 +1068,16 @@ impl BridgeRuntime {
         session_id: SessionId,
         zone_id: ZoneId,
         generation: u64,
-    ) {
+    ) -> bool {
         self.cancel_downstream_retry(session_id);
         let Some(session) = self.sessions.get_mut(&session_id) else {
-            return;
+            return false;
         };
         if session.retry_attempts >= 6 {
             // A kept prepared stream may never have played; the next Play must rebuild it.
             session.reset_needed = true;
             error!(%session_id, %zone_id, "downstream retry budget exhausted; session requires a new playback request");
-            return;
+            return false;
         }
         let delay = downstream_retry_delay(session.retry_attempts);
         session.retry_attempts += 1;
@@ -1087,6 +1090,7 @@ impl BridgeRuntime {
                 generation,
             });
         }));
+        true
     }
 
     async fn handle_downstream_start_result(&mut self, result: DownstreamStartResult) {
@@ -1134,11 +1138,15 @@ impl BridgeRuntime {
                 if outcome == DownstreamStartOutcome::Failed {
                     self.forget_native_member(result.session_id);
                 }
-                self.schedule_downstream_retry(
+                // Like a permanent failure, a spent retry budget leaves the
+                // members of this coordinator silent.
+                if !self.schedule_downstream_retry(
                     result.session_id,
                     result.zone_id,
                     result.generation,
-                );
+                ) {
+                    self.leave_native_group(result.session_id).await;
+                }
             }
         }
     }
@@ -1153,7 +1161,13 @@ impl BridgeRuntime {
         if let Some(task) = session.retry_task.take() {
             task.abort();
         }
-        if let Some(prepared) = session.prepared.clone() {
+        if let Some(prepared) = session.prepared.as_mut() {
+            if let Some(delay) = prepared.held_delay.take() {
+                prepared
+                    .live_stream
+                    .set_playback_plan(Instant::now() + SYNC_START_LEAD, delay);
+            }
+            let prepared = prepared.clone();
             if let Some(worker) = self.worker(&retry.zone_id) {
                 worker.command(TransportCommand::Play(Box::new(prepared)));
             }
@@ -1668,9 +1682,14 @@ impl BridgeRuntime {
             let delay = delays.get(&stream.session_id).copied();
             let command = match (members.remove(&stream.session_id), &stream.renderer, &joins) {
                 (Some(member), Renderer::Sonos { client, .. }, Some(joins)) => {
-                    // A member's own stream plays only if its join fails.
-                    if let Some(delay) = delay {
-                        stream.live_stream.set_playback_plan(cutoff, delay);
+                    // A member's own stream plays only if its join fails. Holding it
+                    // until then keeps a subscribed Sonos from buffering it.
+                    if let Some(prepared) = self
+                        .sessions
+                        .get_mut(&stream.session_id)
+                        .and_then(|session| session.prepared.as_mut())
+                    {
+                        prepared.held_delay = delay;
                     }
                     TransportCommand::Join {
                         client: client.clone(),
@@ -2042,6 +2061,7 @@ mod tests {
                     .expect("client"),
             ),
             live_stream: live_stream_for(session_id, zone_id, codec),
+            held_delay: None,
         }
     }
 
