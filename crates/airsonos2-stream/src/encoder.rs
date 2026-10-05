@@ -169,11 +169,6 @@ impl FfmpegEncoder {
             let Some(delay) = stream.wait_for_playback_release().await else {
                 return Ok(());
             };
-            // Keep the queued audio from the shared cutoff until the renderer
-            // connects. Home Assistant players connect only after Play.
-            if !stream.subscribed().await {
-                return Ok(());
-            }
             let mut first_pcm = false;
 
             while let Some(frame) = tokio::select! {

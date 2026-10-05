@@ -57,12 +57,10 @@ impl Renderer {
         Ok(())
     }
 
-    /// Leaves a native Sonos group, which also stops this player. Home Assistant
-    /// players never join one, so they only stop.
+    /// Leaves a native Sonos group. Home Assistant players never join one.
     pub(crate) async fn leave_group(&self) -> Result<(), RendererError> {
-        match self {
-            Self::Sonos { client, .. } => client.become_coordinator_of_standalone_group().await?,
-            Self::HomeAssistant { .. } => self.stop().await?,
+        if let Self::Sonos { client, .. } = self {
+            client.become_coordinator_of_standalone_group().await?;
         }
         Ok(())
     }

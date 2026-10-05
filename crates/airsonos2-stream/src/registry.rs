@@ -564,19 +564,12 @@ impl LiveStream {
 
     /// Waits until an HTTP subscriber connects or the timeout elapses.
     pub async fn wait_for_subscriber(&self, timeout: Duration) -> bool {
-        tokio::time::timeout(timeout, self.subscribed())
-            .await
-            .unwrap_or(false)
-    }
-
-    /// Waits until an HTTP subscriber connects. Returns false when the stream
-    /// closes first.
-    pub async fn subscribed(&self) -> bool {
         let mut subscriber = self.subscriber.subscribe();
         tokio::select! {
             biased;
             _ = self.closed() => false,
             result = subscriber.wait_for(|connected| *connected) => result.is_ok(),
+            _ = tokio::time::sleep(timeout) => false,
         }
     }
 

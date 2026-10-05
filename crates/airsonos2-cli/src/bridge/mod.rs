@@ -71,10 +71,9 @@ impl ZoneWorker {
                 match command {
                     Some(TransportCommand::Prepare(start)) => {
                         // A member must leave the group before the Stop barrier.
-                        if std::mem::take(&mut joined)
-                            && let Err(error) = transport_renderer.leave_group().await
-                        {
-                            warn!(zone_id = %start.zone_id, "leaving the Sonos group failed: {error}");
+                        // A failed leave fails that barrier, and the retry leaves again.
+                        if joined {
+                            joined = leave_group(&transport_renderer, &start.zone_id).await;
                         }
                         prepare(*start, &commands, subscriber_wait, prebuffer).await;
                     }
@@ -83,7 +82,9 @@ impl ZoneWorker {
                             .renderer
                             .play(&stream.live_stream.session.local_url)
                             .await;
-                        report_start(&result_tx, &stream, "Play", result);
+                        // The room plays its own stream, so it is in no group.
+                        joined &= result.is_err();
+                        report_start(&result_tx, &stream, start_outcome(&stream, "Play", result));
                     }
                     Some(TransportCommand::PlayGroup(stream, joins)) => {
                         let mut changed = commands.clone();
@@ -95,7 +96,7 @@ impl ZoneWorker {
                             .renderer
                             .play(&stream.live_stream.session.local_url)
                             .await;
-                        report_start(&result_tx, &stream, "Play", result);
+                        report_start(&result_tx, &stream, start_outcome(&stream, "Play", result));
                     }
                     Some(TransportCommand::Join {
                         stream,
@@ -110,20 +111,25 @@ impl ZoneWorker {
                         // A timed-out join may have taken effect.
                         joined = !result.as_ref().is_err_and(|error| !error.is_timeout());
                         joins.joined();
-                        report_start(&result_tx, &stream, "Group join", result);
+                        // Only the join failed. The retry plays the room's own stream.
+                        let outcome = match start_outcome(&stream, "Group join", result) {
+                            DownstreamStartOutcome::PermanentFailure => {
+                                DownstreamStartOutcome::Failed
+                            }
+                            outcome => outcome,
+                        };
+                        report_start(&result_tx, &stream, outcome);
                     }
                     Some(TransportCommand::Stop {
                         session_id,
                         zone_id,
                         generation,
                     }) => {
-                        // Leaving the group stops a member; members reject Stop.
-                        let result = if std::mem::take(&mut joined) {
-                            transport_renderer.leave_group().await
-                        } else {
-                            transport_renderer.stop().await
-                        };
-                        let outcome = match result {
+                        // Members reject Stop, so a member leaves its group first.
+                        if joined {
+                            joined = leave_group(&transport_renderer, &zone_id).await;
+                        }
+                        let outcome = match transport_renderer.stop().await {
                             Ok(()) => DownstreamStartOutcome::Stopped,
                             Err(error) => {
                                 warn!(%zone_id, "Stop failed: {error}");
@@ -186,13 +192,23 @@ impl Drop for ZoneWorker {
     }
 }
 
-fn report_start(
-    result_tx: &mpsc::UnboundedSender<DownstreamStartResult>,
+/// Returns whether the room is still a group member.
+async fn leave_group(renderer: &Renderer, zone_id: &ZoneId) -> bool {
+    match renderer.leave_group().await {
+        Ok(()) => false,
+        Err(error) => {
+            warn!(%zone_id, "leaving the Sonos group failed: {error}");
+            true
+        }
+    }
+}
+
+fn start_outcome(
     stream: &PreparedDownstream,
     action: &str,
     result: Result<(), RendererError>,
-) {
-    let outcome = match result {
+) -> DownstreamStartOutcome {
+    match result {
         Ok(()) => DownstreamStartOutcome::Started,
         Err(error) if error.is_timeout() => {
             warn!(zone_id = %stream.zone_id, "{action} timed out; playback is unknown, retrying the same stream");
@@ -206,7 +222,14 @@ fn report_start(
                 DownstreamStartOutcome::PermanentFailure
             }
         }
-    };
+    }
+}
+
+fn report_start(
+    result_tx: &mpsc::UnboundedSender<DownstreamStartResult>,
+    stream: &PreparedDownstream,
+    outcome: DownstreamStartOutcome,
+) {
     let _ = result_tx.send(DownstreamStartResult {
         session_id: stream.session_id,
         zone_id: stream.zone_id.clone(),

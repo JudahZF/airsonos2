@@ -136,7 +136,6 @@ impl AirPlayEndpointRunner {
             events,
             volume_state: volume_state.clone(),
             active_session: Arc::new(Mutex::new(None)),
-            sender: Mutex::new(None),
         });
         let pairing_store = Arc::new(FilePairingStore::load(&endpoint.pairing_store_path)?);
         let rtsp_password_enabled = config.rtsp_password_enabled();
@@ -352,12 +351,18 @@ struct BridgeAudioHandler {
     events: mpsc::UnboundedSender<AirPlayEvent>,
     volume_state: ZoneVolumeState,
     active_session: Arc<Mutex<Option<SessionId>>>,
-    /// Latest connected sender. The audio session starts on its connection.
-    sender: Mutex<Option<IpAddr>>,
 }
 
 impl AudioHandler for BridgeAudioHandler {
     fn audio_init(&self, format: AudioFormat) -> Box<dyn AudioSession> {
+        self.audio_init_with_sender(format, None)
+    }
+
+    fn audio_init_with_sender(
+        &self,
+        format: AudioFormat,
+        sender: Option<IpAddr>,
+    ) -> Box<dyn AudioSession> {
         let session_id = SessionId::new();
         let pcm_format = PcmFormat::from(format);
         debug!(
@@ -375,7 +380,7 @@ impl AudioHandler for BridgeAudioHandler {
             session_id,
             zone_id: self.zone_id.clone(),
             format: pcm_format,
-            sender: self.sender.lock().ok().and_then(|sender| *sender),
+            sender,
         });
 
         Box::new(BridgeAudioSession {
@@ -433,9 +438,6 @@ impl AudioHandler for BridgeAudioHandler {
 
     fn on_client_connected(&self, addr: &str) {
         debug!(zone_id = %self.zone_id, %addr, "AirPlay client connected");
-        if let Ok(mut sender) = self.sender.lock() {
-            *sender = addr.parse().ok();
-        }
         let _ = self.events.send(AirPlayEvent::ClientConnected {
             zone_id: self.zone_id.clone(),
             addr: addr.to_owned(),

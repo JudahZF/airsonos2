@@ -49,6 +49,11 @@ pub struct AudioFormat {
 pub trait AudioHandler: Send + Sync + 'static {
     /// Called when a new audio stream starts. Return a session to receive PCM data.
     fn audio_init(&self, format: AudioFormat) -> Box<dyn AudioSession>;
+    /// Like [`audio_init`](AudioHandler::audio_init), with the address of the
+    /// client whose connection set up this stream, when known.
+    fn audio_init_with_sender(&self, format: AudioFormat, _sender: Option<std::net::IpAddr>) -> Box<dyn AudioSession> {
+        self.audio_init(format)
+    }
 
     // --- Metadata events (called from RTSP thread, never blocks audio) ---
 

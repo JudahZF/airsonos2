@@ -268,6 +268,7 @@ impl BufferedAudioProcessor {
         shk: [u8; 32],
         output_config: OutputConfig,
         handler: Arc<dyn AudioHandler>,
+        sender: Option<std::net::IpAddr>,
         tasks: &mut tokio::task::JoinSet<()>,
     ) -> (tokio::sync::mpsc::Sender<PlayoutCommand>, tokio::task::AbortHandle) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
@@ -298,7 +299,7 @@ impl BufferedAudioProcessor {
         let handler2 = handler.clone();
         let output_config2 = output_config.clone();
         let delivery = std::thread::spawn(move || {
-            delivery_loop(state2, handler2, output_config2);
+            delivery_loop(state2, handler2, output_config2, sender);
         });
 
         // Receiver task
@@ -635,6 +636,7 @@ fn delivery_loop(
     state: Arc<(Mutex<PlayoutState>, Condvar)>,
     handler: Arc<dyn AudioHandler>,
     _output_config: OutputConfig,
+    sender: Option<std::net::IpAddr>,
 ) {
     let (lock, cvar) = &*state;
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
@@ -674,7 +676,7 @@ fn delivery_loop(
                 sample_rate: s.sample_rate,
             };
             info!(?format, "Audio session initialized");
-            session = Some(handler.audio_init(format));
+            session = Some(handler.audio_init_with_sender(format, sender));
         }
 
         let elapsed_frames = source_frames(s.anchor_local.elapsed(), s.source_sample_rate);
@@ -769,6 +771,7 @@ mod ownership_tests {
                     max_channels: None,
                 },
                 Arc::new(Handler),
+                None,
                 &mut tasks,
             );
             let mut client = if connect {
@@ -887,6 +890,7 @@ mod flush_tests {
                     sample_rate: None,
                     max_channels: None,
                 },
+                None,
             )
         });
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "old");
@@ -1015,6 +1019,7 @@ mod downstream_backpressure_tests {
                     sample_rate: None,
                     max_channels: None,
                 },
+                None,
             )
         });
         assert!(matches!(

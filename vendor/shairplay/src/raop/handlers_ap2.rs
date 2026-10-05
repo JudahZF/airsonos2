@@ -441,6 +441,7 @@ pub(crate) fn handle_setup(
                 tracing::info!(audio_port, "Buffered audio TCP port opened");
 
                 let handler = conn.handler.clone();
+                let sender = conn.remote_socket.ip();
                 let output_config = crate::raop::buffered_audio::OutputConfig {
                     sample_rate: conn.output_sample_rate,
                     max_channels: conn.output_max_channels,
@@ -450,7 +451,9 @@ pub(crate) fn handle_setup(
                     listener,
                     port: audio_port,
                 };
-                if !conn.claim_audio(response, |tasks| proc.start(shk_arr, output_config, handler, tasks)) {
+                if !conn.claim_audio(response, |tasks| {
+                    proc.start(shk_arr, output_config, handler, Some(sender), tasks)
+                }) {
                     return None;
                 }
 

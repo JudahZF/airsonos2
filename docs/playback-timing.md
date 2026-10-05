@@ -41,8 +41,10 @@ claimed for that session.
 
 WAV subscribers can receive their single header before a cohort is ready. PCM
 waits until the cohort supplies a common source sample cutoff and a delay per
-room. Every room uses the same source cutoff. After that, PCM is queued until
-the renderer connects, because Home Assistant players connect only after Play.
+room. Every room uses the same source cutoff. PCM published before the
+renderer connects is dropped, so a renderer that connects late, such as a Home
+Assistant player after Play, starts at the live edge. A queued backlog would
+stay in its buffer as extra latency.
 
 A room's delay is a delay line: each frame is sent at its presentation time
 plus the delay. A delayed start does not work. It only sends a burst of queued
