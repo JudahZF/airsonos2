@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "airsonos2-airplay"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "airsonos2-core",
  "serde_json",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "airsonos2-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "airsonos2-airplay",
  "airsonos2-core",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "airsonos2-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "sha2",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "airsonos2-diagnostics"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "airsonos2-core",
  "airsonos2-homeassistant",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "airsonos2-homeassistant"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "airsonos2-core",
  "http",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "airsonos2-sonos"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "airsonos2-core",
  "axum",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "airsonos2-stream"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "airsonos2-core",
  "axum",
