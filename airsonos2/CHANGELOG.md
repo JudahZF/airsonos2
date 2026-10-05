@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Sonos rooms that play from one AirPlay device join one native Sonos group, so Sonos keeps them in sync, including drift. A room added later joins the rooms that already play. The new `native_sonos_groups` option, on by default, controls this.
+- Sessions from one AirPlay device share one timeline, so every room starts on the same source sample.
+- WAV room offsets now hold for the whole stream instead of only at the start.
+- Late renderers, such as Home Assistant players, start at the live edge.
+
 ## 0.2.0
 
 - Expose Home Assistant `media_player` entities, including Music Assistant players, as AirPlay 2 speakers with the `ha_media_players` option.
