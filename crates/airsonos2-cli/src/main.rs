@@ -33,6 +33,9 @@ mod renderer;
 use bridge::{GroupJoins, TransportCommand, ZoneWorker};
 use renderer::Renderer;
 
+/// Lead from a cohort's release to its shared WAV start sample.
+const SYNC_START_LEAD: Duration = Duration::from_millis(120);
+
 /// How long to keep a bridge session alive after the buffered audio stream
 /// closes while AirPlay playback is paused.
 const PAUSED_SESSION_GRACE_SECS: u64 = 60;
@@ -1589,11 +1592,12 @@ impl BridgeRuntime {
         }
     }
 
-    fn apply_sync_anchors(
+    /// Output delays of the WAV streams in `prepared`.
+    fn sync_delays(
         &self,
         prepared: &[PreparedDownstream],
         members: &HashMap<SessionId, NativeMember>,
-    ) {
+    ) -> HashMap<SessionId, Duration> {
         let coordinator_of = |stream: &PreparedDownstream| {
             members
                 .get(&stream.session_id)
@@ -1622,7 +1626,7 @@ impl BridgeRuntime {
             &self.config.sync.zone_offsets_ms,
             self.config.sync.default_offset_ms,
         );
-        let common_sample = Instant::now() + Duration::from_millis(120);
+        let mut stream_delays = HashMap::new();
         for stream in prepared {
             let coordinator = coordinator_of(stream);
             if stream.live_stream.session.codec == StreamCodec::Wav {
@@ -1639,9 +1643,7 @@ impl BridgeRuntime {
                     .iter()
                     .find(|delay| Some(&delay.zone_id) == zone_id)
                     .map_or(0, |delay| delay.delay_ms);
-                stream
-                    .live_stream
-                    .set_playback_plan(common_sample, Duration::from_millis(delay));
+                stream_delays.insert(stream.session_id, Duration::from_millis(delay));
             } else if coordinator.is_none()
                 && (rooms.len() > 1
                     || self.config.sync.default_offset_ms != 0
@@ -1651,18 +1653,25 @@ impl BridgeRuntime {
                     "MP3 does not support sample-aligned WAV offsets; group startup is best effort");
             }
         }
+        stream_delays
     }
 
     async fn play_prepared_downstreams(&mut self, prepared: Vec<PreparedDownstream>) {
         let mut members = self.plan_native_groups(&prepared);
-        self.apply_sync_anchors(&prepared, &members);
+        let delays = self.sync_delays(&prepared, &members);
+        let cutoff = Instant::now() + SYNC_START_LEAD;
         // Every room that plays its own stream waits for the joins, so the whole
         // cohort starts together.
         let joins = (!members.is_empty()).then(|| GroupJoins::new(members.len()));
         for stream in prepared {
             let zone_id = stream.zone_id.clone();
+            let delay = delays.get(&stream.session_id).copied();
             let command = match (members.remove(&stream.session_id), &stream.renderer, &joins) {
                 (Some(member), Renderer::Sonos { client, .. }, Some(joins)) => {
+                    // A member's own stream plays only if its join fails.
+                    if let Some(delay) = delay {
+                        stream.live_stream.set_playback_plan(cutoff, delay);
+                    }
                     TransportCommand::Join {
                         client: client.clone(),
                         stream: Box::new(stream),
@@ -1670,8 +1679,19 @@ impl BridgeRuntime {
                         joins: joins.clone(),
                     }
                 }
-                (_, _, Some(joins)) => TransportCommand::PlayGroup(Box::new(stream), joins.clone()),
-                _ => TransportCommand::Play(Box::new(stream)),
+                // The worker sets the plan when the joins finish, so a renderer
+                // that is already subscribed does not buffer audio during the wait.
+                (_, _, Some(joins)) => TransportCommand::PlayGroup {
+                    stream: Box::new(stream),
+                    joins: joins.clone(),
+                    delay,
+                },
+                _ => {
+                    if let Some(delay) = delay {
+                        stream.live_stream.set_playback_plan(cutoff, delay);
+                    }
+                    TransportCommand::Play(Box::new(stream))
+                }
             };
             if let Some(worker) = self.worker(&zone_id) {
                 worker.command(command);
@@ -2528,7 +2548,7 @@ mod tests {
     }
 
     #[test]
-    fn wav_streams_receive_compensated_anchors() {
+    fn wav_streams_get_sync_delays() {
         let mut runtime = runtime();
         runtime.config.stream.codec = "wav".to_owned();
         runtime
@@ -2539,9 +2559,9 @@ mod tests {
         let session_id = SessionId::new();
         let prepared = prepared_downstream(session_id, zone_id(), StreamCodec::Wav);
 
-        runtime.apply_sync_anchors(std::slice::from_ref(&prepared), &HashMap::new());
+        let delays = runtime.sync_delays(std::slice::from_ref(&prepared), &HashMap::new());
 
-        assert!(prepared.live_stream.timing().playback_anchor_at.is_some());
+        assert!(delays.contains_key(&session_id));
     }
 
     #[test]
@@ -2584,14 +2604,14 @@ mod tests {
     }
 
     #[test]
-    fn mp3_streams_do_not_use_sample_anchors() {
+    fn mp3_streams_get_no_sync_delays() {
         let runtime = runtime();
         let session_id = SessionId::new();
         let prepared = prepared_downstream(session_id, zone_id(), StreamCodec::Mp3);
 
-        runtime.apply_sync_anchors(std::slice::from_ref(&prepared), &HashMap::new());
+        let delays = runtime.sync_delays(std::slice::from_ref(&prepared), &HashMap::new());
 
-        assert!(prepared.live_stream.timing().playback_anchor_at.is_none());
+        assert!(delays.is_empty());
     }
 
     #[tokio::test]

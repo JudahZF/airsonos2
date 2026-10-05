@@ -1,6 +1,6 @@
 use super::*;
 use crate::renderer::RendererError;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::watch;
 
 #[derive(Clone)]
@@ -8,8 +8,12 @@ pub(super) enum TransportCommand {
     Prepare(Box<StreamPrepare>),
     Play(Box<PreparedDownstream>),
     /// Play once the cohort's group members have joined, so the whole cohort
-    /// starts together.
-    PlayGroup(Box<PreparedDownstream>, GroupJoins),
+    /// starts together. A WAV stream gets its playback plan with `delay` then.
+    PlayGroup {
+        stream: Box<PreparedDownstream>,
+        joins: GroupJoins,
+        delay: Option<Duration>,
+    },
     /// Join the native Sonos group of the player with RINCON id `coordinator`.
     Join {
         stream: Box<PreparedDownstream>,
@@ -27,23 +31,36 @@ pub(super) enum TransportCommand {
 /// Members of a cohort that still have to join a native Sonos group. A member
 /// that never runs its join leaves the cohort to wait for the timeout.
 #[derive(Clone, Debug)]
-pub(super) struct GroupJoins(Arc<watch::Sender<usize>>);
+pub(super) struct GroupJoins(Arc<GroupJoinState>);
+
+#[derive(Debug)]
+struct GroupJoinState {
+    pending: watch::Sender<usize>,
+    released: OnceLock<Instant>,
+}
 
 impl GroupJoins {
     const WAIT: Duration = Duration::from_secs(2);
 
     pub(super) fn new(members: usize) -> Self {
-        Self(Arc::new(watch::Sender::new(members)))
+        Self(Arc::new(GroupJoinState {
+            pending: watch::Sender::new(members),
+            released: OnceLock::new(),
+        }))
     }
 
     fn joined(&self) {
         self.0
+            .pending
             .send_modify(|pending| *pending = pending.saturating_sub(1));
     }
 
-    async fn wait(&self) {
-        let mut pending = self.0.subscribe();
+    /// Waits for the joins and returns the cohort's release time. The first
+    /// room to finish waiting fixes it, so every room shares one start sample.
+    async fn wait(&self) -> Instant {
+        let mut pending = self.0.pending.subscribe();
         let _ = tokio::time::timeout(Self::WAIT, pending.wait_for(|pending| *pending == 0)).await;
+        *self.0.released.get_or_init(Instant::now)
     }
 }
 
@@ -79,6 +96,11 @@ impl ZoneWorker {
                         prepare(*start, &commands, subscriber_wait, prebuffer).await;
                     }
                     Some(TransportCommand::Play(stream)) => {
+                        // A fallback after an uncertain join must leave the group,
+                        // because members reject Play.
+                        if joined {
+                            joined = leave_group(&transport_renderer, &stream.zone_id).await;
+                        }
                         let result = stream
                             .renderer
                             .play(&stream.live_stream.session.local_url)
@@ -87,11 +109,20 @@ impl ZoneWorker {
                         joined &= result.is_err();
                         report_start(&result_tx, &stream, start_outcome(&stream, "Play", result));
                     }
-                    Some(TransportCommand::PlayGroup(stream, joins)) => {
+                    Some(TransportCommand::PlayGroup {
+                        stream,
+                        joins,
+                        delay,
+                    }) => {
                         let mut changed = commands.clone();
-                        tokio::select! {
+                        let released = tokio::select! {
                             _ = changed.changed() => continue,
-                            _ = joins.wait() => {}
+                            released = joins.wait() => released,
+                        };
+                        if let Some(delay) = delay {
+                            stream
+                                .live_stream
+                                .set_playback_plan(released + SYNC_START_LEAD, delay);
                         }
                         let result = stream
                             .renderer

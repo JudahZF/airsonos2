@@ -14,7 +14,8 @@ room plays its own stream. The other rooms join it with `x-rincon:` and Sonos
 keeps them sample-synced, including drift. The sender is the IP address of the
 connection that set up the stream. Rooms that play their own stream, including
 Home Assistant players in the cohort, wait until the joins finish (at most 2 s),
-so the cohort starts together. When a sender already plays on a Sonos room, a
+so the cohort starts together. Their shared WAV start sample is set then, so a
+renderer that is already subscribed does not buffer audio during the wait. When a sender already plays on a Sonos room, a
 room that starts later joins that room. The group shows in the Sonos app.
 
 A member leaves the group when its session stops, pauses or restarts. When the
