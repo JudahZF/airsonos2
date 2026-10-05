@@ -380,6 +380,9 @@ pub struct SyncConfig {
     pub multi_select_window_ms: u64,
     pub start_deadline_ms: u64,
     pub play_command_spread_warn_ms: u64,
+    /// Group Sonos rooms that play one AirPlay sender's audio as a native Sonos
+    /// group. Sonos then keeps them in sync and the offsets apply per group.
+    pub native_sonos_groups: bool,
     pub zone_offsets_ms: std::collections::BTreeMap<String, i64>,
 }
 
@@ -390,6 +393,7 @@ impl Default for SyncConfig {
             multi_select_window_ms: 750,
             start_deadline_ms: 2_500,
             play_command_spread_warn_ms: 80,
+            native_sonos_groups: true,
             zone_offsets_ms: std::collections::BTreeMap::new(),
         }
     }

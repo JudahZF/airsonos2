@@ -26,6 +26,8 @@ pub enum AirPlayEvent {
         session_id: SessionId,
         zone_id: ZoneId,
         format: PcmFormat,
+        /// Address of the AirPlay sender. Sessions from one sender play the same audio.
+        sender: Option<IpAddr>,
     },
     Pcm {
         session_id: SessionId,
@@ -353,6 +355,14 @@ struct BridgeAudioHandler {
 
 impl AudioHandler for BridgeAudioHandler {
     fn audio_init(&self, format: AudioFormat) -> Box<dyn AudioSession> {
+        self.audio_init_with_sender(format, None)
+    }
+
+    fn audio_init_with_sender(
+        &self,
+        format: AudioFormat,
+        sender: Option<IpAddr>,
+    ) -> Box<dyn AudioSession> {
         let session_id = SessionId::new();
         let pcm_format = PcmFormat::from(format);
         debug!(
@@ -370,6 +380,7 @@ impl AudioHandler for BridgeAudioHandler {
             session_id,
             zone_id: self.zone_id.clone(),
             format: pcm_format,
+            sender,
         });
 
         Box::new(BridgeAudioSession {

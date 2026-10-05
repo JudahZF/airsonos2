@@ -691,6 +691,7 @@ mod controller_acceptance {
                 .try_send(PlayoutCommand::SetRate {
                     anchor_rtp: 0,
                     anchor_time_ns: 0,
+                    timeline_id: 0,
                     rate: 0,
                 })
                 .unwrap();

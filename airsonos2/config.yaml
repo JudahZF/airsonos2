@@ -43,6 +43,7 @@ options:
   multi_select_window_ms: 750
   start_deadline_ms: 2500
   play_command_spread_warn_ms: 80
+  native_sonos_groups: true
   zone_offsets: []
 schema:
   log_level: list(trace|debug|info|warn|error)
@@ -76,6 +77,7 @@ schema:
   multi_select_window_ms: int(0,60000)
   start_deadline_ms: int(0,60000)
   play_command_spread_warn_ms: int(0,)
+  native_sonos_groups: bool
   zone_offsets:
     - zone: str(1,)
       offset_ms: int(-10000,10000)

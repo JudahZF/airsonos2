@@ -30,8 +30,11 @@ use url::Url;
 mod bridge;
 mod home_assistant;
 mod renderer;
-use bridge::{TransportCommand, ZoneWorker};
+use bridge::{GroupJoins, TransportCommand, ZoneWorker};
 use renderer::Renderer;
+
+/// Lead from a cohort's release to its shared WAV start sample.
+const SYNC_START_LEAD: Duration = Duration::from_millis(120);
 
 /// How long to keep a bridge session alive after the buffered audio stream
 /// closes while AirPlay playback is paused.
@@ -793,6 +796,8 @@ struct BridgeRuntime {
     cohort_wake_tx: mpsc::UnboundedSender<()>,
     cohort_wake_rx: mpsc::UnboundedReceiver<()>,
     sync_cohort: Option<SyncCohort>,
+    /// Native Sonos groups: coordinator session to member sessions.
+    native_groups: HashMap<SessionId, Vec<SessionId>>,
     tasks: tokio::task::JoinSet<()>,
 }
 
@@ -806,6 +811,11 @@ enum ObservedPlayback {
 struct SessionRuntime {
     zone_id: ZoneId,
     format: PcmFormat,
+    /// AirPlay sender. Sessions from one sender play the same audio.
+    sender: Option<IpAddr>,
+    /// WAV delay from this session's last cohort. A room that joins this one
+    /// later and falls back to its own stream reuses it.
+    sync_delay: Duration,
     generation: u64,
     playback_epoch: u64,
     desired_playback: bool,
@@ -826,6 +836,8 @@ impl SessionRuntime {
         Self {
             zone_id,
             format,
+            sender: None,
+            sync_delay: Duration::ZERO,
             generation: 0,
             playback_epoch: 0,
             desired_playback: true,
@@ -865,6 +877,8 @@ struct StreamPrepare {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DownstreamStartOutcome {
     Started,
+    /// The room joined a native Sonos group instead of playing its own stream.
+    Joined,
     Stopped,
     StopUnknown,
     Unknown,
@@ -889,6 +903,12 @@ struct SyncCohort {
     prepared: HashMap<SessionId, PreparedDownstream>,
 }
 
+/// A released stream that joins a native Sonos group instead of playing.
+struct NativeMember {
+    coordinator: SessionId,
+    rincon_id: String,
+}
+
 #[derive(Clone, Debug)]
 struct PreparedDownstream {
     session_id: SessionId,
@@ -896,6 +916,9 @@ struct PreparedDownstream {
     generation: u64,
     renderer: Renderer,
     live_stream: LiveStream,
+    /// WAV delay of a native group member's own stream. The stream stays held
+    /// until a failed join falls back to Play.
+    held_delay: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -936,6 +959,7 @@ impl BridgeRuntime {
             cohort_wake_tx,
             cohort_wake_rx,
             sync_cohort: None,
+            native_groups: HashMap::new(),
             tasks: tokio::task::JoinSet::new(),
         }
     }
@@ -975,7 +999,7 @@ impl BridgeRuntime {
                 }
                 result = self.downstream_result_rx.recv() => {
                     let Some(result) = result else { continue };
-                    self.handle_downstream_start_result(result);
+                    self.handle_downstream_start_result(result).await;
                 }
                 retry = self.downstream_retry_rx.recv() => {
                     let Some(retry) = retry else { continue };
@@ -1048,16 +1072,16 @@ impl BridgeRuntime {
         session_id: SessionId,
         zone_id: ZoneId,
         generation: u64,
-    ) {
+    ) -> bool {
         self.cancel_downstream_retry(session_id);
         let Some(session) = self.sessions.get_mut(&session_id) else {
-            return;
+            return false;
         };
         if session.retry_attempts >= 6 {
             // A kept prepared stream may never have played; the next Play must rebuild it.
             session.reset_needed = true;
             error!(%session_id, %zone_id, "downstream retry budget exhausted; session requires a new playback request");
-            return;
+            return false;
         }
         let delay = downstream_retry_delay(session.retry_attempts);
         session.retry_attempts += 1;
@@ -1070,9 +1094,10 @@ impl BridgeRuntime {
                 generation,
             });
         }));
+        true
     }
 
-    fn handle_downstream_start_result(&mut self, result: DownstreamStartResult) {
+    async fn handle_downstream_start_result(&mut self, result: DownstreamStartResult) {
         let Some(session) = self.sessions.get_mut(&result.session_id) else {
             return;
         };
@@ -1089,11 +1114,16 @@ impl BridgeRuntime {
         }
         match result.outcome {
             DownstreamStartOutcome::Stopped | DownstreamStartOutcome::StopUnknown => {}
-            DownstreamStartOutcome::Started => {
+            outcome @ (DownstreamStartOutcome::Started | DownstreamStartOutcome::Joined) => {
                 session.observed = ObservedPlayback::Playing;
                 session.reset_needed = false;
                 session.retry_attempts = 0;
                 self.cancel_downstream_retry(result.session_id);
+                // A room that plays its own stream, such as after a failed join,
+                // is in no native group.
+                if outcome == DownstreamStartOutcome::Started {
+                    self.forget_native_member(result.session_id);
+                }
             }
             DownstreamStartOutcome::PermanentFailure => {
                 session.observed = ObservedPlayback::Unknown;
@@ -1101,15 +1131,26 @@ impl BridgeRuntime {
                 session.retry_attempts = 6;
                 error!(session_id = %result.session_id, "permanent renderer error; automatic retries stopped");
                 self.cancel_downstream_retry(result.session_id);
+                // Members of a coordinator that cannot play would stay silent.
+                self.leave_native_group(result.session_id).await;
             }
-            _ => {
+            outcome => {
                 session.observed = ObservedPlayback::Unknown;
                 session.reset_needed = session.prepared.is_none();
-                self.schedule_downstream_retry(
+                // A failed join leaves the room on its own stream. A timed-out
+                // join may have taken effect, so it stays a member.
+                if outcome == DownstreamStartOutcome::Failed {
+                    self.forget_native_member(result.session_id);
+                }
+                // Like a permanent failure, a spent retry budget leaves the
+                // members of this coordinator silent.
+                if !self.schedule_downstream_retry(
                     result.session_id,
                     result.zone_id,
                     result.generation,
-                );
+                ) {
+                    self.leave_native_group(result.session_id).await;
+                }
             }
         }
     }
@@ -1124,7 +1165,13 @@ impl BridgeRuntime {
         if let Some(task) = session.retry_task.take() {
             task.abort();
         }
-        if let Some(prepared) = session.prepared.clone() {
+        if let Some(prepared) = session.prepared.as_mut() {
+            if let Some(delay) = prepared.held_delay.take() {
+                prepared
+                    .live_stream
+                    .set_playback_plan(Instant::now() + SYNC_START_LEAD, delay);
+            }
+            let prepared = prepared.clone();
             if let Some(worker) = self.worker(&retry.zone_id) {
                 worker.command(TransportCommand::Play(Box::new(prepared)));
             }
@@ -1141,7 +1188,11 @@ impl BridgeRuntime {
                 session_id,
                 zone_id,
                 format,
-            } => self.start_session(session_id, zone_id, format).await,
+                sender,
+            } => {
+                self.start_session(session_id, zone_id, format, sender)
+                    .await
+            }
             AirPlayEvent::Pcm {
                 session_id, frames, ..
             } => {
@@ -1450,9 +1501,131 @@ impl BridgeRuntime {
         }
     }
 
-    fn apply_sync_anchors(&self, prepared: &[PreparedDownstream]) {
+    /// Groups the Sonos rooms in `prepared` that play one sender's audio, so Sonos
+    /// keeps them in sync. When the sender already plays on a Sonos room, the new
+    /// rooms join it, so a room added later joins the rooms that already play.
+    fn plan_native_groups(
+        &mut self,
+        prepared: &[PreparedDownstream],
+    ) -> HashMap<SessionId, NativeMember> {
+        let mut roles = HashMap::new();
+        if !self.config.sync.native_sonos_groups {
+            return roles;
+        }
+        let mut by_sender: Vec<(IpAddr, Vec<SessionId>)> = Vec::new();
+        for stream in prepared {
+            if !matches!(stream.renderer, Renderer::Sonos { .. }) {
+                continue;
+            }
+            let Some(sender) = self
+                .sessions
+                .get(&stream.session_id)
+                .and_then(|session| session.sender)
+            else {
+                continue;
+            };
+            match by_sender.iter_mut().find(|(other, _)| *other == sender) {
+                Some((_, sessions)) => sessions.push(stream.session_id),
+                None => by_sender.push((sender, vec![stream.session_id])),
+            }
+        }
+        for (sender, mut members) in by_sender {
+            let coordinator = match self.playing_sonos_session(sender) {
+                Some(coordinator) => coordinator,
+                None if members.len() > 1 => members.remove(0),
+                None => continue,
+            };
+            let Some(Renderer::Sonos { zone, .. }) = self
+                .sessions
+                .get(&coordinator)
+                .and_then(|session| self.renderers.get(&session.zone_id))
+            else {
+                continue;
+            };
+            let rincon_id = zone.rincon_id.clone();
+            info!(%coordinator, members = members.len(), "grouping Sonos rooms natively");
+            for member in &members {
+                roles.insert(
+                    *member,
+                    NativeMember {
+                        coordinator,
+                        rincon_id: rincon_id.clone(),
+                    },
+                );
+            }
+            self.native_groups
+                .entry(coordinator)
+                .or_default()
+                .extend(members);
+        }
+        roles
+    }
+
+    /// A sender's Sonos room that plays, or coordinates a group that is still
+    /// starting, and is not a group member. An existing group coordinator wins.
+    fn playing_sonos_session(&self, sender: IpAddr) -> Option<SessionId> {
+        self.sessions
+            .iter()
+            .filter(|(id, session)| {
+                session.sender == Some(sender)
+                    && session.desired_playback
+                    && (session.observed == ObservedPlayback::Playing
+                        || self.native_groups.contains_key(id))
+                    && matches!(
+                        self.renderers.get(&session.zone_id),
+                        Some(Renderer::Sonos { .. })
+                    )
+                    && !self
+                        .native_groups
+                        .values()
+                        .flatten()
+                        .any(|member| member == *id)
+            })
+            .min_by_key(|(id, _)| !self.native_groups.contains_key(id))
+            .map(|(id, _)| *id)
+    }
+
+    fn forget_native_member(&mut self, session_id: SessionId) {
+        for members in self.native_groups.values_mut() {
+            members.retain(|member| *member != session_id);
+        }
+    }
+
+    /// Removes `session_id` from native Sonos groups. The members of a group it
+    /// coordinated go silent with it, so they restart on their own streams.
+    async fn leave_native_group(&mut self, session_id: SessionId) {
+        self.forget_native_member(session_id);
+        for member in self.native_groups.remove(&session_id).unwrap_or_default() {
+            let Some(session) = self
+                .sessions
+                .get(&member)
+                .filter(|session| session.desired_playback)
+            else {
+                continue;
+            };
+            let zone_id = session.zone_id.clone();
+            if let Err(error) = Box::pin(self.restart_downstream_for_play(member, zone_id)).await {
+                warn!(%member, "restarting a native Sonos group member failed: {error:#}");
+            }
+        }
+    }
+
+    /// Output delays of the WAV streams in `prepared`.
+    fn sync_delays(
+        &self,
+        prepared: &[PreparedDownstream],
+        members: &HashMap<SessionId, NativeMember>,
+    ) -> HashMap<SessionId, Duration> {
+        let coordinator_of = |stream: &PreparedDownstream| {
+            members
+                .get(&stream.session_id)
+                .map(|member| member.coordinator)
+        };
+        // Sonos plays members in step with their coordinator, so offsets apply
+        // only to the rooms that play their own stream.
         let rooms = prepared
             .iter()
+            .filter(|stream| coordinator_of(stream).is_none())
             .map(|stream| (stream.zone_id.clone(), stream.renderer.name().to_owned()))
             .collect::<Vec<_>>();
         let delays = configured_delays(
@@ -1460,31 +1633,87 @@ impl BridgeRuntime {
             &self.config.sync.zone_offsets_ms,
             self.config.sync.default_offset_ms,
         );
-        let common_sample = Instant::now() + Duration::from_millis(120);
+        let cohort_delay = |zone_id: &ZoneId| {
+            delays
+                .iter()
+                .find(|delay| &delay.zone_id == zone_id)
+                .map(|delay| Duration::from_millis(delay.delay_ms))
+        };
+        let mut stream_delays = HashMap::new();
         for stream in prepared {
+            let coordinator = coordinator_of(stream);
             if stream.live_stream.session.codec == StreamCodec::Wav {
-                let delay = delays
-                    .iter()
-                    .find(|delay| delay.zone_id == stream.zone_id)
-                    .map_or(0, |delay| delay.delay_ms);
-                stream
-                    .live_stream
-                    .set_playback_plan(common_sample, common_sample + Duration::from_millis(delay));
-            } else if prepared.len() > 1
-                || self.config.sync.default_offset_ms != 0
-                || !self.config.sync.zone_offsets_ms.is_empty()
+                // A member's own stream plays only if its join fails. It then keeps
+                // the coordinator's delay: from this cohort, or the delay that an
+                // already playing coordinator uses.
+                let delay = match coordinator {
+                    Some(coordinator) => self.sessions.get(&coordinator).map(|session| {
+                        cohort_delay(&session.zone_id).unwrap_or(session.sync_delay)
+                    }),
+                    None => cohort_delay(&stream.zone_id),
+                };
+                stream_delays.insert(stream.session_id, delay.unwrap_or_default());
+            } else if coordinator.is_none()
+                && (rooms.len() > 1
+                    || self.config.sync.default_offset_ms != 0
+                    || !self.config.sync.zone_offsets_ms.is_empty())
             {
                 warn!(session_id = %stream.session_id, codec = ?stream.live_stream.session.codec,
                     "MP3 does not support sample-aligned WAV offsets; group startup is best effort");
             }
         }
+        stream_delays
     }
 
     async fn play_prepared_downstreams(&mut self, prepared: Vec<PreparedDownstream>) {
-        self.apply_sync_anchors(&prepared);
+        let mut members = self.plan_native_groups(&prepared);
+        let delays = self.sync_delays(&prepared, &members);
+        let cutoff = Instant::now() + SYNC_START_LEAD;
+        // Every room that plays its own stream waits for the joins, so the whole
+        // cohort starts together.
+        let joins = (!members.is_empty()).then(|| GroupJoins::new(members.len()));
         for stream in prepared {
-            if let Some(worker) = self.worker(&stream.zone_id) {
-                worker.command(TransportCommand::Play(Box::new(stream)));
+            let zone_id = stream.zone_id.clone();
+            let delay = delays.get(&stream.session_id).copied();
+            if let (Some(delay), Some(session)) = (delay, self.sessions.get_mut(&stream.session_id))
+            {
+                session.sync_delay = delay;
+            }
+            let command = match (members.remove(&stream.session_id), &stream.renderer, &joins) {
+                (Some(member), Renderer::Sonos { client, .. }, Some(joins)) => {
+                    // A member's own stream plays only if its join fails. Holding a
+                    // WAV stream until then keeps a subscribed Sonos from buffering
+                    // it. MP3 has no playback plan, so it is not held.
+                    if let Some(prepared) = self
+                        .sessions
+                        .get_mut(&stream.session_id)
+                        .and_then(|session| session.prepared.as_mut())
+                    {
+                        prepared.held_delay = delay;
+                    }
+                    TransportCommand::Join {
+                        client: client.clone(),
+                        stream: Box::new(stream),
+                        coordinator: member.rincon_id,
+                        joins: joins.clone(),
+                    }
+                }
+                // The worker sets the plan when the joins finish, so a renderer
+                // that is already subscribed does not buffer audio during the wait.
+                (_, _, Some(joins)) => TransportCommand::PlayGroup {
+                    stream: Box::new(stream),
+                    joins: joins.clone(),
+                    delay,
+                },
+                _ => {
+                    if let Some(delay) = delay {
+                        stream.live_stream.set_playback_plan(cutoff, delay);
+                    }
+                    TransportCommand::Play(Box::new(stream))
+                }
+            };
+            if let Some(worker) = self.worker(&zone_id) {
+                worker.command(command);
             }
         }
     }
@@ -1494,6 +1723,7 @@ impl BridgeRuntime {
         session_id: SessionId,
         zone_id: ZoneId,
         format: PcmFormat,
+        sender: Option<IpAddr>,
     ) -> anyhow::Result<()> {
         let old_sessions: Vec<_> = self
             .sessions
@@ -1507,8 +1737,9 @@ impl BridgeRuntime {
             self.renderers.contains_key(&zone_id),
             "no renderer for zone {zone_id}"
         );
-        self.sessions
-            .insert(session_id, SessionRuntime::new(zone_id.clone(), format));
+        let mut session = SessionRuntime::new(zone_id.clone(), format);
+        session.sender = sender;
+        self.sessions.insert(session_id, session);
         self.restart_downstream_for_play(session_id, zone_id).await
     }
 
@@ -1528,6 +1759,7 @@ impl BridgeRuntime {
         zone_id: ZoneId,
     ) -> anyhow::Result<()> {
         self.cancel_downstream_retry(session_id);
+        self.leave_native_group(session_id).await;
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return Ok(());
         };
@@ -1616,6 +1848,7 @@ impl BridgeRuntime {
             session.observed = ObservedPlayback::Unknown;
             session.prepared = None;
             self.cancel_downstream_retry(session_id);
+            self.leave_native_group(session_id).await;
             let generation = self.next_downstream_generation(session_id);
             if let Some(worker) = self.worker(&zone_id) {
                 worker.command(TransportCommand::Stop {
@@ -1640,6 +1873,7 @@ impl BridgeRuntime {
         let zone_id = fallback_zone_id.unwrap_or_else(|| session.zone_id.clone());
         self.registry.remove(&session_id).await;
         self.retire_encoder(session.encoder.take());
+        self.leave_native_group(session_id).await;
         if let Some(worker) = self.worker(&zone_id) {
             worker.command(TransportCommand::Stop {
                 session_id,
@@ -1827,6 +2061,7 @@ mod tests {
                     .expect("client"),
             ),
             live_stream: live_stream_for(session_id, zone_id, codec),
+            held_delay: None,
         }
     }
 
@@ -2067,7 +2302,7 @@ mod tests {
         );
         let session_id = SessionId::new();
         runtime
-            .start_session(session_id, id.clone(), format())
+            .start_session(session_id, id.clone(), format(), None)
             .await
             .unwrap();
         assert!(runtime.registry.is_empty().await);
@@ -2107,12 +2342,14 @@ mod tests {
         session.generation = 7;
         session.prepared = Some(prepared);
         runtime.sessions.insert(session_id, session);
-        runtime.handle_downstream_start_result(DownstreamStartResult {
-            session_id,
-            zone_id: id.clone(),
-            generation: 7,
-            outcome: DownstreamStartOutcome::Unknown,
-        });
+        runtime
+            .handle_downstream_start_result(DownstreamStartResult {
+                session_id,
+                zone_id: id.clone(),
+                generation: 7,
+                outcome: DownstreamStartOutcome::Unknown,
+            })
+            .await;
         assert_eq!(
             runtime.sessions[&session_id].observed,
             ObservedPlayback::Unknown
@@ -2331,7 +2568,7 @@ mod tests {
     }
 
     #[test]
-    fn wav_streams_receive_compensated_anchors() {
+    fn wav_streams_get_sync_delays() {
         let mut runtime = runtime();
         runtime.config.stream.codec = "wav".to_owned();
         runtime
@@ -2342,20 +2579,59 @@ mod tests {
         let session_id = SessionId::new();
         let prepared = prepared_downstream(session_id, zone_id(), StreamCodec::Wav);
 
-        runtime.apply_sync_anchors(std::slice::from_ref(&prepared));
+        let delays = runtime.sync_delays(std::slice::from_ref(&prepared), &HashMap::new());
 
-        assert!(prepared.live_stream.timing().playback_anchor_at.is_some());
+        assert!(delays.contains_key(&session_id));
     }
 
     #[test]
-    fn mp3_streams_do_not_use_sample_anchors() {
+    fn sonos_rooms_of_one_sender_form_one_native_group() {
+        let mut runtime = runtime();
+        let phone: IpAddr = "192.168.1.20".parse().unwrap();
+        let laptop: IpAddr = "192.168.1.30".parse().unwrap();
+        let mut start = |room: &str, sender| {
+            let (id, zone) = (SessionId::new(), ZoneId::new(room));
+            let prepared = prepared_downstream(id, zone.clone(), StreamCodec::Wav);
+            runtime
+                .renderers
+                .insert(zone.clone(), prepared.renderer.clone());
+            let mut session = SessionRuntime::new(zone, format());
+            session.sender = Some(sender);
+            runtime.sessions.insert(id, session);
+            prepared
+        };
+        let cohort = [
+            start("RINCON_A", phone),
+            start("RINCON_B", phone),
+            start("RINCON_C", laptop),
+        ];
+        let late = start("RINCON_D", phone);
+
+        let roles = runtime.plan_native_groups(&cohort);
+        let coordinator = cohort[0].session_id;
+        assert!(!roles.contains_key(&coordinator));
+        assert_eq!(roles[&cohort[1].session_id].rincon_id, "RINCON_A");
+        assert!(!roles.contains_key(&cohort[2].session_id));
+
+        // A room added later joins the group that already plays.
+        runtime.sessions.get_mut(&coordinator).unwrap().observed = ObservedPlayback::Playing;
+        let roles = runtime.plan_native_groups(std::slice::from_ref(&late));
+        assert_eq!(roles[&late.session_id].coordinator, coordinator);
+        assert_eq!(
+            runtime.native_groups[&coordinator],
+            [cohort[1].session_id, late.session_id]
+        );
+    }
+
+    #[test]
+    fn mp3_streams_get_no_sync_delays() {
         let runtime = runtime();
         let session_id = SessionId::new();
         let prepared = prepared_downstream(session_id, zone_id(), StreamCodec::Mp3);
 
-        runtime.apply_sync_anchors(std::slice::from_ref(&prepared));
+        let delays = runtime.sync_delays(std::slice::from_ref(&prepared), &HashMap::new());
 
-        assert!(prepared.live_stream.timing().playback_anchor_at.is_none());
+        assert!(delays.is_empty());
     }
 
     #[tokio::test]
@@ -2380,12 +2656,14 @@ mod tests {
             .unwrap()
             .retry_attempts = 2;
 
-        runtime.handle_downstream_start_result(DownstreamStartResult {
-            session_id,
-            zone_id,
-            generation: 3,
-            outcome: DownstreamStartOutcome::Started,
-        });
+        runtime
+            .handle_downstream_start_result(DownstreamStartResult {
+                session_id,
+                zone_id,
+                generation: 3,
+                outcome: DownstreamStartOutcome::Started,
+            })
+            .await;
 
         assert!(!runtime.sessions[&session_id].reset_needed);
         assert!(runtime.sessions[&session_id].retry_attempts == 0);
@@ -2407,12 +2685,14 @@ mod tests {
             .unwrap()
             .desired_playback = true;
 
-        runtime.handle_downstream_start_result(DownstreamStartResult {
-            session_id,
-            zone_id,
-            generation: 4,
-            outcome: DownstreamStartOutcome::Failed,
-        });
+        runtime
+            .handle_downstream_start_result(DownstreamStartResult {
+                session_id,
+                zone_id,
+                generation: 4,
+                outcome: DownstreamStartOutcome::Failed,
+            })
+            .await;
 
         assert!(runtime.sessions[&session_id].reset_needed);
         assert!(runtime.sessions[&session_id].retry_task.is_some());
@@ -2436,12 +2716,14 @@ mod tests {
             .unwrap()
             .desired_playback = true;
 
-        runtime.handle_downstream_start_result(DownstreamStartResult {
-            session_id,
-            zone_id,
-            generation: 4,
-            outcome: DownstreamStartOutcome::Started,
-        });
+        runtime
+            .handle_downstream_start_result(DownstreamStartResult {
+                session_id,
+                zone_id,
+                generation: 4,
+                outcome: DownstreamStartOutcome::Started,
+            })
+            .await;
 
         assert!(runtime.sessions[&session_id].reset_needed);
     }
@@ -2553,12 +2835,14 @@ mod tests {
                 StreamCodec::Mp3,
             ));
             runtime.sessions.insert(session_id, session);
-            runtime.handle_downstream_start_result(DownstreamStartResult {
-                session_id,
-                zone_id: zone_id.clone(),
-                generation: 3,
-                outcome,
-            });
+            runtime
+                .handle_downstream_start_result(DownstreamStartResult {
+                    session_id,
+                    zone_id: zone_id.clone(),
+                    generation: 3,
+                    outcome,
+                })
+                .await;
             assert!(runtime.sessions[&session_id].retry_task.is_none());
 
             runtime

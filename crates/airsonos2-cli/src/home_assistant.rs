@@ -45,6 +45,7 @@ pub(crate) struct HomeAssistantOptions {
     pub(crate) multi_select_window_ms: u64,
     pub(crate) start_deadline_ms: u64,
     pub(crate) play_command_spread_warn_ms: u64,
+    pub(crate) native_sonos_groups: bool,
     pub(crate) zone_offsets: Vec<HomeAssistantZoneOffset>,
 }
 
@@ -90,6 +91,7 @@ impl Default for HomeAssistantOptions {
             multi_select_window_ms: config.sync.multi_select_window_ms,
             start_deadline_ms: config.sync.start_deadline_ms,
             play_command_spread_warn_ms: config.sync.play_command_spread_warn_ms,
+            native_sonos_groups: config.sync.native_sonos_groups,
             zone_offsets: config
                 .sync
                 .zone_offsets_ms
@@ -144,6 +146,7 @@ impl HomeAssistantOptions {
         config.sync.multi_select_window_ms = self.multi_select_window_ms;
         config.sync.start_deadline_ms = self.start_deadline_ms;
         config.sync.play_command_spread_warn_ms = self.play_command_spread_warn_ms;
+        config.sync.native_sonos_groups = self.native_sonos_groups;
         config.sync.zone_offsets_ms = zone_offsets_map(&self.zone_offsets)?;
 
         config.validate()?;

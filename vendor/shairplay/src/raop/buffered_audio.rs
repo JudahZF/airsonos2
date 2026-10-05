@@ -10,7 +10,8 @@
 //! - **Delivery** (std::thread): timed playout using anchor-based scheduling
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
@@ -42,6 +43,8 @@ pub enum PlayoutCommand {
         anchor_rtp: u32,
         /// Network time at the anchor point (ns).
         anchor_time_ns: u64,
+        /// Sender PTP timeline of `anchor_time_ns`. Zero when unknown.
+        timeline_id: u64,
         /// Playback rate (1 = playing, 0 = paused).
         rate: u32,
     },
@@ -61,13 +64,59 @@ struct BufferedFrame {
     samples: Vec<f32>,
 }
 
+/// Local monotonic time of one sender's PTP timeline. All sessions from one
+/// sender share an origin, so one network time maps to one local instant in
+/// every session, although their SETRATEANCHORTI requests arrive at different
+/// times. The first session picks the origin. It ends with the last session.
+#[derive(Debug)]
+struct TimelineOrigin {
+    network_ns: u64,
+    local: Instant,
+}
+
+impl TimelineOrigin {
+    fn local_time(&self, network_ns: u64) -> Option<Instant> {
+        offset_instant(self.local, network_ns.wrapping_sub(self.network_ns) as i64)
+    }
+}
+
+static TIMELINES: Mutex<BTreeMap<u64, Weak<TimelineOrigin>>> = Mutex::new(BTreeMap::new());
+
+fn shared_origin(timeline_id: u64, proposed: TimelineOrigin) -> Arc<TimelineOrigin> {
+    let mut timelines = TIMELINES.lock().unwrap();
+    timelines.retain(|_, origin| origin.strong_count() > 0);
+    if let Some(origin) = timelines.get(&timeline_id).and_then(Weak::upgrade) {
+        return origin;
+    }
+    let origin = Arc::new(proposed);
+    timelines.insert(timeline_id, Arc::downgrade(&origin));
+    origin
+}
+
+fn offset_instant(at: Instant, nanos: i64) -> Option<Instant> {
+    let offset = Duration::from_nanos(nanos.unsigned_abs());
+    if nanos >= 0 {
+        at.checked_add(offset)
+    } else {
+        at.checked_sub(offset)
+    }
+}
+
+fn frames_to_nanos(frames: i32, sample_rate: u32) -> i64 {
+    i64::from(frames) * 1_000_000_000 / i64::from(sample_rate)
+}
+
+/// A mapped start further than this from now means the timeline is unusable.
+const MAX_TIMELINE_SKEW: Duration = Duration::from_secs(2);
+
 struct PlayoutState {
     buffer: BTreeMap<u32, BufferedFrame>, // source RTP timestamp → decoded packet
     epoch: u64,
     in_flight_samples: usize,
     flush_range: Option<(u16, u16)>,
     anchor_rtp: u32,
-    anchor_local: std::time::Instant,
+    anchor_local: Instant,
+    timeline: Option<(u64, Arc<TimelineOrigin>)>,
     rate: u32,
     sample_rate: u32,
     source_sample_rate: u32,
@@ -87,6 +136,94 @@ impl PlayoutState {
         self.flush_range = Some((from, until));
         self.buffer
             .retain(|_, frame| !sequence_in_range(frame.sequence, from, until));
+    }
+
+    /// Anchor playout so `anchor_rtp` plays at the sender's network time, mapped
+    /// through the sender's shared timeline origin. Without a usable timeline,
+    /// the earliest buffered frame plays after a 100 ms lead. Frames that are
+    /// already due are dropped.
+    fn start_playout(&mut self, anchor_rtp: u32, network_ns: u64, timeline_id: u64, now: Instant) {
+        let rate = self.source_sample_rate;
+        let first = self
+            .buffer
+            .keys()
+            .copied()
+            .min_by_key(|ts| ts.wrapping_sub(anchor_rtp) as i32);
+        let lead_frames = rate / 10;
+        self.anchor_rtp = first.map_or(anchor_rtp, |first| first.wrapping_sub(lead_frames));
+        self.anchor_local = now;
+        if network_ns != 0 && timeline_id != 0 {
+            self.anchor_to_timeline(anchor_rtp, network_ns, timeline_id, first, now);
+        } else {
+            self.timeline = None;
+        }
+
+        let due = self
+            .anchor_rtp
+            .wrapping_add(source_frames(now.saturating_duration_since(self.anchor_local), rate));
+        let before = self.buffer.len();
+        self.buffer.retain(|&ts, _| ts.wrapping_sub(due) as i32 >= 0);
+        if self.buffer.len() < before {
+            debug!(discarded = before - self.buffer.len(), "Discarded stale frames");
+        }
+    }
+
+    fn anchor_to_timeline(
+        &mut self,
+        anchor_rtp: u32,
+        network_ns: u64,
+        timeline_id: u64,
+        first: Option<u32>,
+        now: Instant,
+    ) {
+        let rate = self.source_sample_rate;
+        let origin = match &self.timeline {
+            Some((id, origin)) if *id == timeline_id => origin.clone(),
+            _ => {
+                // A new origin keeps this session's local start: the network
+                // time of the current anchor maps to now.
+                let lead = frames_to_nanos(self.anchor_rtp.wrapping_sub(anchor_rtp) as i32, rate);
+                shared_origin(
+                    timeline_id,
+                    TimelineOrigin {
+                        network_ns: network_ns.wrapping_add_signed(lead),
+                        local: now,
+                    },
+                )
+            }
+        };
+        self.timeline = Some((timeline_id, origin.clone()));
+        let Some(local) = origin.local_time(network_ns) else {
+            return;
+        };
+        // Keep the anchor at or before now so elapsed time stays exact.
+        let (rtp, local) = match local.checked_duration_since(now) {
+            Some(ahead) => (anchor_rtp.wrapping_sub(source_frames(ahead, rate)), now),
+            None => (anchor_rtp, local),
+        };
+        if let Some(first) = first {
+            let first_due = offset_instant(local, frames_to_nanos(first.wrapping_sub(rtp) as i32, rate));
+            let usable = first_due.is_some_and(|due| {
+                due.checked_duration_since(now)
+                    .or_else(|| now.checked_duration_since(due))
+                    .is_some_and(|skew| skew <= MAX_TIMELINE_SKEW)
+            });
+            if !usable {
+                warn!(
+                    timeline_id,
+                    "Sender timeline is too far from local playout; using a local anchor"
+                );
+                return;
+            }
+        }
+        self.anchor_rtp = rtp;
+        self.anchor_local = local;
+    }
+
+    /// Local monotonic time when the frame at `timestamp` should play.
+    fn presentation_time(&self, timestamp: u32) -> Option<Instant> {
+        let frames = timestamp.wrapping_sub(self.anchor_rtp) as i32;
+        offset_instant(self.anchor_local, frames_to_nanos(frames, self.source_sample_rate))
     }
 }
 
@@ -131,6 +268,7 @@ impl BufferedAudioProcessor {
         shk: [u8; 32],
         output_config: OutputConfig,
         handler: Arc<dyn AudioHandler>,
+        sender: Option<std::net::IpAddr>,
         tasks: &mut tokio::task::JoinSet<()>,
     ) -> (tokio::sync::mpsc::Sender<PlayoutCommand>, tokio::task::AbortHandle) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
@@ -143,7 +281,8 @@ impl BufferedAudioProcessor {
                 in_flight_samples: 0,
                 flush_range: None,
                 anchor_rtp: 0,
-                anchor_local: std::time::Instant::now(),
+                anchor_local: Instant::now(),
+                timeline: None,
                 rate: 0,
                 sample_rate: default_sr,
                 source_sample_rate: 44100,
@@ -160,7 +299,7 @@ impl BufferedAudioProcessor {
         let handler2 = handler.clone();
         let output_config2 = output_config.clone();
         let delivery = std::thread::spawn(move || {
-            delivery_loop(state2, handler2, output_config2);
+            delivery_loop(state2, handler2, output_config2, sender);
         });
 
         // Receiver task
@@ -198,37 +337,19 @@ impl BufferedAudioProcessor {
                 match cmd {
                     PlayoutCommand::SetRate {
                         anchor_rtp,
-                        anchor_time_ns: _,
+                        anchor_time_ns,
+                        timeline_id,
                         rate,
                     } => {
-                        s.anchor_rtp = anchor_rtp;
                         let was_paused = s.rate == 0;
                         s.rate = rate;
                         if rate == 0 {
+                            s.anchor_rtp = anchor_rtp;
                             info!("Playout paused");
                         } else {
-                            // Set anchor so the earliest buffered frame is deliverable
-                            // with a small lead time for smooth playback
-                            if let Some(&first_ts) = s.buffer.keys().min_by_key(|ts| ts.wrapping_sub(anchor_rtp) as i32)
-                            {
-                                let lead_frames = s.source_sample_rate / 10; // 100ms lead
-                                s.anchor_rtp = first_ts.wrapping_sub(lead_frames);
-                            }
-                            s.anchor_local = std::time::Instant::now();
-                            let stale: Vec<u32> = s
-                                .buffer
-                                .keys()
-                                .filter(|&&ts| (s.anchor_rtp.wrapping_sub(ts) as i32) > 0)
-                                .copied()
-                                .collect();
-                            if !stale.is_empty() {
-                                debug!(discarded = stale.len(), "Discarded stale frames");
-                            }
-                            for k in stale {
-                                s.buffer.remove(&k);
-                            }
+                            s.start_playout(anchor_rtp, anchor_time_ns, timeline_id, Instant::now());
                             if was_paused {
-                                info!(anchor_rtp, "Playout started");
+                                info!(anchor_rtp, timeline_id, "Playout started");
                             }
                         }
                         cvar.notify_all();
@@ -398,7 +519,7 @@ async fn receive_loop(
             // rate first, so the new rate only applies to time after the switch.
             // The first detection has no old rate, and SetRate re-anchors on resume.
             if switched && s.rate != 0 {
-                let now = std::time::Instant::now();
+                let now = Instant::now();
                 let elapsed = source_frames(now.saturating_duration_since(s.anchor_local), s.source_sample_rate);
                 s.anchor_rtp = s.anchor_rtp.wrapping_add(elapsed);
                 s.anchor_local = now;
@@ -515,6 +636,7 @@ fn delivery_loop(
     state: Arc<(Mutex<PlayoutState>, Condvar)>,
     handler: Arc<dyn AudioHandler>,
     _output_config: OutputConfig,
+    sender: Option<std::net::IpAddr>,
 ) {
     let (lock, cvar) = &*state;
     let mut session: Option<Box<dyn crate::raop::AudioSession>> = None;
@@ -554,7 +676,7 @@ fn delivery_loop(
                 sample_rate: s.sample_rate,
             };
             info!(?format, "Audio session initialized");
-            session = Some(handler.audio_init(format));
+            session = Some(handler.audio_init_with_sender(format, sender));
         }
 
         let elapsed_frames = source_frames(s.anchor_local.elapsed(), s.source_sample_rate);
@@ -568,25 +690,26 @@ fn delivery_loop(
                 .filter(|frames| *frames <= i32::MAX as u32)
                 .min()
                 .unwrap_or(s.source_sample_rate);
-            let wait = std::time::Duration::from_nanos(
+            let wait = Duration::from_nanos(
                 (u64::from(next_frames) * 1_000_000_000).div_ceil(u64::from(s.source_sample_rate)),
             );
             let _ = cvar.wait_timeout(s, wait).unwrap();
             continue;
         };
         s.in_flight_samples = frame.samples.len();
+        let presentation_time = s.presentation_time(timestamp);
         drop(s);
 
         // The adapter owns no samples on false. Call outside the queue mutex so
         // RTSP FLUSH/Stop and receiver backpressure remain responsive.
         let accepted = session
             .as_mut()
-            .is_some_and(|session| session.audio_process_buffered(&frame.samples, None));
+            .is_some_and(|session| session.audio_process_buffered(&frame.samples, presentation_time));
         let mut s = lock.lock().unwrap();
         s.in_flight_samples = 0;
         if !accepted && !s.stopped && s.epoch == delivered_epoch {
             s.buffer.entry(timestamp).or_insert(frame);
-            let _ = cvar.wait_timeout(s, std::time::Duration::from_millis(10)).unwrap();
+            let _ = cvar.wait_timeout(s, Duration::from_millis(10)).unwrap();
         }
     }
     info!("Delivery loop ended");
@@ -602,7 +725,7 @@ fn take_ready_frame(buffer: &mut BTreeMap<u32, BufferedFrame>, target: u32) -> O
     buffer.remove(&timestamp).map(|frame| (timestamp, frame))
 }
 
-fn source_frames(elapsed: std::time::Duration, sample_rate: u32) -> u32 {
+fn source_frames(elapsed: Duration, sample_rate: u32) -> u32 {
     (elapsed.as_nanos() * u128::from(sample_rate) / 1_000_000_000) as u32
 }
 
@@ -648,6 +771,7 @@ mod ownership_tests {
                     max_channels: None,
                 },
                 Arc::new(Handler),
+                None,
                 &mut tasks,
             );
             let mut client = if connect {
@@ -679,7 +803,8 @@ mod flush_tests {
             in_flight_samples: 0,
             flush_range: None,
             anchor_rtp: 0,
-            anchor_local: std::time::Instant::now(),
+            anchor_local: Instant::now(),
+            timeline: None,
             rate: 1,
             sample_rate: 48000,
             source_sample_rate: 44100,
@@ -689,6 +814,29 @@ mod flush_tests {
             format_changed: false,
         }
     }
+    #[test]
+    fn sessions_on_one_sender_timeline_share_presentation_times() {
+        let now = Instant::now();
+        let started = |timeline_id, at| {
+            let mut s = state();
+            s.buffer.insert(
+                44_100,
+                BufferedFrame {
+                    sequence: 1,
+                    samples: vec![0.0],
+                },
+            );
+            s.start_playout(44_100, 50_000_000_000, timeline_id, at);
+            s
+        };
+        // SETRATEANCHORTI reaches the second receiver 40 ms later.
+        let late = now + Duration::from_millis(40);
+        let (first, second) = (started(0x7E57_0001, now), started(0x7E57_0001, late));
+        assert_eq!(first.presentation_time(88_200), second.presentation_time(88_200));
+        let (first, second) = (started(0, now), started(0, late));
+        assert_ne!(first.presentation_time(88_200), second.presentation_time(88_200));
+    }
+
     #[test]
     fn flush_uses_sequence_not_timestamp_and_wraps() {
         let mut s = state();
@@ -742,6 +890,7 @@ mod flush_tests {
                     sample_rate: None,
                     max_channels: None,
                 },
+                None,
             )
         });
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), "old");
@@ -870,6 +1019,7 @@ mod downstream_backpressure_tests {
                     sample_rate: None,
                     max_channels: None,
                 },
+                None,
             )
         });
         assert!(matches!(
@@ -952,7 +1102,8 @@ mod buffered_acceptance {
                 epoch: 0,
                 flush_range: None,
                 anchor_rtp: 0,
-                anchor_local: std::time::Instant::now(),
+                anchor_local: Instant::now(),
+                timeline: None,
                 rate: 0,
                 sample_rate: 48000,
                 source_sample_rate: 48000,

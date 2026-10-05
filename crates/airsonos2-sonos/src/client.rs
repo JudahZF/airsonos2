@@ -50,6 +50,16 @@ impl SonosClient {
         .await
     }
 
+    /// Joins the group of the player with RINCON id `coordinator`. Sonos then
+    /// keeps this player sample-synced with the coordinator.
+    pub async fn join_group(&self, coordinator: &str) -> Result<(), SonosClientError> {
+        self.soap(
+            SoapAction::SET_AV_TRANSPORT_URI,
+            set_av_transport_uri_body(&format!("x-rincon:{coordinator}"), ""),
+        )
+        .await
+    }
+
     pub async fn play(&self) -> Result<(), SonosClientError> {
         self.soap(SoapAction::PLAY, play_body()).await
     }

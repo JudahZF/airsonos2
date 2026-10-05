@@ -1,16 +1,67 @@
 use super::*;
 use crate::renderer::RendererError;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::watch;
 
 #[derive(Clone)]
 pub(super) enum TransportCommand {
     Prepare(Box<StreamPrepare>),
     Play(Box<PreparedDownstream>),
+    /// Play once the cohort's group members have joined, so the whole cohort
+    /// starts together. A WAV stream gets its playback plan with `delay` then.
+    PlayGroup {
+        stream: Box<PreparedDownstream>,
+        joins: GroupJoins,
+        delay: Option<Duration>,
+    },
+    /// Join the native Sonos group of the player with RINCON id `coordinator`.
+    Join {
+        stream: Box<PreparedDownstream>,
+        client: SonosClient,
+        coordinator: String,
+        joins: GroupJoins,
+    },
     Stop {
         session_id: SessionId,
         zone_id: ZoneId,
         generation: u64,
     },
+}
+
+/// Members of a cohort that still have to join a native Sonos group. A member
+/// that never runs its join leaves the cohort to wait for the timeout.
+#[derive(Clone, Debug)]
+pub(super) struct GroupJoins(Arc<GroupJoinState>);
+
+#[derive(Debug)]
+struct GroupJoinState {
+    pending: watch::Sender<usize>,
+    released: OnceLock<Instant>,
+}
+
+impl GroupJoins {
+    const WAIT: Duration = Duration::from_secs(2);
+
+    pub(super) fn new(members: usize) -> Self {
+        Self(Arc::new(GroupJoinState {
+            pending: watch::Sender::new(members),
+            released: OnceLock::new(),
+        }))
+    }
+
+    fn joined(&self) {
+        self.0
+            .pending
+            .send_modify(|pending| *pending = pending.saturating_sub(1));
+    }
+
+    /// Waits for the joins and returns the cohort's release time. The first
+    /// room to finish waiting fixes it, so every room shares one start sample.
+    async fn wait(&self) -> Instant {
+        let mut pending = self.0.pending.subscribe();
+        let _ = tokio::time::timeout(Self::WAIT, pending.wait_for(|pending| *pending == 0)).await;
+        *self.0.released.get_or_init(Instant::now)
+    }
 }
 
 pub(super) struct ZoneWorker {
@@ -30,44 +81,87 @@ impl ZoneWorker {
         let (transport, mut commands) = watch::channel(None);
         let transport_renderer = renderer.clone();
         let transport_task = tokio::spawn(async move {
+            // This zone joined a native Sonos group. Only this task sends its
+            // transport commands, so it alone tracks that.
+            let mut joined = false;
             while commands.changed().await.is_ok() {
                 let command = commands.borrow_and_update().clone();
                 match command {
                     Some(TransportCommand::Prepare(start)) => {
+                        // A member must leave the group before the Stop barrier.
+                        // A failed leave fails that barrier, and the retry leaves again.
+                        if joined {
+                            joined = leave_group(&transport_renderer, &start.zone_id).await;
+                        }
                         prepare(*start, &commands, subscriber_wait, prebuffer).await;
                     }
                     Some(TransportCommand::Play(stream)) => {
-                        let outcome = match stream
+                        // A fallback after an uncertain join must leave the group,
+                        // because members reject Play.
+                        if joined {
+                            joined = leave_group(&transport_renderer, &stream.zone_id).await;
+                        }
+                        let result = stream
                             .renderer
                             .play(&stream.live_stream.session.local_url)
-                            .await
-                        {
-                            Ok(()) => DownstreamStartOutcome::Started,
-                            Err(error) if error.is_timeout() => {
-                                warn!(zone_id = %stream.zone_id, "Play timed out; playback is unknown, retrying the same stream");
-                                DownstreamStartOutcome::Unknown
-                            }
-                            Err(error) => {
-                                warn!(zone_id = %stream.zone_id, "Play failed: {error}");
-                                if error.is_retryable() {
-                                    DownstreamStartOutcome::Failed
-                                } else {
-                                    DownstreamStartOutcome::PermanentFailure
-                                }
-                            }
+                            .await;
+                        // The room plays its own stream, so it is in no group.
+                        joined &= result.is_err();
+                        report_start(&result_tx, &stream, start_outcome(&stream, "Play", result));
+                    }
+                    Some(TransportCommand::PlayGroup {
+                        stream,
+                        joins,
+                        delay,
+                    }) => {
+                        let mut changed = commands.clone();
+                        let released = tokio::select! {
+                            _ = changed.changed() => continue,
+                            released = joins.wait() => released,
                         };
-                        let _ = result_tx.send(DownstreamStartResult {
-                            session_id: stream.session_id,
-                            zone_id: stream.zone_id,
-                            generation: stream.generation,
-                            outcome,
-                        });
+                        if let Some(delay) = delay {
+                            stream
+                                .live_stream
+                                .set_playback_plan(released + SYNC_START_LEAD, delay);
+                        }
+                        let result = stream
+                            .renderer
+                            .play(&stream.live_stream.session.local_url)
+                            .await;
+                        report_start(&result_tx, &stream, start_outcome(&stream, "Play", result));
+                    }
+                    Some(TransportCommand::Join {
+                        stream,
+                        client,
+                        coordinator,
+                        joins,
+                    }) => {
+                        let result = client
+                            .join_group(&coordinator)
+                            .await
+                            .map_err(RendererError::from);
+                        // A timed-out join may have taken effect.
+                        joined = !result.as_ref().is_err_and(|error| !error.is_timeout());
+                        joins.joined();
+                        // Only the join failed. The retry plays the room's own stream.
+                        let outcome = match start_outcome(&stream, "Group join", result) {
+                            DownstreamStartOutcome::Started => DownstreamStartOutcome::Joined,
+                            DownstreamStartOutcome::PermanentFailure => {
+                                DownstreamStartOutcome::Failed
+                            }
+                            outcome => outcome,
+                        };
+                        report_start(&result_tx, &stream, outcome);
                     }
                     Some(TransportCommand::Stop {
                         session_id,
                         zone_id,
                         generation,
                     }) => {
+                        // Members reject Stop, so a member leaves its group first.
+                        if joined {
+                            joined = leave_group(&transport_renderer, &zone_id).await;
+                        }
                         let outcome = match transport_renderer.stop().await {
                             Ok(()) => DownstreamStartOutcome::Stopped,
                             Err(error) => {
@@ -129,6 +223,52 @@ impl Drop for ZoneWorker {
         self.transport_task.abort();
         self.volume_task.abort();
     }
+}
+
+/// Returns whether the room is still a group member.
+async fn leave_group(renderer: &Renderer, zone_id: &ZoneId) -> bool {
+    match renderer.leave_group().await {
+        Ok(()) => false,
+        Err(error) => {
+            warn!(%zone_id, "leaving the Sonos group failed: {error}");
+            true
+        }
+    }
+}
+
+fn start_outcome(
+    stream: &PreparedDownstream,
+    action: &str,
+    result: Result<(), RendererError>,
+) -> DownstreamStartOutcome {
+    match result {
+        Ok(()) => DownstreamStartOutcome::Started,
+        Err(error) if error.is_timeout() => {
+            warn!(zone_id = %stream.zone_id, "{action} timed out; playback is unknown, retrying the same stream");
+            DownstreamStartOutcome::Unknown
+        }
+        Err(error) => {
+            warn!(zone_id = %stream.zone_id, "{action} failed: {error}");
+            if error.is_retryable() {
+                DownstreamStartOutcome::Failed
+            } else {
+                DownstreamStartOutcome::PermanentFailure
+            }
+        }
+    }
+}
+
+fn report_start(
+    result_tx: &mpsc::UnboundedSender<DownstreamStartResult>,
+    stream: &PreparedDownstream,
+    outcome: DownstreamStartOutcome,
+) {
+    let _ = result_tx.send(DownstreamStartResult {
+        session_id: stream.session_id,
+        zone_id: stream.zone_id.clone(),
+        generation: stream.generation,
+        outcome,
+    });
 }
 
 async fn prepare(
@@ -208,6 +348,7 @@ async fn prepare(
         generation: start.generation,
         renderer: start.renderer,
         live_stream: start.live_stream,
+        held_delay: None,
     });
 }
 

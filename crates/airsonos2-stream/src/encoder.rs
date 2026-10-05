@@ -93,7 +93,7 @@ impl FfmpegEncoder {
                 let mut stdin = stdin;
                 let mut first_pcm = true;
                 let mut bytes = Vec::new();
-                while let Some(frame) = rx.recv().await {
+                while let Some((frame, _)) = rx.recv().await {
                     if !input_stream.accepts_epoch(frame.playback_epoch) {
                         continue;
                     }
@@ -166,16 +166,21 @@ impl FfmpegEncoder {
                 config.sample_rate,
                 config.channels,
             )));
-            if !stream.wait_for_playback_release().await {
+            let Some(release) = stream.wait_for_playback_release().await else {
                 return Ok(());
-            }
+            };
             let mut first_pcm = false;
 
-            while let Some(frame) = tokio::select! {
+            while let Some((frame, arrived)) = tokio::select! {
                 _ = stream.closed() => None,
                 frame = rx.recv() => frame,
             } {
                 if !stream.accepts_epoch(frame.playback_epoch) {
+                    continue;
+                }
+                // The source cutoff cannot apply to untimed frames, so their arrival
+                // time is compared with it. The stream then starts at the live edge.
+                if frame.presentation_time.is_none() && arrived < release.at {
                     continue;
                 }
                 if !first_pcm {
@@ -188,6 +193,17 @@ impl FfmpegEncoder {
                     );
                 }
 
+                // A delay line, not a delayed start: it moves the renderer's live
+                // edge. A delayed start only sends a burst of backlog, and the
+                // renderer's start buffer absorbs that burst. Untimed frames use
+                // their arrival time.
+                if !release.delay.is_zero() {
+                    let due = frame.presentation_time.unwrap_or(arrived) + release.delay;
+                    tokio::select! {
+                        _ = stream.closed() => break,
+                        _ = time::sleep_until(due.into()) => {}
+                    }
+                }
                 stream.publish_timed_pcm(
                     Bytes::from(f32_pcm_to_s16le_bytes(&frame.samples_f32_interleaved)),
                     frame.presentation_time,
@@ -338,7 +354,7 @@ mod tests {
             assert_eq!(subscriber.recv().await.unwrap().bytes.len(), 44);
         }
         let start = std::time::Instant::now();
-        stream.set_playback_plan(start, start + Duration::from_millis(350));
+        stream.set_playback_plan(start, Duration::from_millis(350));
         for index in 0..10 {
             encoder
                 .try_write_frame(PcmFrame {
@@ -357,6 +373,12 @@ mod tests {
             .unwrap();
         assert!(start.elapsed() >= Duration::from_millis(350));
         assert_eq!(i16::from_le_bytes([bytes.bytes[0], bytes.bytes[1]]), 8192);
+        // Queued audio keeps its delay instead of following in one burst.
+        tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(450));
         stream.close();
         encoder.shutdown().await.unwrap();
     }
@@ -407,15 +429,14 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(first_rx.try_recv().is_err());
         assert!(second_rx.try_recv().is_err());
-        let release = std::time::Instant::now() + Duration::from_millis(20);
         let cutoff = source_time + Duration::from_millis(2);
-        first.set_playback_plan(cutoff, release);
-        second.set_playback_plan(cutoff, release + Duration::from_millis(20));
+        first.set_playback_plan(cutoff, Duration::from_millis(20));
+        second.set_playback_plan(cutoff, Duration::from_millis(40));
         let a = tokio::time::timeout(Duration::from_secs(1), first_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(std::time::Instant::now() >= release);
+        assert!(std::time::Instant::now() >= source_time + Duration::from_millis(20));
         let b = tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
             .await
             .unwrap()

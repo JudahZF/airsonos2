@@ -64,6 +64,9 @@ default_offset_ms = 0
 multi_select_window_ms = 750
 start_deadline_ms = 2500
 play_command_spread_warn_ms = 80
+# Sonos rooms that play from one AirPlay device join one native Sonos group, which
+# Sonos keeps in sync. Offsets then apply per group, not per Sonos room.
+native_sonos_groups = true
 
 [sync.zone_offsets_ms]
 # Positive means measured late. WAV delays faster rooms; MP3 offsets are unsupported.

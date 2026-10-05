@@ -183,6 +183,14 @@ enum PlaybackAnchorState {
     NextTimedPcm,
 }
 
+/// A released stream's start and output delay. Output begins with audio
+/// presented, or for untimed audio received, at or after `at`.
+#[derive(Clone, Copy, Debug)]
+pub struct PlaybackRelease {
+    pub at: Instant,
+    pub delay: Duration,
+}
+
 #[derive(Clone, Debug)]
 pub struct LiveStream {
     pub session: StreamSession,
@@ -196,7 +204,8 @@ pub struct LiveStream {
     ready: watch::Sender<bool>,
     subscriber: watch::Sender<bool>,
     closed: watch::Sender<bool>,
-    playback_release: watch::Sender<Option<Instant>>,
+    /// Set once playback is released; `None` holds output back.
+    playback_release: watch::Sender<Option<PlaybackRelease>>,
     playback_epoch: Arc<AtomicU64>,
     subscriber_count: Arc<AtomicU64>,
     playback_anchor: Arc<std::sync::Mutex<PlaybackAnchorState>>,
@@ -487,7 +496,10 @@ impl LiveStream {
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::At(anchor);
         }
-        self.playback_release.send_replace(Some(anchor));
+        self.playback_release.send_replace(Some(PlaybackRelease {
+            at: anchor,
+            delay: Duration::ZERO,
+        }));
         let timing = self.timing();
         info!(
             session_id = %self.session.session_id,
@@ -502,7 +514,10 @@ impl LiveStream {
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::NextTimedPcm;
         }
-        self.playback_release.send_replace(Some(Instant::now()));
+        self.playback_release.send_replace(Some(PlaybackRelease {
+            at: Instant::now(),
+            delay: Duration::ZERO,
+        }));
         let timing = self.timing();
         info!(
             session_id = %self.session.session_id,
@@ -513,29 +528,26 @@ impl LiveStream {
         );
     }
 
-    pub fn set_playback_plan(&self, source_cutoff: Instant, release_at: Instant) {
+    /// Start output at the shared `source_cutoff` sample and present every frame
+    /// `delay` after its source presentation time.
+    pub fn set_playback_plan(&self, source_cutoff: Instant, delay: Duration) {
         if let Ok(mut anchor) = self.playback_anchor.lock() {
             *anchor = PlaybackAnchorState::At(source_cutoff);
         }
-        self.playback_release.send_replace(Some(release_at));
+        self.playback_release.send_replace(Some(PlaybackRelease {
+            at: source_cutoff,
+            delay,
+        }));
     }
 
-    pub async fn wait_for_playback_release(&self) -> bool {
+    /// Waits until playback is released, or returns `None` when the stream
+    /// closes first.
+    pub async fn wait_for_playback_release(&self) -> Option<PlaybackRelease> {
         let mut release = self.playback_release.subscribe();
-        loop {
-            let deadline = *release.borrow_and_update();
-            match deadline {
-                Some(deadline) => tokio::select! {
-                    biased;
-                    _ = self.closed() => return false,
-                    changed = release.changed() => if changed.is_err() { return false; },
-                    _ = tokio::time::sleep_until(deadline.into()) => return true,
-                },
-                None => tokio::select! {
-                    _ = self.closed() => return false,
-                    changed = release.changed() => if changed.is_err() { return false; },
-                },
-            }
+        tokio::select! {
+            biased;
+            _ = self.closed() => None,
+            released = release.wait_for(Option::is_some) => released.ok().and_then(|release| *release),
         }
     }
 
