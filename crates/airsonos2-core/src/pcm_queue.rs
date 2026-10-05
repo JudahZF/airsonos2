@@ -154,31 +154,33 @@ impl PcmQueue {
     }
 
     pub fn pop(&self) -> Option<PcmFrame> {
-        self.pop_at(Instant::now())
+        self.pop_at(Instant::now()).map(|(frame, _)| frame)
     }
 
-    fn pop_at(&self, now: Instant) -> Option<PcmFrame> {
+    /// Pops the oldest frame with its arrival time.
+    fn pop_at(&self, now: Instant) -> Option<(PcmFrame, Instant)> {
         let mut state = self.inner.lock().expect("PCM queue lock");
         self.expire(&mut state, now);
-        if let Some((frame, _)) = state.frames.pop_front() {
+        if let Some((frame, arrived)) = state.frames.pop_front() {
             state.samples -= frame.samples_f32_interleaved.len();
             state.allocated_bytes -= frame.samples_f32_interleaved.capacity()
                 * std::mem::size_of::<f32>()
                 + std::mem::size_of::<(PcmFrame, Instant)>();
-            Some(frame)
+            Some((frame, arrived))
         } else {
             state.notified = false;
             None
         }
     }
 
-    pub async fn recv(&self) -> Option<PcmFrame> {
+    /// Waits for the oldest frame and returns it with its arrival time.
+    pub async fn recv(&self) -> Option<(PcmFrame, Instant)> {
         loop {
             let ready = self.ready.notified();
             tokio::pin!(ready);
             ready.as_mut().enable();
-            if let Some(frame) = self.pop() {
-                return Some(frame);
+            if let Some(entry) = self.pop_at(Instant::now()) {
+                return Some(entry);
             }
             if self.is_closed() {
                 return None;

@@ -870,6 +870,8 @@ struct StreamPrepare {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DownstreamStartOutcome {
     Started,
+    /// The room joined a native Sonos group instead of playing its own stream.
+    Joined,
     Stopped,
     StopUnknown,
     Unknown,
@@ -894,14 +896,10 @@ struct SyncCohort {
     prepared: HashMap<SessionId, PreparedDownstream>,
 }
 
-/// How a released stream starts when it belongs to a native Sonos group.
-enum GroupRole {
-    Coordinator(GroupJoins),
-    Member {
-        coordinator: SessionId,
-        rincon_id: String,
-        joins: GroupJoins,
-    },
+/// A released stream that joins a native Sonos group instead of playing.
+struct NativeMember {
+    coordinator: SessionId,
+    rincon_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1105,11 +1103,16 @@ impl BridgeRuntime {
         }
         match result.outcome {
             DownstreamStartOutcome::Stopped | DownstreamStartOutcome::StopUnknown => {}
-            DownstreamStartOutcome::Started => {
+            outcome @ (DownstreamStartOutcome::Started | DownstreamStartOutcome::Joined) => {
                 session.observed = ObservedPlayback::Playing;
                 session.reset_needed = false;
                 session.retry_attempts = 0;
                 self.cancel_downstream_retry(result.session_id);
+                // A room that plays its own stream, such as after a failed join,
+                // is in no native group.
+                if outcome == DownstreamStartOutcome::Started {
+                    self.forget_native_member(result.session_id);
+                }
             }
             DownstreamStartOutcome::PermanentFailure => {
                 session.observed = ObservedPlayback::Unknown;
@@ -1483,7 +1486,7 @@ impl BridgeRuntime {
     fn plan_native_groups(
         &mut self,
         prepared: &[PreparedDownstream],
-    ) -> HashMap<SessionId, GroupRole> {
+    ) -> HashMap<SessionId, NativeMember> {
         let mut roles = HashMap::new();
         if !self.config.sync.native_sonos_groups {
             return roles;
@@ -1519,16 +1522,13 @@ impl BridgeRuntime {
                 continue;
             };
             let rincon_id = zone.rincon_id.clone();
-            let joins = GroupJoins::new(members.len());
             info!(%coordinator, members = members.len(), "grouping Sonos rooms natively");
-            roles.insert(coordinator, GroupRole::Coordinator(joins.clone()));
             for member in &members {
                 roles.insert(
                     *member,
-                    GroupRole::Member {
+                    NativeMember {
                         coordinator,
                         rincon_id: rincon_id.clone(),
-                        joins: joins.clone(),
                     },
                 );
             }
@@ -1592,11 +1592,12 @@ impl BridgeRuntime {
     fn apply_sync_anchors(
         &self,
         prepared: &[PreparedDownstream],
-        roles: &HashMap<SessionId, GroupRole>,
+        members: &HashMap<SessionId, NativeMember>,
     ) {
-        let coordinator_of = |stream: &PreparedDownstream| match roles.get(&stream.session_id) {
-            Some(GroupRole::Member { coordinator, .. }) => Some(*coordinator),
-            _ => None,
+        let coordinator_of = |stream: &PreparedDownstream| {
+            members
+                .get(&stream.session_id)
+                .map(|member| member.coordinator)
         };
         // Sonos plays members in step with their coordinator, so offsets apply
         // only to the rooms that play their own stream. That includes a playing
@@ -1653,25 +1654,23 @@ impl BridgeRuntime {
     }
 
     async fn play_prepared_downstreams(&mut self, prepared: Vec<PreparedDownstream>) {
-        let mut roles = self.plan_native_groups(&prepared);
-        self.apply_sync_anchors(&prepared, &roles);
+        let mut members = self.plan_native_groups(&prepared);
+        self.apply_sync_anchors(&prepared, &members);
+        // Every room that plays its own stream waits for the joins, so the whole
+        // cohort starts together.
+        let joins = (!members.is_empty()).then(|| GroupJoins::new(members.len()));
         for stream in prepared {
             let zone_id = stream.zone_id.clone();
-            let command = match (roles.remove(&stream.session_id), &stream.renderer) {
-                (Some(GroupRole::Coordinator(joins)), _) => {
-                    TransportCommand::PlayGroup(Box::new(stream), joins)
+            let command = match (members.remove(&stream.session_id), &stream.renderer, &joins) {
+                (Some(member), Renderer::Sonos { client, .. }, Some(joins)) => {
+                    TransportCommand::Join {
+                        client: client.clone(),
+                        stream: Box::new(stream),
+                        coordinator: member.rincon_id,
+                        joins: joins.clone(),
+                    }
                 }
-                (
-                    Some(GroupRole::Member {
-                        rincon_id, joins, ..
-                    }),
-                    Renderer::Sonos { client, .. },
-                ) => TransportCommand::Join {
-                    client: client.clone(),
-                    stream: Box::new(stream),
-                    coordinator: rincon_id,
-                    joins,
-                },
+                (_, _, Some(joins)) => TransportCommand::PlayGroup(Box::new(stream), joins.clone()),
                 _ => TransportCommand::Play(Box::new(stream)),
             };
             if let Some(worker) = self.worker(&zone_id) {
@@ -2570,19 +2569,14 @@ mod tests {
 
         let roles = runtime.plan_native_groups(&cohort);
         let coordinator = cohort[0].session_id;
-        assert!(matches!(
-            roles.get(&coordinator),
-            Some(GroupRole::Coordinator(_))
-        ));
-        assert!(matches!(roles.get(&cohort[1].session_id),
-            Some(GroupRole::Member { rincon_id, .. }) if rincon_id == "RINCON_A"));
+        assert!(!roles.contains_key(&coordinator));
+        assert_eq!(roles[&cohort[1].session_id].rincon_id, "RINCON_A");
         assert!(!roles.contains_key(&cohort[2].session_id));
 
         // A room added later joins the group that already plays.
         runtime.sessions.get_mut(&coordinator).unwrap().observed = ObservedPlayback::Playing;
         let roles = runtime.plan_native_groups(std::slice::from_ref(&late));
-        assert!(matches!(roles.get(&late.session_id),
-            Some(GroupRole::Member { coordinator: c, .. }) if *c == coordinator));
+        assert_eq!(roles[&late.session_id].coordinator, coordinator);
         assert_eq!(
             runtime.native_groups[&coordinator],
             [cohort[1].session_id, late.session_id]

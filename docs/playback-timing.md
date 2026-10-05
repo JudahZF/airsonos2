@@ -11,9 +11,11 @@ because bytes already buffered inside a speaker cannot be recalled from HTTP.
 With `[sync].native_sonos_groups = true` (the default), Sonos rooms in one
 cohort that play from one AirPlay sender form one native Sonos group. The first
 room plays its own stream. The other rooms join it with `x-rincon:` and Sonos
-keeps them sample-synced, including drift. The sender is the client IP address.
-When a sender already plays on a Sonos room, a room that starts later joins that
-room. The group shows in the Sonos app.
+keeps them sample-synced, including drift. The sender is the IP address of the
+connection that set up the stream. Rooms that play their own stream, including
+Home Assistant players in the cohort, wait until the joins finish (at most 2 s),
+so the cohort starts together. When a sender already plays on a Sonos room, a
+room that starts later joins that room. The group shows in the Sonos app.
 
 A member leaves the group when its session stops, pauses or restarts. When the
 first room stops, the other rooms restart on their own streams and form a new
@@ -47,7 +49,7 @@ Assistant player after Play, starts at the live edge. A queued backlog would
 stay in its buffer as extra latency.
 
 A room's delay is a delay line: each frame is sent at its presentation time
-plus the delay. A delayed start does not work. It only sends a burst of queued
+plus the delay. A frame without presentation time uses its arrival time. A delayed start does not work. It only sends a burst of queued
 audio, and the speaker's start buffer absorbs that burst. Startup buffering is
 bounded, so senders must continue providing current audio during preparation.
 

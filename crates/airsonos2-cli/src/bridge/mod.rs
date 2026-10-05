@@ -7,7 +7,8 @@ use tokio::sync::watch;
 pub(super) enum TransportCommand {
     Prepare(Box<StreamPrepare>),
     Play(Box<PreparedDownstream>),
-    /// Play once the group members have joined, so the whole group starts together.
+    /// Play once the cohort's group members have joined, so the whole cohort
+    /// starts together.
     PlayGroup(Box<PreparedDownstream>, GroupJoins),
     /// Join the native Sonos group of the player with RINCON id `coordinator`.
     Join {
@@ -23,8 +24,8 @@ pub(super) enum TransportCommand {
     },
 }
 
-/// Members that still have to join a native Sonos group. A member that never
-/// runs its join leaves the coordinator to wait for the timeout.
+/// Members of a cohort that still have to join a native Sonos group. A member
+/// that never runs its join leaves the cohort to wait for the timeout.
 #[derive(Clone, Debug)]
 pub(super) struct GroupJoins(Arc<watch::Sender<usize>>);
 
@@ -113,6 +114,7 @@ impl ZoneWorker {
                         joins.joined();
                         // Only the join failed. The retry plays the room's own stream.
                         let outcome = match start_outcome(&stream, "Group join", result) {
+                            DownstreamStartOutcome::Started => DownstreamStartOutcome::Joined,
                             DownstreamStartOutcome::PermanentFailure => {
                                 DownstreamStartOutcome::Failed
                             }

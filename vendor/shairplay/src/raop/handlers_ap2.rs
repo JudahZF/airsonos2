@@ -352,6 +352,7 @@ pub(crate) fn handle_setup(
                         max_channels: conn.output_max_channels,
                     };
 
+                    let sender = conn.remote_socket.ip();
                     let claimed = conn.claim_audio(response, |tasks| {
                         let (commands, receiver) = tokio::sync::mpsc::channel(64);
                         let task = tasks.spawn(crate::raop::realtime_audio::run(
@@ -359,6 +360,7 @@ pub(crate) fn handle_setup(
                             shk_arr,
                             handler,
                             output_config,
+                            Some(sender),
                             receiver,
                         ));
                         (commands, task)

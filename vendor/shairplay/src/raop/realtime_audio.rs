@@ -33,6 +33,7 @@ pub async fn run(
     shk: [u8; 32],
     handler: Arc<dyn AudioHandler>,
     output_config: OutputConfig,
+    sender: Option<std::net::IpAddr>,
     mut commands: tokio::sync::mpsc::Receiver<super::buffered_audio::PlayoutCommand>,
 ) {
     let cipher = ChaCha20Poly1305::new((&shk).into());
@@ -125,12 +126,15 @@ pub async fn run(
         }
 
         if session.is_none() {
-            session = Some(handler.audio_init(AudioFormat {
-                codec: AudioCodec::Pcm,
-                bits: 32,
-                channels: out_ch,
-                sample_rate: target_sr,
-            }));
+            session = Some(handler.audio_init_with_sender(
+                AudioFormat {
+                    codec: AudioCodec::Pcm,
+                    bits: 32,
+                    channels: out_ch,
+                    sample_rate: target_sr,
+                },
+                sender,
+            ));
         }
         // Deliver immediately (realtime = no playout buffer)
         if let Some(ref mut sess) = session {
@@ -225,6 +229,7 @@ mod acceptance {
                 max_channels: None,
                 alac,
             },
+            None,
             receiver,
         ));
         sender.send_to(&packet(10, 1000), address).await.unwrap();

@@ -93,7 +93,7 @@ impl FfmpegEncoder {
                 let mut stdin = stdin;
                 let mut first_pcm = true;
                 let mut bytes = Vec::new();
-                while let Some(frame) = rx.recv().await {
+                while let Some((frame, _)) = rx.recv().await {
                     if !input_stream.accepts_epoch(frame.playback_epoch) {
                         continue;
                     }
@@ -171,7 +171,7 @@ impl FfmpegEncoder {
             };
             let mut first_pcm = false;
 
-            while let Some(frame) = tokio::select! {
+            while let Some((frame, arrived)) = tokio::select! {
                 _ = stream.closed() => None,
                 frame = rx.recv() => frame,
             } {
@@ -190,13 +190,13 @@ impl FfmpegEncoder {
 
                 // A delay line, not a delayed start: it moves the renderer's live
                 // edge. A delayed start only sends a burst of backlog, and the
-                // renderer's start buffer absorbs that burst.
-                if let Some(at) = frame.presentation_time
-                    && !delay.is_zero()
-                {
+                // renderer's start buffer absorbs that burst. Untimed frames use
+                // their arrival time.
+                if !delay.is_zero() {
+                    let due = frame.presentation_time.unwrap_or(arrived) + delay;
                     tokio::select! {
                         _ = stream.closed() => break,
-                        _ = time::sleep_until((at + delay).into()) => {}
+                        _ = time::sleep_until(due.into()) => {}
                     }
                 }
                 stream.publish_timed_pcm(
