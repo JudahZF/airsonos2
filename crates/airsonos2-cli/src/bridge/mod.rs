@@ -1,16 +1,49 @@
 use super::*;
 use crate::renderer::RendererError;
+use std::sync::Arc;
 use tokio::sync::watch;
 
 #[derive(Clone)]
 pub(super) enum TransportCommand {
     Prepare(Box<StreamPrepare>),
     Play(Box<PreparedDownstream>),
+    /// Play once the group members have joined, so the whole group starts together.
+    PlayGroup(Box<PreparedDownstream>, GroupJoins),
+    /// Join the native Sonos group of the player with RINCON id `coordinator`.
+    Join {
+        stream: Box<PreparedDownstream>,
+        client: SonosClient,
+        coordinator: String,
+        joins: GroupJoins,
+    },
     Stop {
         session_id: SessionId,
         zone_id: ZoneId,
         generation: u64,
     },
+}
+
+/// Members that still have to join a native Sonos group. A member that never
+/// runs its join leaves the coordinator to wait for the timeout.
+#[derive(Clone, Debug)]
+pub(super) struct GroupJoins(Arc<watch::Sender<usize>>);
+
+impl GroupJoins {
+    const WAIT: Duration = Duration::from_secs(2);
+
+    pub(super) fn new(members: usize) -> Self {
+        Self(Arc::new(watch::Sender::new(members)))
+    }
+
+    fn joined(&self) {
+        self.0
+            .send_modify(|pending| *pending = pending.saturating_sub(1));
+    }
+
+    async fn wait(&self) {
+        let mut pending = self.0.subscribe();
+        let _ = tokio::time::timeout(Self::WAIT, pending.wait_for(|pending| *pending == 0)).await;
+    }
 }
 
 pub(super) struct ZoneWorker {
@@ -30,45 +63,67 @@ impl ZoneWorker {
         let (transport, mut commands) = watch::channel(None);
         let transport_renderer = renderer.clone();
         let transport_task = tokio::spawn(async move {
+            // This zone joined a native Sonos group. Only this task sends its
+            // transport commands, so it alone tracks that.
+            let mut joined = false;
             while commands.changed().await.is_ok() {
                 let command = commands.borrow_and_update().clone();
                 match command {
                     Some(TransportCommand::Prepare(start)) => {
+                        // A member must leave the group before the Stop barrier.
+                        if std::mem::take(&mut joined)
+                            && let Err(error) = transport_renderer.leave_group().await
+                        {
+                            warn!(zone_id = %start.zone_id, "leaving the Sonos group failed: {error}");
+                        }
                         prepare(*start, &commands, subscriber_wait, prebuffer).await;
                     }
                     Some(TransportCommand::Play(stream)) => {
-                        let outcome = match stream
+                        let result = stream
                             .renderer
                             .play(&stream.live_stream.session.local_url)
+                            .await;
+                        report_start(&result_tx, &stream, "Play", result);
+                    }
+                    Some(TransportCommand::PlayGroup(stream, joins)) => {
+                        let mut changed = commands.clone();
+                        tokio::select! {
+                            _ = changed.changed() => continue,
+                            _ = joins.wait() => {}
+                        }
+                        let result = stream
+                            .renderer
+                            .play(&stream.live_stream.session.local_url)
+                            .await;
+                        report_start(&result_tx, &stream, "Play", result);
+                    }
+                    Some(TransportCommand::Join {
+                        stream,
+                        client,
+                        coordinator,
+                        joins,
+                    }) => {
+                        let result = client
+                            .join_group(&coordinator)
                             .await
-                        {
-                            Ok(()) => DownstreamStartOutcome::Started,
-                            Err(error) if error.is_timeout() => {
-                                warn!(zone_id = %stream.zone_id, "Play timed out; playback is unknown, retrying the same stream");
-                                DownstreamStartOutcome::Unknown
-                            }
-                            Err(error) => {
-                                warn!(zone_id = %stream.zone_id, "Play failed: {error}");
-                                if error.is_retryable() {
-                                    DownstreamStartOutcome::Failed
-                                } else {
-                                    DownstreamStartOutcome::PermanentFailure
-                                }
-                            }
-                        };
-                        let _ = result_tx.send(DownstreamStartResult {
-                            session_id: stream.session_id,
-                            zone_id: stream.zone_id,
-                            generation: stream.generation,
-                            outcome,
-                        });
+                            .map_err(RendererError::from);
+                        // A timed-out join may have taken effect.
+                        joined = !result.as_ref().is_err_and(|error| !error.is_timeout());
+                        joins.joined();
+                        report_start(&result_tx, &stream, "Group join", result);
                     }
                     Some(TransportCommand::Stop {
                         session_id,
                         zone_id,
                         generation,
                     }) => {
-                        let outcome = match transport_renderer.stop().await {
+                        // Leaving the group stops a member; members reject Stop.
+                        let result = if std::mem::take(&mut joined) {
+                            transport_renderer.leave_group().await
+                        } else {
+                            transport_renderer.stop().await
+                        };
+                        let outcome = match result {
                             Ok(()) => DownstreamStartOutcome::Stopped,
                             Err(error) => {
                                 warn!(%zone_id, "Stop failed: {error}");
@@ -129,6 +184,35 @@ impl Drop for ZoneWorker {
         self.transport_task.abort();
         self.volume_task.abort();
     }
+}
+
+fn report_start(
+    result_tx: &mpsc::UnboundedSender<DownstreamStartResult>,
+    stream: &PreparedDownstream,
+    action: &str,
+    result: Result<(), RendererError>,
+) {
+    let outcome = match result {
+        Ok(()) => DownstreamStartOutcome::Started,
+        Err(error) if error.is_timeout() => {
+            warn!(zone_id = %stream.zone_id, "{action} timed out; playback is unknown, retrying the same stream");
+            DownstreamStartOutcome::Unknown
+        }
+        Err(error) => {
+            warn!(zone_id = %stream.zone_id, "{action} failed: {error}");
+            if error.is_retryable() {
+                DownstreamStartOutcome::Failed
+            } else {
+                DownstreamStartOutcome::PermanentFailure
+            }
+        }
+    };
+    let _ = result_tx.send(DownstreamStartResult {
+        session_id: stream.session_id,
+        zone_id: stream.zone_id.clone(),
+        generation: stream.generation,
+        outcome,
+    });
 }
 
 async fn prepare(

@@ -30,7 +30,7 @@ use url::Url;
 mod bridge;
 mod home_assistant;
 mod renderer;
-use bridge::{TransportCommand, ZoneWorker};
+use bridge::{GroupJoins, TransportCommand, ZoneWorker};
 use renderer::Renderer;
 
 /// How long to keep a bridge session alive after the buffered audio stream
@@ -793,6 +793,8 @@ struct BridgeRuntime {
     cohort_wake_tx: mpsc::UnboundedSender<()>,
     cohort_wake_rx: mpsc::UnboundedReceiver<()>,
     sync_cohort: Option<SyncCohort>,
+    /// Native Sonos groups: coordinator session to member sessions.
+    native_groups: HashMap<SessionId, Vec<SessionId>>,
     tasks: tokio::task::JoinSet<()>,
 }
 
@@ -806,6 +808,8 @@ enum ObservedPlayback {
 struct SessionRuntime {
     zone_id: ZoneId,
     format: PcmFormat,
+    /// AirPlay sender. Sessions from one sender play the same audio.
+    sender: Option<IpAddr>,
     generation: u64,
     playback_epoch: u64,
     desired_playback: bool,
@@ -826,6 +830,7 @@ impl SessionRuntime {
         Self {
             zone_id,
             format,
+            sender: None,
             generation: 0,
             playback_epoch: 0,
             desired_playback: true,
@@ -889,6 +894,16 @@ struct SyncCohort {
     prepared: HashMap<SessionId, PreparedDownstream>,
 }
 
+/// How a released stream starts when it belongs to a native Sonos group.
+enum GroupRole {
+    Coordinator(GroupJoins),
+    Member {
+        coordinator: SessionId,
+        rincon_id: String,
+        joins: GroupJoins,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct PreparedDownstream {
     session_id: SessionId,
@@ -936,6 +951,7 @@ impl BridgeRuntime {
             cohort_wake_tx,
             cohort_wake_rx,
             sync_cohort: None,
+            native_groups: HashMap::new(),
             tasks: tokio::task::JoinSet::new(),
         }
     }
@@ -1141,7 +1157,11 @@ impl BridgeRuntime {
                 session_id,
                 zone_id,
                 format,
-            } => self.start_session(session_id, zone_id, format).await,
+                sender,
+            } => {
+                self.start_session(session_id, zone_id, format, sender)
+                    .await
+            }
             AirPlayEvent::Pcm {
                 session_id, frames, ..
             } => {
@@ -1450,9 +1470,127 @@ impl BridgeRuntime {
         }
     }
 
-    fn apply_sync_anchors(&self, prepared: &[PreparedDownstream]) {
+    /// Groups the Sonos rooms in `prepared` that play one sender's audio, so Sonos
+    /// keeps them in sync. When the sender already plays on a Sonos room, the new
+    /// rooms join it, so a room added later joins the rooms that already play.
+    fn plan_native_groups(
+        &mut self,
+        prepared: &[PreparedDownstream],
+    ) -> HashMap<SessionId, GroupRole> {
+        let mut roles = HashMap::new();
+        if !self.config.sync.native_sonos_groups {
+            return roles;
+        }
+        let mut by_sender: Vec<(IpAddr, Vec<SessionId>)> = Vec::new();
+        for stream in prepared {
+            if !matches!(stream.renderer, Renderer::Sonos { .. }) {
+                continue;
+            }
+            let Some(sender) = self
+                .sessions
+                .get(&stream.session_id)
+                .and_then(|session| session.sender)
+            else {
+                continue;
+            };
+            match by_sender.iter_mut().find(|(other, _)| *other == sender) {
+                Some((_, sessions)) => sessions.push(stream.session_id),
+                None => by_sender.push((sender, vec![stream.session_id])),
+            }
+        }
+        for (sender, mut members) in by_sender {
+            let coordinator = match self.playing_sonos_session(sender) {
+                Some(coordinator) => coordinator,
+                None if members.len() > 1 => members.remove(0),
+                None => continue,
+            };
+            let Some(Renderer::Sonos { zone, .. }) = self
+                .sessions
+                .get(&coordinator)
+                .and_then(|session| self.renderers.get(&session.zone_id))
+            else {
+                continue;
+            };
+            let rincon_id = zone.rincon_id.clone();
+            let joins = GroupJoins::new(members.len());
+            info!(%coordinator, members = members.len(), "grouping Sonos rooms natively");
+            roles.insert(coordinator, GroupRole::Coordinator(joins.clone()));
+            for member in &members {
+                roles.insert(
+                    *member,
+                    GroupRole::Member {
+                        coordinator,
+                        rincon_id: rincon_id.clone(),
+                        joins: joins.clone(),
+                    },
+                );
+            }
+            self.native_groups
+                .entry(coordinator)
+                .or_default()
+                .extend(members);
+        }
+        roles
+    }
+
+    /// A sender's playing Sonos room that is not a group member. An existing
+    /// group coordinator wins.
+    fn playing_sonos_session(&self, sender: IpAddr) -> Option<SessionId> {
+        self.sessions
+            .iter()
+            .filter(|(id, session)| {
+                session.sender == Some(sender)
+                    && session.desired_playback
+                    && session.observed == ObservedPlayback::Playing
+                    && matches!(
+                        self.renderers.get(&session.zone_id),
+                        Some(Renderer::Sonos { .. })
+                    )
+                    && !self
+                        .native_groups
+                        .values()
+                        .flatten()
+                        .any(|member| member == *id)
+            })
+            .min_by_key(|(id, _)| !self.native_groups.contains_key(id))
+            .map(|(id, _)| *id)
+    }
+
+    /// Removes `session_id` from native Sonos groups. The members of a group it
+    /// coordinated go silent with it, so they restart on their own streams.
+    async fn leave_native_group(&mut self, session_id: SessionId) {
+        for members in self.native_groups.values_mut() {
+            members.retain(|member| *member != session_id);
+        }
+        for member in self.native_groups.remove(&session_id).unwrap_or_default() {
+            let Some(session) = self
+                .sessions
+                .get(&member)
+                .filter(|session| session.desired_playback)
+            else {
+                continue;
+            };
+            let zone_id = session.zone_id.clone();
+            if let Err(error) = Box::pin(self.restart_downstream_for_play(member, zone_id)).await {
+                warn!(%member, "restarting a native Sonos group member failed: {error:#}");
+            }
+        }
+    }
+
+    fn apply_sync_anchors(
+        &self,
+        prepared: &[PreparedDownstream],
+        roles: &HashMap<SessionId, GroupRole>,
+    ) {
+        let coordinator_of = |stream: &PreparedDownstream| match roles.get(&stream.session_id) {
+            Some(GroupRole::Member { coordinator, .. }) => Some(*coordinator),
+            _ => None,
+        };
+        // Sonos plays members in step with their coordinator, so offsets apply
+        // only to the rooms that play their own stream.
         let rooms = prepared
             .iter()
+            .filter(|stream| coordinator_of(stream).is_none())
             .map(|stream| (stream.zone_id.clone(), stream.renderer.name().to_owned()))
             .collect::<Vec<_>>();
         let delays = configured_delays(
@@ -1462,17 +1600,28 @@ impl BridgeRuntime {
         );
         let common_sample = Instant::now() + Duration::from_millis(120);
         for stream in prepared {
+            let coordinator = coordinator_of(stream);
             if stream.live_stream.session.codec == StreamCodec::Wav {
+                // A member's own stream plays only if its join fails. It then keeps
+                // the coordinator's delay.
+                let zone_id = match coordinator {
+                    Some(coordinator) => self
+                        .sessions
+                        .get(&coordinator)
+                        .map(|session| &session.zone_id),
+                    None => Some(&stream.zone_id),
+                };
                 let delay = delays
                     .iter()
-                    .find(|delay| delay.zone_id == stream.zone_id)
+                    .find(|delay| Some(&delay.zone_id) == zone_id)
                     .map_or(0, |delay| delay.delay_ms);
                 stream
                     .live_stream
-                    .set_playback_plan(common_sample, common_sample + Duration::from_millis(delay));
-            } else if prepared.len() > 1
-                || self.config.sync.default_offset_ms != 0
-                || !self.config.sync.zone_offsets_ms.is_empty()
+                    .set_playback_plan(common_sample, Duration::from_millis(delay));
+            } else if coordinator.is_none()
+                && (rooms.len() > 1
+                    || self.config.sync.default_offset_ms != 0
+                    || !self.config.sync.zone_offsets_ms.is_empty())
             {
                 warn!(session_id = %stream.session_id, codec = ?stream.live_stream.session.codec,
                     "MP3 does not support sample-aligned WAV offsets; group startup is best effort");
@@ -1481,10 +1630,29 @@ impl BridgeRuntime {
     }
 
     async fn play_prepared_downstreams(&mut self, prepared: Vec<PreparedDownstream>) {
-        self.apply_sync_anchors(&prepared);
+        let mut roles = self.plan_native_groups(&prepared);
+        self.apply_sync_anchors(&prepared, &roles);
         for stream in prepared {
-            if let Some(worker) = self.worker(&stream.zone_id) {
-                worker.command(TransportCommand::Play(Box::new(stream)));
+            let zone_id = stream.zone_id.clone();
+            let command = match (roles.remove(&stream.session_id), &stream.renderer) {
+                (Some(GroupRole::Coordinator(joins)), _) => {
+                    TransportCommand::PlayGroup(Box::new(stream), joins)
+                }
+                (
+                    Some(GroupRole::Member {
+                        rincon_id, joins, ..
+                    }),
+                    Renderer::Sonos { client, .. },
+                ) => TransportCommand::Join {
+                    client: client.clone(),
+                    stream: Box::new(stream),
+                    coordinator: rincon_id,
+                    joins,
+                },
+                _ => TransportCommand::Play(Box::new(stream)),
+            };
+            if let Some(worker) = self.worker(&zone_id) {
+                worker.command(command);
             }
         }
     }
@@ -1494,6 +1662,7 @@ impl BridgeRuntime {
         session_id: SessionId,
         zone_id: ZoneId,
         format: PcmFormat,
+        sender: Option<IpAddr>,
     ) -> anyhow::Result<()> {
         let old_sessions: Vec<_> = self
             .sessions
@@ -1507,8 +1676,9 @@ impl BridgeRuntime {
             self.renderers.contains_key(&zone_id),
             "no renderer for zone {zone_id}"
         );
-        self.sessions
-            .insert(session_id, SessionRuntime::new(zone_id.clone(), format));
+        let mut session = SessionRuntime::new(zone_id.clone(), format);
+        session.sender = sender;
+        self.sessions.insert(session_id, session);
         self.restart_downstream_for_play(session_id, zone_id).await
     }
 
@@ -1528,6 +1698,7 @@ impl BridgeRuntime {
         zone_id: ZoneId,
     ) -> anyhow::Result<()> {
         self.cancel_downstream_retry(session_id);
+        self.leave_native_group(session_id).await;
         let Some(session) = self.sessions.get_mut(&session_id) else {
             return Ok(());
         };
@@ -1616,6 +1787,7 @@ impl BridgeRuntime {
             session.observed = ObservedPlayback::Unknown;
             session.prepared = None;
             self.cancel_downstream_retry(session_id);
+            self.leave_native_group(session_id).await;
             let generation = self.next_downstream_generation(session_id);
             if let Some(worker) = self.worker(&zone_id) {
                 worker.command(TransportCommand::Stop {
@@ -1640,6 +1812,7 @@ impl BridgeRuntime {
         let zone_id = fallback_zone_id.unwrap_or_else(|| session.zone_id.clone());
         self.registry.remove(&session_id).await;
         self.retire_encoder(session.encoder.take());
+        self.leave_native_group(session_id).await;
         if let Some(worker) = self.worker(&zone_id) {
             worker.command(TransportCommand::Stop {
                 session_id,
@@ -2067,7 +2240,7 @@ mod tests {
         );
         let session_id = SessionId::new();
         runtime
-            .start_session(session_id, id.clone(), format())
+            .start_session(session_id, id.clone(), format(), None)
             .await
             .unwrap();
         assert!(runtime.registry.is_empty().await);
@@ -2342,9 +2515,53 @@ mod tests {
         let session_id = SessionId::new();
         let prepared = prepared_downstream(session_id, zone_id(), StreamCodec::Wav);
 
-        runtime.apply_sync_anchors(std::slice::from_ref(&prepared));
+        runtime.apply_sync_anchors(std::slice::from_ref(&prepared), &HashMap::new());
 
         assert!(prepared.live_stream.timing().playback_anchor_at.is_some());
+    }
+
+    #[test]
+    fn sonos_rooms_of_one_sender_form_one_native_group() {
+        let mut runtime = runtime();
+        let phone: IpAddr = "192.168.1.20".parse().unwrap();
+        let laptop: IpAddr = "192.168.1.30".parse().unwrap();
+        let mut start = |room: &str, sender| {
+            let (id, zone) = (SessionId::new(), ZoneId::new(room));
+            let prepared = prepared_downstream(id, zone.clone(), StreamCodec::Wav);
+            runtime
+                .renderers
+                .insert(zone.clone(), prepared.renderer.clone());
+            let mut session = SessionRuntime::new(zone, format());
+            session.sender = Some(sender);
+            runtime.sessions.insert(id, session);
+            prepared
+        };
+        let cohort = [
+            start("RINCON_A", phone),
+            start("RINCON_B", phone),
+            start("RINCON_C", laptop),
+        ];
+        let late = start("RINCON_D", phone);
+
+        let roles = runtime.plan_native_groups(&cohort);
+        let coordinator = cohort[0].session_id;
+        assert!(matches!(
+            roles.get(&coordinator),
+            Some(GroupRole::Coordinator(_))
+        ));
+        assert!(matches!(roles.get(&cohort[1].session_id),
+            Some(GroupRole::Member { rincon_id, .. }) if rincon_id == "RINCON_A"));
+        assert!(!roles.contains_key(&cohort[2].session_id));
+
+        // A room added later joins the group that already plays.
+        runtime.sessions.get_mut(&coordinator).unwrap().observed = ObservedPlayback::Playing;
+        let roles = runtime.plan_native_groups(std::slice::from_ref(&late));
+        assert!(matches!(roles.get(&late.session_id),
+            Some(GroupRole::Member { coordinator: c, .. }) if *c == coordinator));
+        assert_eq!(
+            runtime.native_groups[&coordinator],
+            [cohort[1].session_id, late.session_id]
+        );
     }
 
     #[test]
@@ -2353,7 +2570,7 @@ mod tests {
         let session_id = SessionId::new();
         let prepared = prepared_downstream(session_id, zone_id(), StreamCodec::Mp3);
 
-        runtime.apply_sync_anchors(std::slice::from_ref(&prepared));
+        runtime.apply_sync_anchors(std::slice::from_ref(&prepared), &HashMap::new());
 
         assert!(prepared.live_stream.timing().playback_anchor_at.is_none());
     }

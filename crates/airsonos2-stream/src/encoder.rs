@@ -166,7 +166,12 @@ impl FfmpegEncoder {
                 config.sample_rate,
                 config.channels,
             )));
-            if !stream.wait_for_playback_release().await {
+            let Some(delay) = stream.wait_for_playback_release().await else {
+                return Ok(());
+            };
+            // Keep the queued audio from the shared cutoff until the renderer
+            // connects. Home Assistant players connect only after Play.
+            if !stream.subscribed().await {
                 return Ok(());
             }
             let mut first_pcm = false;
@@ -188,6 +193,17 @@ impl FfmpegEncoder {
                     );
                 }
 
+                // A delay line, not a delayed start: it moves the renderer's live
+                // edge. A delayed start only sends a burst of backlog, and the
+                // renderer's start buffer absorbs that burst.
+                if let Some(at) = frame.presentation_time
+                    && !delay.is_zero()
+                {
+                    tokio::select! {
+                        _ = stream.closed() => break,
+                        _ = time::sleep_until((at + delay).into()) => {}
+                    }
+                }
                 stream.publish_timed_pcm(
                     Bytes::from(f32_pcm_to_s16le_bytes(&frame.samples_f32_interleaved)),
                     frame.presentation_time,
@@ -338,7 +354,7 @@ mod tests {
             assert_eq!(subscriber.recv().await.unwrap().bytes.len(), 44);
         }
         let start = std::time::Instant::now();
-        stream.set_playback_plan(start, start + Duration::from_millis(350));
+        stream.set_playback_plan(start, Duration::from_millis(350));
         for index in 0..10 {
             encoder
                 .try_write_frame(PcmFrame {
@@ -357,6 +373,12 @@ mod tests {
             .unwrap();
         assert!(start.elapsed() >= Duration::from_millis(350));
         assert_eq!(i16::from_le_bytes([bytes.bytes[0], bytes.bytes[1]]), 8192);
+        // Queued audio keeps its delay instead of following in one burst.
+        tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(450));
         stream.close();
         encoder.shutdown().await.unwrap();
     }
@@ -407,15 +429,14 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(first_rx.try_recv().is_err());
         assert!(second_rx.try_recv().is_err());
-        let release = std::time::Instant::now() + Duration::from_millis(20);
         let cutoff = source_time + Duration::from_millis(2);
-        first.set_playback_plan(cutoff, release);
-        second.set_playback_plan(cutoff, release + Duration::from_millis(20));
+        first.set_playback_plan(cutoff, Duration::from_millis(20));
+        second.set_playback_plan(cutoff, Duration::from_millis(40));
         let a = tokio::time::timeout(Duration::from_secs(1), first_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(std::time::Instant::now() >= release);
+        assert!(std::time::Instant::now() >= source_time + Duration::from_millis(20));
         let b = tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
             .await
             .unwrap()

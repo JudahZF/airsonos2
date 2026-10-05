@@ -22,9 +22,11 @@ Real-device AirPlay 2 and Sonos sync acceptance still must be validated on hardw
 
 When you multi-select several AirSonos2 speakers from AirPlay, sessions that start within `[sync].multi_select_window_ms` are treated as one startup cohort. AirSonos2 prepares each Sonos stream first, waits until every stream is ready or `[sync].start_deadline_ms` expires, then dispatches the Sonos `Play` commands concurrently.
 
+Sonos rooms that play from one AirPlay device form one native Sonos group (`[sync].native_sonos_groups`, on by default). Sonos then keeps the rooms in sync, with any codec. A room that you add later joins the rooms that already play. The group shows in the Sonos app.
+
 There is no automatic startup compensation. SOAP round trips and HTTP stream timings are not acoustic latency measurements, so the former `[sync].startup_*` settings were removed. Old configs that still set them load normally and the keys are ignored.
 
-For `stream.codec = "wav"`, cohorts also receive a shared future playback anchor with `[sync.zone_offsets_ms]` manual room offsets. MP3 remains supported, but sync is best-effort because it cannot use sample-aligned WAV anchors. Measure speaker-specific output delay with a microphone outside the service and set it as manual offsets.
+For `stream.codec = "wav"`, cohorts also start every room on one shared source sample, and `[sync.zone_offsets_ms]` manual room offsets delay the faster rooms. Use offsets to align Home Assistant players with Sonos rooms or groups. A Sonos group uses the offset of its first room. MP3 cannot use sample-aligned WAV anchors, so sync without native groups is best-effort. Measure speaker-specific output delay with a microphone outside the service and set it as manual offsets.
 
 ## Development
 
@@ -136,7 +138,7 @@ Pause stops the affected room. Resume prepares a new downstream generation. FLUS
 
 WAV headers are available during preparation, but PCM waits for the cohort's release. The MP3 path remains the compatibility default. Network and HTTP timings do not measure acoustic latency, and automatic sync compensation is disabled.
 
-See [playback timing and offset migration](docs/playback-timing.md) before reusing existing room offsets. Positive offsets describe rooms measured late; `default_offset_ms` is only a fallback. WAV uses the normalized release delays; MP3 does not support this sample alignment mechanism. Missing source timing produces a visible best-effort fallback.
+See [playback timing and offset migration](docs/playback-timing.md) before reusing existing room offsets. Positive offsets describe rooms measured late; `default_offset_ms` is only a fallback. WAV uses the normalized delays; MP3 does not support this sample alignment mechanism. Missing source timing produces a visible best-effort fallback.
 
 ## License Notice
 

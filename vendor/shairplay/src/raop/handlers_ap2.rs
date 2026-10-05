@@ -871,6 +871,10 @@ pub(crate) fn handle_set_rate_anchor_time(
         .get("networkTimeFrac")
         .and_then(|v| v.as_unsigned_integer())
         .unwrap_or(0);
+    let timeline_id = dict
+        .get("networkTimeTimelineID")
+        .and_then(|v| v.as_unsigned_integer())
+        .unwrap_or(0);
 
     // Convert network time to nanoseconds
     let frac_ns = ((net_frac >> 32) * 1_000_000_000) >> 32;
@@ -878,7 +882,7 @@ pub(crate) fn handle_set_rate_anchor_time(
 
     let playing = rate & 1 != 0;
     if playing {
-        tracing::info!(rtp_time, anchor_time_ns, "AP2 play start");
+        tracing::info!(rtp_time, anchor_time_ns, timeline_id, "AP2 play start");
     } else {
         tracing::info!("AP2 play pause");
     }
@@ -888,6 +892,7 @@ pub(crate) fn handle_set_rate_anchor_time(
         crate::raop::buffered_audio::PlayoutCommand::SetRate {
             anchor_rtp: rtp_time,
             anchor_time_ns,
+            timeline_id,
             rate,
         },
         response,

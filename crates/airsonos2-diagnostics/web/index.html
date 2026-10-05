@@ -481,8 +481,10 @@ const SECTIONS = [
       inactive: (config) => config.stream.codec !== 'mp3', inactiveHelp: 'Not used with WAV.' },
   ] },
   { id: 'sync', title: 'Sync', blurb: 'Multi-room timing', fields: [
+    { path: 'sync.native_sonos_groups', label: 'Native Sonos groups', type: 'toggle',
+      help: 'Sonos rooms that play from one AirPlay device join one Sonos group, so Sonos keeps them in sync. The group shows in the Sonos app.' },
     { path: 'sync.zone_offsets_ms', label: 'Room offsets', type: 'offsets',
-      help: 'Measured latency per room. Positive means the room plays late. Applies to WAV only.' },
+      help: 'Measured latency per room. Positive means the room plays late. Applies to WAV only. A Sonos group uses the offset of its first room.' },
     { path: 'sync.default_offset_ms', label: 'Default offset', type: 'number', min: -10000, max: 10000, unit: 'ms',
       help: 'For rooms without their own offset.' },
     { path: 'sync.multi_select_window_ms', label: 'Group window', type: 'number', min: 0, max: 60000, unit: 'ms',

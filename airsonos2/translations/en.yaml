@@ -80,6 +80,9 @@ configuration:
   play_command_spread_warn_ms:
     name: Play command warning threshold
     description: Log a warning when grouped Sonos play commands spread beyond this duration.
+  native_sonos_groups:
+    name: Native Sonos groups
+    description: Sonos rooms that play from one AirPlay device join one Sonos group, so Sonos keeps them in sync. The group shows in the Sonos app.
   zone_offsets:
     name: Zone offsets
     description: Per-room sync offsets in milliseconds.

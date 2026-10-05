@@ -196,7 +196,8 @@ pub struct LiveStream {
     ready: watch::Sender<bool>,
     subscriber: watch::Sender<bool>,
     closed: watch::Sender<bool>,
-    playback_release: watch::Sender<Option<Instant>>,
+    /// Output delay once playback is released; `None` holds output back.
+    playback_release: watch::Sender<Option<Duration>>,
     playback_epoch: Arc<AtomicU64>,
     subscriber_count: Arc<AtomicU64>,
     playback_anchor: Arc<std::sync::Mutex<PlaybackAnchorState>>,
@@ -487,7 +488,7 @@ impl LiveStream {
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::At(anchor);
         }
-        self.playback_release.send_replace(Some(anchor));
+        self.playback_release.send_replace(Some(Duration::ZERO));
         let timing = self.timing();
         info!(
             session_id = %self.session.session_id,
@@ -502,7 +503,7 @@ impl LiveStream {
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::NextTimedPcm;
         }
-        self.playback_release.send_replace(Some(Instant::now()));
+        self.playback_release.send_replace(Some(Duration::ZERO));
         let timing = self.timing();
         info!(
             session_id = %self.session.session_id,
@@ -513,29 +514,23 @@ impl LiveStream {
         );
     }
 
-    pub fn set_playback_plan(&self, source_cutoff: Instant, release_at: Instant) {
+    /// Start output at the shared `source_cutoff` sample and present every frame
+    /// `delay` after its source presentation time.
+    pub fn set_playback_plan(&self, source_cutoff: Instant, delay: Duration) {
         if let Ok(mut anchor) = self.playback_anchor.lock() {
             *anchor = PlaybackAnchorState::At(source_cutoff);
         }
-        self.playback_release.send_replace(Some(release_at));
+        self.playback_release.send_replace(Some(delay));
     }
 
-    pub async fn wait_for_playback_release(&self) -> bool {
+    /// Waits until playback is released and returns the output delay, or `None`
+    /// when the stream closes first.
+    pub async fn wait_for_playback_release(&self) -> Option<Duration> {
         let mut release = self.playback_release.subscribe();
-        loop {
-            let deadline = *release.borrow_and_update();
-            match deadline {
-                Some(deadline) => tokio::select! {
-                    biased;
-                    _ = self.closed() => return false,
-                    changed = release.changed() => if changed.is_err() { return false; },
-                    _ = tokio::time::sleep_until(deadline.into()) => return true,
-                },
-                None => tokio::select! {
-                    _ = self.closed() => return false,
-                    changed = release.changed() => if changed.is_err() { return false; },
-                },
-            }
+        tokio::select! {
+            biased;
+            _ = self.closed() => None,
+            released = release.wait_for(Option::is_some) => released.ok().and_then(|delay| *delay),
         }
     }
 
@@ -569,12 +564,19 @@ impl LiveStream {
 
     /// Waits until an HTTP subscriber connects or the timeout elapses.
     pub async fn wait_for_subscriber(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.subscribed())
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Waits until an HTTP subscriber connects. Returns false when the stream
+    /// closes first.
+    pub async fn subscribed(&self) -> bool {
         let mut subscriber = self.subscriber.subscribe();
         tokio::select! {
             biased;
             _ = self.closed() => false,
             result = subscriber.wait_for(|connected| *connected) => result.is_ok(),
-            _ = tokio::time::sleep(timeout) => false,
         }
     }
 
