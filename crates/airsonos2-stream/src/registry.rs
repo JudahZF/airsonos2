@@ -183,20 +183,12 @@ enum PlaybackAnchorState {
     NextTimedPcm,
 }
 
-/// When a stream's output was released, and its output delay.
+/// A released stream's start and output delay. Output begins with audio
+/// presented, or for untimed audio received, at or after `at`.
 #[derive(Clone, Copy, Debug)]
 pub struct PlaybackRelease {
     pub at: Instant,
     pub delay: Duration,
-}
-
-impl PlaybackRelease {
-    fn now(delay: Duration) -> Self {
-        Self {
-            at: Instant::now(),
-            delay,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -504,8 +496,10 @@ impl LiveStream {
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::At(anchor);
         }
-        self.playback_release
-            .send_replace(Some(PlaybackRelease::now(Duration::ZERO)));
+        self.playback_release.send_replace(Some(PlaybackRelease {
+            at: anchor,
+            delay: Duration::ZERO,
+        }));
         let timing = self.timing();
         info!(
             session_id = %self.session.session_id,
@@ -520,8 +514,10 @@ impl LiveStream {
         if let Ok(mut at) = self.playback_anchor.lock() {
             *at = PlaybackAnchorState::NextTimedPcm;
         }
-        self.playback_release
-            .send_replace(Some(PlaybackRelease::now(Duration::ZERO)));
+        self.playback_release.send_replace(Some(PlaybackRelease {
+            at: Instant::now(),
+            delay: Duration::ZERO,
+        }));
         let timing = self.timing();
         info!(
             session_id = %self.session.session_id,
@@ -538,8 +534,10 @@ impl LiveStream {
         if let Ok(mut anchor) = self.playback_anchor.lock() {
             *anchor = PlaybackAnchorState::At(source_cutoff);
         }
-        self.playback_release
-            .send_replace(Some(PlaybackRelease::now(delay)));
+        self.playback_release.send_replace(Some(PlaybackRelease {
+            at: source_cutoff,
+            delay,
+        }));
     }
 
     /// Waits until playback is released, or returns `None` when the stream

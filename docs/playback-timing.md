@@ -51,8 +51,7 @@ stay in its buffer as extra latency.
 
 A room's delay is a delay line: each frame is sent at its presentation time
 plus the delay. A frame without presentation time uses its arrival time, and
-such frames that arrived before the release are dropped, because the source
-cutoff cannot apply to them. A delayed start does not work. It only sends a burst of queued
+such frames that arrived before the shared cutoff are dropped. A delayed start does not work. It only sends a burst of queued
 audio, and the speaker's start buffer absorbs that burst. Startup buffering is
 bounded, so senders must continue providing current audio during preparation.
 

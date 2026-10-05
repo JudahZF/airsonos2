@@ -178,8 +178,8 @@ impl FfmpegEncoder {
                 if !stream.accepts_epoch(frame.playback_epoch) {
                     continue;
                 }
-                // Untimed frames have no source cutoff. Drop the backlog from before
-                // the release, so the stream starts at the live edge.
+                // The source cutoff cannot apply to untimed frames, so their arrival
+                // time is compared with it. The stream then starts at the live edge.
                 if frame.presentation_time.is_none() && arrived < release.at {
                     continue;
                 }
