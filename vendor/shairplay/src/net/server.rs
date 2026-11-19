@@ -238,6 +238,26 @@ async fn bind_listener(addr: IpAddr, start_port: u16, auto_port: bool) -> Result
         }
     }
 }
+/// Probe idle RTSP connections so a sender that vanishes without a FIN (sleep,
+/// Wi-Fi loss) is closed after about 30 s. Closing it frees its connection slot
+/// and the audio session it owns.
+fn enable_keepalive(stream: &TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(15));
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    ))]
+    let keepalive = keepalive
+        .with_interval(std::time::Duration::from_secs(5))
+        .with_retries(3);
+    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!("Failed to enable TCP keepalive: {e}");
+    }
+}
+
 /// Spawn a tokio task that accepts connections on the given listener.
 async fn accept_loop(
     listener: TcpListener,
@@ -254,6 +274,7 @@ async fn accept_loop(
                     Err(_) => continue,
                 };
                 tracing::info!(%remote, "New connection");
+                enable_keepalive(&stream);
                 let local = match stream.local_addr() {
                     Ok(a) => a,
                     Err(_) => continue,

@@ -2067,6 +2067,7 @@ dependencies = [
  "rubato",
  "sha1",
  "sha2",
+ "socket2",
  "symphonia",
  "thiserror",
  "tokio",
