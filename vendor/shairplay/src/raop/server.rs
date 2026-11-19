@@ -576,6 +576,80 @@ mod controller_acceptance {
         drop(control);
         assert!(server.shared.controller_session.lock().unwrap().owner.is_none());
     }
+    /// A sender can vanish without TEARDOWN or FIN. Its session must not lock
+    /// out the next sender, which gets a new identity under transient pairing.
+    #[tokio::test]
+    async fn other_controller_setup_takes_over_abandoned_session() {
+        let server = RaopServer::builder()
+            .pin("1234")
+            .build(Arc::new(Handler::default()))
+            .unwrap();
+        let key = SigningKey::from_bytes(&[17; 32]);
+        server.shared.pairing_store.put("owner", key.verifying_key().to_bytes());
+        server.shared.pairing_store.put("other", key.verifying_key().to_bytes());
+        let connect = |identity| {
+            let mut conn = server
+                .shared
+                .conn_init("127.0.0.1:7000".parse().unwrap(), "127.0.0.1:8000".parse().unwrap())
+                .unwrap();
+            verify(conn.as_mut(), identity, &key);
+            conn
+        };
+        let active_playout = || {
+            server
+                .shared
+                .controller_session
+                .lock()
+                .unwrap()
+                .playout
+                .clone()
+                .unwrap()
+        };
+        let mut abandoned = connect("owner");
+        setup(abandoned.as_mut());
+        let original = active_playout();
+        let session_setup = |conn: &mut dyn ConnectionHandler, rc_only: bool| {
+            let setup = plist::Dictionary::from_iter([
+                ("timingProtocol", plist::Value::String("PTP".into())),
+                ("isRemoteControlOnly", plist::Value::Boolean(rc_only)),
+            ]);
+            let mut bytes = Vec::new();
+            plist::to_writer_binary(&mut bytes, &plist::Value::Dictionary(setup)).unwrap();
+            request(conn, "SETUP", "/stream", "application/x-apple-binary-plist", &bytes).status_code()
+        };
+
+        // iOS opens remote-control-only connections to every receiver it lists.
+        let mut remote = connect("other");
+        assert_eq!(session_setup(remote.as_mut(), true), 403);
+        assert!(!original.is_closed(), "a remote-control connection must not take over");
+
+        // iOS sends RECORD and other requests between the session and stream SETUP.
+        let mut next = connect("other");
+        assert_eq!(session_setup(next.as_mut(), false), 200);
+        tokio::time::timeout(std::time::Duration::from_secs(1), original.closed())
+            .await
+            .unwrap();
+        assert_eq!(
+            request(next.as_mut(), "RECORD", "/stream", "text/parameters", &[]).status_code(),
+            200
+        );
+        setup(next.as_mut());
+        let replacement = active_playout();
+        assert_eq!(
+            server.shared.controller_session.lock().unwrap().owner.as_deref(),
+            Some("other")
+        );
+
+        assert_eq!(
+            request(abandoned.as_mut(), "TEARDOWN", "/stream", "text/parameters", &[]).status_code(),
+            409
+        );
+        drop(abandoned);
+        assert!(
+            !replacement.is_closed(),
+            "the abandoned connection must not stop the stream that replaced it"
+        );
+    }
     #[cfg(feature = "video")]
     #[tokio::test]
     async fn legacy_rtp_claims_only_after_start_and_is_cancelled_by_replacement() {

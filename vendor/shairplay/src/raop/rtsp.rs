@@ -231,7 +231,26 @@ pub(crate) fn dispatch(conn: &mut RaopConnection, request: &HttpRequest) -> Http
         }
         #[cfg(feature = "ap2")]
         {
-            let active = conn.controller_session.lock().unwrap();
+            let mut active = conn.controller_session.lock().unwrap();
+            // A new playback session takes the receiver from another controller:
+            // the newest sender wins, as on Apple receivers. Otherwise a sender
+            // that vanished without TEARDOWN holds it until restart, because
+            // transient pairing gives each new connection a new identity.
+            if method == "SETUP"
+                && ap2_authenticated
+                && !conn.has_owned_audio
+                && active.owner.is_some()
+                && active.owner != conn.controller_id
+                && is_playback_session_setup(request)
+            {
+                tracing::info!("AP2 SETUP takes over the session from another controller");
+                if let Some(task) = active.media_abort.take() {
+                    task.abort();
+                }
+                active.playout = None;
+                active.owner = conn.controller_id.clone();
+                active.owner_connection = Some(conn.nonce.clone());
+            }
             if let Some((code, reason)) = session_rejection(conn, &active) {
                 response = HttpResponse::new("RTSP/1.0", code, reason);
                 response.add_header("CSeq", cseq);
@@ -321,6 +340,24 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
     }
     let _ = conn;
     None
+}
+
+/// Whether an AP2 SETUP starts a playback session: the first SETUP, without
+/// streams, that is not a remote-control-only connection.
+#[cfg(feature = "ap2")]
+fn is_playback_session_setup(request: &HttpRequest) -> bool {
+    let Some(dict) = request
+        .data()
+        .and_then(|data| plist::from_bytes::<plist::Value>(data).ok())
+        .and_then(plist::Value::into_dictionary)
+    else {
+        return false;
+    };
+    !dict.contains_key("streams")
+        && !dict
+            .get("isRemoteControlOnly")
+            .and_then(plist::Value::as_boolean)
+            .unwrap_or(false)
 }
 
 /// Why `conn` may not act on the shared session, if it may not. Callers that
