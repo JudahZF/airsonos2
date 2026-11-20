@@ -240,8 +240,11 @@ async fn bind_listener(addr: IpAddr, start_port: u16, auto_port: bool) -> Result
 }
 /// Probe idle RTSP connections so a sender that vanishes without a FIN (sleep,
 /// Wi-Fi loss) is closed after about 30 s. Closing it frees its connection slot
-/// and the audio session it owns.
+/// and the audio session it owns. On Linux, `TCP_USER_TIMEOUT` gives the same
+/// limit when a reply is still unacknowledged, because keepalive does not probe
+/// while data is in flight.
 fn enable_keepalive(stream: &TcpStream) {
+    let socket = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(15));
     #[cfg(any(
         target_os = "linux",
@@ -253,8 +256,12 @@ fn enable_keepalive(stream: &TcpStream) {
     let keepalive = keepalive
         .with_interval(std::time::Duration::from_secs(5))
         .with_retries(3);
-    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
         tracing::warn!("Failed to enable TCP keepalive: {e}");
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Err(e) = socket.set_tcp_user_timeout(Some(std::time::Duration::from_secs(30))) {
+        tracing::warn!("Failed to set TCP user timeout: {e}");
     }
 }
 
